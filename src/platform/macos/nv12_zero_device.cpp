@@ -50,9 +50,13 @@ namespace platf {
 
     av_frame.reset(frame);
 
-    resolution_fn(this->display, frame->width, frame->height);
+    set_resolution(frame->width, frame->height);
 
     return 0;
+  }
+
+  void nv12_zero_device::set_resolution(int width, int height) {
+    resolution_fn(this->display, width, height);
   }
 
   int nv12_zero_device::init(void *display, pix_fmt_e pix_fmt, resolution_fn_t resolution_fn, const pixel_format_fn_t &pixel_format_fn) {

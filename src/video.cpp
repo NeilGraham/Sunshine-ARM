@@ -37,6 +37,10 @@ extern "C" {
 }
 #endif
 
+#ifdef __APPLE__
+  #include "platform/macos/vt_encoder.h"
+#endif
+
 using namespace std::literals;
 
 namespace video {
@@ -1605,12 +1609,38 @@ namespace video {
     return 0;
   }
 
+#ifdef __APPLE__
+  int encode_vt_native(int64_t frame_nr, native_vt_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    auto encoded_frame = session.encode_frame(frame_nr);
+    if (!encoded_frame) {
+      return session.has_failed() ? -1 : 0;
+    }
+
+    if (encoded_frame->data.empty()) {
+      BOOST_LOG(error) << "VideoToolbox returned empty packet"sv;
+      return -1;
+    }
+
+    auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame->data), encoded_frame->frame_index, encoded_frame->idr);
+    packet->channel_data = channel_data;
+    packet->frame_timestamp = frame_timestamp;
+    packets->raise(std::move(packet));
+
+    return 0;
+  }
+#endif
+
   int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
       return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
     }
+#ifdef __APPLE__
+    else if (auto vt_native_session = dynamic_cast<native_vt_encode_session_t *>(&session)) {
+      return encode_vt_native(frame_nr, *vt_native_session, packets, channel_data, frame_timestamp);
+    }
+#endif
 
     return -1;
   }
@@ -2010,6 +2040,11 @@ namespace video {
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
+#ifdef __APPLE__
+      if (encoder.name == "videotoolbox"sv) {
+        return make_vt_native_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
+      }
+#endif
       return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
     } else if (dynamic_cast<platf::nvenc_encode_device_t *>(encode_device.get())) {
       auto nvenc_encode_device = boost::dynamic_pointer_cast<platf::nvenc_encode_device_t>(std::move(encode_device));

@@ -19,6 +19,7 @@ else()
             COMMENT "Copying bundle resources to build tree"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${_bundle_resources_dir}"
             COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_BINARY_DIR}/assets" "${_bundle_resources_dir}/assets"
+            COMMAND "${CMAKE_COMMAND}" -E copy_directory "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/assets" "${_bundle_resources_dir}/assets"
             VERBATIM)
 endif()
 
