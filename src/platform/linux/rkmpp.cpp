@@ -163,8 +163,9 @@ namespace rkmpp {
         BOOST_LOG(error) << "Couldn't allocate RKMPP mapped frame"sv;
         return -1;
       }
+      mapped_frame->format = AV_PIX_FMT_NV12;
 
-      auto status = av_hwframe_map(mapped_frame.get(), frame, AV_HWFRAME_MAP_WRITE);
+      auto status = av_hwframe_map(mapped_frame.get(), frame, AV_HWFRAME_MAP_WRITE | AV_HWFRAME_MAP_OVERWRITE);
       if (status < 0) {
         char string[AV_ERROR_MAX_STRING_SIZE];
         BOOST_LOG(error) << "Couldn't map RKMPP hwframe for writing: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
