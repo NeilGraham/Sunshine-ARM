@@ -964,6 +964,10 @@ namespace egl {
     gl::ctx.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.width, img.height, GL_BGRA, GL_UNSIGNED_BYTE, img.data);
   }
 
+  void sws_t::load_vram_direct(int texture) {
+    loaded_texture = texture;
+  }
+
   void sws_t::load_vram(img_descriptor_t &img, int offset_x, int offset_y, int texture) {
     // When only a sub-part of the image must be encoded...
     const bool copy = offset_x || offset_y || img.sd.width != in_width || img.sd.height != in_height;

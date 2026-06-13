@@ -328,6 +328,7 @@ namespace egl {
 
     void load_ram(platf::img_t &img);
     void load_vram(img_descriptor_t &img, int offset_x, int offset_y, int texture);
+    void load_vram_direct(int texture);
 
     void apply_colorspace(const video::sunshine_colorspace_t &colorspace);
 

@@ -152,7 +152,15 @@ namespace rkmpp {
         rgb = std::move(*rgb_opt);
       }
 
-      sws.load_vram(descriptor, offset_x, offset_y, rgb->tex[0]);
+      if (offset_x || offset_y) {
+        sws.load_vram(descriptor, offset_x, offset_y, rgb->tex[0]);
+      } else {
+        // The Rockchip/Panfrost path can sample imported KMS DMA-BUF textures,
+        // but using them as an FBO source for Sunshine's resize copy can fail
+        // with GL_INVALID_FRAMEBUFFER_OPERATION. Let the RGB->NV12 shader scale
+        // directly from the imported texture instead.
+        sws.load_vram_direct(rgb->tex[0]);
+      }
 
       if (sws.convert(nv12->buf)) {
         return -1;
