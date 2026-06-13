@@ -77,6 +77,9 @@ Sunshine requires CUDA Toolkit for NVFBC capture. There are two caveats to CUDA:
 > To install older versions, select the appropriate run file based on your desired CUDA version and architecture
 > according to [CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive)
 
+> [!NOTE]
+> On non-NVIDIA ARM devices, such as Rockchip boards, pass `--skip-cuda` to `scripts/linux_build.sh`.
+
 #### macOS
 You can either use [Homebrew](https://brew.sh) or [MacPorts](https://www.macports.org) to install dependencies.
 

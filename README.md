@@ -381,7 +381,7 @@ LizardByte has the full documentation hosted on [Read the Docs](https://docs.liz
         <td>FreeBSD: 14.4+</td>
     </tr>
     <tr>
-        <td>Linux/Debian: 13+ (trixie)</td>
+        <td>Linux/Debian: 12+ (bookworm)</td>
     </tr>
     <tr>
         <td>Linux/Fedora: 43+</td>

@@ -34,7 +34,11 @@ IF (NOT WIN32)
                 SYSTEMD_SYSTEM_UNIT_INSTALL_DIR
                 SYSTEMD_MODULES_LOAD_DIR
         )
-
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(SYSTEMD_FOUND TRUE)
+        set(SYSTEMD_USER_UNIT_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/lib/systemd/user")
+        set(SYSTEMD_SYSTEM_UNIT_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/lib/systemd/system")
+        set(SYSTEMD_MODULES_LOAD_DIR "${CMAKE_INSTALL_PREFIX}/lib/modules-load.d")
     endif ()
 
 ENDIF ()

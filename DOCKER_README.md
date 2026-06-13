@@ -25,6 +25,7 @@ ENTRYPOINT steam && sunshine
 Sunshine images are available with the following tag suffixes, based on their respective base images.
 
 - `debian-bookworm`
+- `debian-trixie`
 - `ubuntu-22.04`
 - `ubuntu-24.04`
 
@@ -153,6 +154,7 @@ The architectures supported by these images are shown in the table below.
 | tag suffix      | amd64/x86_64 | arm64/aarch64 |
 |-----------------|--------------|---------------|
 | debian-bookworm | ✅            | ✅             |
+| debian-trixie   | ✅            | ✅             |
 | ubuntu-22.04    | ✅            | ✅             |
 | ubuntu-24.04    | ✅            | ✅             |
 

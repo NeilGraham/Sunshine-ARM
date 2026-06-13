@@ -2,8 +2,8 @@
 set -e
 
 # Version requirements - centralized for easy maintenance
-cmake_min="4.0.0"
-target_cmake_version="4.3.0"
+cmake_min="3.25.0"
+target_cmake_version="3.30.1"
 doxygen_min="1.10.0"
 _doxygen_min="${doxygen_min//\./_}"  # Convert dots to underscores for URL
 doxygen_max="1.12.0"
@@ -401,9 +401,11 @@ function add_test_ppa() {
 function add_debian_deps() {
   add_test_ppa
   add_debian_based_deps
-  dependencies+=(
-    "systemd-dev"
-  )
+  if [[ "$(printf '%s\n' "$version" "13" | sort -V | head -n1)" == "13" ]]; then
+    dependencies+=(
+      "systemd-dev"
+    )
+  fi
   return 0
 }
 
@@ -847,7 +849,7 @@ elif grep -q "Debian GNU/Linux 12 (bookworm)" /etc/os-release; then
   version="12"
   package_update_command="${sudo_cmd} apt-get update"
   package_install_command="${sudo_cmd} apt-get install -y"
-  gcc_version="13"
+  gcc_version="12"
   nvm_node=0
 elif grep -q "Debian GNU/Linux 13 (trixie)" /etc/os-release; then
   distro="debian"
