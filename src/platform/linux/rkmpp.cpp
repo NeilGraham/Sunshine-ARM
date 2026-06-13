@@ -92,6 +92,8 @@ namespace rkmpp {
       this->offset_y = offset_y;
       sequence = 0;
 
+      BOOST_LOG(info) << "Using zero-copy RKMPP encode path"sv;
+
       return 0;
     }
 
