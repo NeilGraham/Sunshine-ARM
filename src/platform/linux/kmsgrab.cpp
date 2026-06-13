@@ -1388,7 +1388,7 @@ namespace platf {
 
 #ifdef SUNSHINE_BUILD_RKMPP
         if (mem_type == mem_type_e::rkmpp) {
-          return rkmpp::make_avcodec_encode_device(width, height, img_offset_x, img_offset_y);
+          return rkmpp::make_avcodec_encode_device(width, height, dup(card.render_fd.el), img_offset_x, img_offset_y);
         }
 #endif
 

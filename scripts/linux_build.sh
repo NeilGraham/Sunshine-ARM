@@ -401,8 +401,6 @@ function add_debian_based_deps() {
   if [ -n "$rkmpp_source" ]; then
     dependencies+=(
       "librockchip-mpp-dev"  # Rockchip MPP
-      "librga-dev"  # Rockchip RGA 2D engine (capture crop/scale)
-      "librga2"  # Rockchip RGA runtime library
     )
   fi
 
