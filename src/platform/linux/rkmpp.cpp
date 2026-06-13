@@ -23,10 +23,6 @@
 // standard includes
 #include <cstring>
 #include <tuple>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-
-#include <linux/dma-buf.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -50,9 +46,6 @@ namespace rkmpp {
   class rkmpp_t: public platf::avcodec_encode_device_t {
   public:
     ~rkmpp_t() override {
-      if (mapped && mapped != MAP_FAILED) {
-        munmap(mapped, mapped_size);
-      }
     }
 
     int init(int in_width, int in_height, file_t &&render_device, int offset_x, int offset_y) {
@@ -117,28 +110,6 @@ namespace rkmpp {
         }
       }
 
-      auto desc = (const AVDRMFrameDescriptor *) frame->data[0];
-      if (!desc || desc->nb_objects < 1 || desc->nb_layers < 1 || desc->layers[0].nb_planes < 2) {
-        BOOST_LOG(error) << "RKMPP hwframe is not a biplanar NV12 DMA-BUF"sv;
-        return -1;
-      }
-
-      dmabuf_fd = desc->objects[0].fd;
-      mapped_size = desc->objects[0].size;
-      y_offset = desc->layers[0].planes[0].offset;
-      y_pitch = desc->layers[0].planes[0].pitch;
-      uv_offset = desc->layers[0].planes[1].offset;
-      uv_pitch = desc->layers[0].planes[1].pitch;
-
-      // The encoder buffer is filled from the CPU via glGetTextureSubImage, so
-      // map it for writing.
-      mapped = mmap(nullptr, mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
-      if (mapped == MAP_FAILED) {
-        char string[1024];
-        BOOST_LOG(error) << "Couldn't mmap RKMPP encoder buffer: ["sv << strerror_r(errno, string, sizeof(string)) << ']';
-        return -1;
-      }
-
       // Native NV12 render target the GPU converts into.
       auto nv12_opt = egl::create_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
       if (!nv12_opt) {
@@ -187,32 +158,49 @@ namespace rkmpp {
         return -1;
       }
 
-      // Read the converted NV12 planes back into the encoder's DMA-BUF.
-      sync_dma_buf(DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+      video::avcodec_frame_t mapped_frame {av_frame_alloc()};
+      if (!mapped_frame) {
+        BOOST_LOG(error) << "Couldn't allocate RKMPP mapped frame"sv;
+        return -1;
+      }
+
+      auto status = av_hwframe_map(mapped_frame.get(), frame, AV_HWFRAME_MAP_WRITE);
+      if (status < 0) {
+        char string[AV_ERROR_MAX_STRING_SIZE];
+        BOOST_LOG(error) << "Couldn't map RKMPP hwframe for writing: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+        return -1;
+      }
+
+      if (!mapped_frame->data[0] || !mapped_frame->data[1] || mapped_frame->linesize[0] <= 0 || mapped_frame->linesize[1] <= 0) {
+        BOOST_LOG(error) << "RKMPP mapped frame is not writable NV12"sv;
+        return -1;
+      }
+
+      // Read the converted NV12 planes into FFmpeg's mapped RKMPP frame. The
+      // map/unmap path uses RKMPP's own buffer pointer and cache-sync rules,
+      // avoiding stale all-green frames from raw DMA-BUF mmap writes.
 
       gl::ctx.PixelStorei(GL_PACK_ALIGNMENT, 1);
 
       // Y plane (R8): one byte per pixel, destination stride is y_pitch bytes.
-      gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, y_pitch);
+      gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, mapped_frame->linesize[0]);
       gl::ctx.GetTextureSubImage(
         nv12->tex[0], 0, 0, 0, 0,
         frame->width, frame->height, 1,
         GL_RED, GL_UNSIGNED_BYTE,
-        (int) (mapped_size - y_offset), (std::uint8_t *) mapped + y_offset
+        mapped_frame->linesize[0] * frame->height, mapped_frame->data[0]
       );
 
       // UV plane (RG8): two bytes per pixel, half resolution.
-      gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, uv_pitch / 2);
+      gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, mapped_frame->linesize[1] / 2);
       gl::ctx.GetTextureSubImage(
         nv12->tex[1], 0, 0, 0, 0,
         frame->width / 2, frame->height / 2, 1,
         GL_RG, GL_UNSIGNED_BYTE,
-        (int) (mapped_size - uv_offset), (std::uint8_t *) mapped + uv_offset
+        mapped_frame->linesize[1] * (frame->height / 2), mapped_frame->data[1]
       );
 
       gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, 0);
-
-      sync_dma_buf(DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
 
       return 0;
     }
@@ -229,12 +217,6 @@ namespace rkmpp {
     egl::nv12_t nv12;
     egl::rgb_t rgb;
 
-    void *mapped {nullptr};
-    std::size_t mapped_size {};
-    int dmabuf_fd {-1};
-    std::ptrdiff_t y_offset {}, uv_offset {};
-    int y_pitch {}, uv_pitch {};
-
     int width {}, height {};
     int offset_x {}, offset_y {};
     std::uint64_t sequence {};
@@ -242,12 +224,6 @@ namespace rkmpp {
   private:
     void make_current() {
       eglMakeCurrent(display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, std::get<1>(ctx.el));
-    }
-
-    void sync_dma_buf(std::uint64_t flags) {
-      struct dma_buf_sync sync {};
-      sync.flags = flags;
-      ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync);
     }
   };
 

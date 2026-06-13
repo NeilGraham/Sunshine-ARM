@@ -17,6 +17,10 @@ COPY docker/radxa-apt/*.list /etc/apt/sources.list.d/
 COPY docker/radxa-apt/radxa-archive-keyring.gpg /usr/share/keyrings/radxa-archive-keyring.gpg
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+      libcap-dev \
+      libdrm-dev \
+      libgbm-dev \
+      librockchip-mpp-dev \
       librga-dev \
       librga2 \
     && rm -rf /var/lib/apt/lists/*
