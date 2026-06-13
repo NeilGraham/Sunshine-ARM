@@ -367,7 +367,6 @@ function add_debian_based_deps() {
     "libxtst-dev"  # X11
     "libvulkan-dev"  # Vulkan
     "ninja-build"
-    "npm"  # web-ui
     "python3-jinja2"  # glad OpenGL/EGL loader generator
     "python3-setuptools"  # glad OpenGL/EGL loader generated, v2.0.0
     "qt6-base-dev"
@@ -376,6 +375,12 @@ function add_debian_based_deps() {
     "wget"  # necessary for cuda install with `run` file
     "xvfb"  # necessary for headless unit testing
   )
+
+  if ! command -v npm >/dev/null 2>&1; then
+    dependencies+=(
+      "npm"  # web-ui
+    )
+  fi
 
   # Ubuntu 22.04 uses a different package name for Qt6 SVG
   if [[ "$distro" == "ubuntu" ]] && [[ "$version" == "22.04" ]]; then
