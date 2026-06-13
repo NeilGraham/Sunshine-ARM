@@ -7,6 +7,7 @@ integration_dir="$(cd "${sunshine_dir}/.." >/dev/null 2>&1 && pwd -P)"
 apt_dir="${sunshine_dir}/docker/radxa-apt"
 image_name="sunshine-radxa-bookworm-arm64-rkmpp"
 docker_context="$(mktemp -d)"
+artifact_dir="${sunshine_dir}/build/docker-artifacts"
 trap 'rm -rf "$docker_context"' EXIT
 
 missing=0
@@ -39,6 +40,7 @@ mkdir -p "${docker_context}/docker/radxa-apt"
 cp "${sunshine_dir}/docker/radxa-bookworm-arm64-rkmpp.Dockerfile" "${docker_context}/"
 cp "${apt_dir}/"*.list "${docker_context}/docker/radxa-apt/"
 cp "${apt_dir}/radxa-archive-keyring.gpg" "${docker_context}/docker/radxa-apt/"
+mkdir -p "$artifact_dir"
 
 docker build \
   --platform linux/arm64/v8 \
@@ -48,6 +50,29 @@ docker build \
 
 docker run --rm \
   --platform linux/arm64/v8 \
-  -v "${integration_dir}:/work/SUNSHINE-ROCKCHIP-INTEGRATION" \
+  -v "${integration_dir}:/src/SUNSHINE-ROCKCHIP-INTEGRATION:ro" \
+  -v "${artifact_dir}:/out" \
   "$image_name" \
-  bash -lc 'rm -rf build node_modules package-lock.json npm-shrinkwrap.json && ./scripts/linux_build.sh --sudo-off --skip-cuda --rkmpp=../ffmpeg-rockchip'
+  bash -lc '
+    set -euo pipefail
+
+    mkdir -p /work/SUNSHINE-ROCKCHIP-INTEGRATION
+    cd /src/SUNSHINE-ROCKCHIP-INTEGRATION
+    tar \
+      --exclude=Sunshine-ARM/build \
+      --exclude=Sunshine-ARM/node_modules \
+      --exclude=Sunshine-ARM/package-lock.json \
+      --exclude=Sunshine-ARM/npm-shrinkwrap.json \
+      -cf - . | tar -C /work/SUNSHINE-ROCKCHIP-INTEGRATION -xf -
+
+    cd /work/SUNSHINE-ROCKCHIP-INTEGRATION/Sunshine-ARM
+    ./scripts/linux_build.sh --sudo-off --skip-cuda --rkmpp=../ffmpeg-rockchip
+
+    if [ -d build/cpack_artifacts ]; then
+      cp -a build/cpack_artifacts/. /out/
+    fi
+
+    find build -maxdepth 4 -type f \( -name "*.deb" -o -name "*.rpm" \) -exec cp -v {} /out/ \;
+  '
+
+echo "Artifacts available on host at: ${artifact_dir}"
