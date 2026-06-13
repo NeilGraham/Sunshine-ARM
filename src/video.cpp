@@ -2255,6 +2255,11 @@ namespace video {
                   encoder.platform_formats->pix_fmt_8bit;
     }
 
+    if (pix_fmt == platf::pix_fmt_e::unknown) {
+      BOOST_LOG(error) << encoder.name << ": no compatible pixel format for " << colorspace.bit_depth << "-bit encoding"sv;
+      return {};
+    }
+
     {
       auto encoder_name = encoder.codec_from_config(config).name;
 
@@ -2808,6 +2813,12 @@ namespace video {
         auto encoder_codec_name = encoder.codec_from_config(config).name;
 
         if (!flag_map[encoder_t::PASSED] || encoder_codec_name.empty()) {
+          return;
+        }
+
+        if (encoder.platform_formats->pix_fmt_10bit == platf::pix_fmt_e::unknown) {
+          flag_map[encoder_t::DYNAMIC_RANGE] = false;
+          flag_map[encoder_t::YUV444] = false;
           return;
         }
 
