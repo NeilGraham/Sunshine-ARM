@@ -50,4 +50,4 @@ docker run --rm \
   --platform linux/arm64/v8 \
   -v "${integration_dir}:/work/SUNSHINE-ROCKCHIP-INTEGRATION" \
   "$image_name" \
-  bash -lc 'rm -rf build && ./scripts/linux_build.sh --sudo-off --skip-cuda --rkmpp=../ffmpeg-rockchip'
+  bash -lc 'rm -rf build node_modules && ./scripts/linux_build.sh --sudo-off --skip-cuda --rkmpp=../ffmpeg-rockchip'
