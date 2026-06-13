@@ -26,6 +26,7 @@ skip_cleanup=0
 skip_cuda=0
 skip_libva=0
 skip_package=0
+rkmpp_source=""
 sudo_cmd="sudo"
 ubuntu_test_repo=0
 step="all"
@@ -188,6 +189,7 @@ Options:
   --publisher-website      The URL of the publisher's website.
   --publisher-issue-url    The URL of the publisher's support site or issue tracker.
                            If you provide a modified version of Sunshine, we kindly request that you use your own url.
+  --rkmpp=PATH             Build and link against a Rockchip MPP-enabled ffmpeg-rockchip checkout.
   --skip-cleanup           Do not restore the original gcc alternatives, or the math-vector.h file.
   --skip-cuda              Skip CUDA installation.
   --skip-libva             Skip libva installation. This will automatically be enabled if passing --appimage-build.
@@ -240,6 +242,9 @@ while getopts ":hs-:" opt; do
           ;;
         publisher-issue-url=*)
           publisher_issue_url="${OPTARG#*=}"
+          ;;
+        rkmpp=*)
+          rkmpp_source="${OPTARG#*=}"
           ;;
         skip-cleanup) skip_cleanup=1 ;;
         skip-cuda) skip_cuda=1 ;;
@@ -387,6 +392,13 @@ function add_debian_based_deps() {
       "libva-dev"  # VA-API
     )
   fi
+
+  if [ -n "$rkmpp_source" ]; then
+    dependencies+=(
+      "librockchip-mpp-dev"  # Rockchip MPP
+    )
+  fi
+
   return 0
 }
 
@@ -741,6 +753,15 @@ function run_step_cmake() {
     cmake_args+=("-DSUNSHINE_ENABLE_CUDA=OFF")
   fi
 
+  if [ -n "$rkmpp_source" ]; then
+    "${script_dir}/build_ffmpeg_rkmpp.sh" \
+      --source "$rkmpp_source" \
+      --prefix "${build_dir}/ffmpeg-rkmpp" \
+      --jobs "$num_processors"
+    cmake_args+=("-DFFMPEG_PREPARED_BINARIES=${build_dir}/ffmpeg-rkmpp")
+    cmake_args+=("-DSUNSHINE_ENABLE_RKMPP=ON")
+  fi
+
   # Cmake stuff here
   mkdir -p "build"
   echo "cmake args:"
@@ -849,6 +870,8 @@ elif grep -q "Debian GNU/Linux 12 (bookworm)" /etc/os-release; then
   version="12"
   package_update_command="${sudo_cmd} apt-get update"
   package_install_command="${sudo_cmd} apt-get install -y"
+  cuda_version="12.9.1"
+  cuda_build="575.57.08"
   gcc_version="12"
   nvm_node=0
 elif grep -q "Debian GNU/Linux 13 (trixie)" /etc/os-release; then

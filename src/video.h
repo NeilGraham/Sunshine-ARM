@@ -233,6 +233,9 @@ namespace video {
 #endif
 
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
+  #ifdef __linux__
+  extern encoder_t rockchip;
+  #endif
   extern encoder_t vaapi;
 #endif
 

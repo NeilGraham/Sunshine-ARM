@@ -61,6 +61,8 @@ elseif(UNIX)  # Linux
             "Enable building vaapi specific code." ON)
     option(SUNSHINE_ENABLE_VULKAN
             "Enable Vulkan video encoding." ON)
+    option(SUNSHINE_ENABLE_RKMPP
+            "Enable linking against Rockchip MPP-enabled FFmpeg." OFF)
     option(SUNSHINE_ENABLE_WAYLAND
             "Enable building wayland specific code." ON)
     option(SUNSHINE_ENABLE_X11

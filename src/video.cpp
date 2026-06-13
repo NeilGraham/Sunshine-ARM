@@ -958,6 +958,61 @@ namespace video {
   };
 
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
+  #ifdef __linux__
+  encoder_t rockchip {
+    "rkmpp"sv,
+    std::make_unique<encoder_platform_formats_avcodec>(
+      AV_HWDEVICE_TYPE_NONE,
+      AV_HWDEVICE_TYPE_NONE,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NV12,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NONE,
+      nullptr
+    ),
+    {
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      {},  // No RKMPP AV1 encoder
+    },
+    {
+      // Common options
+      {
+        {"rc_mode"s, "CBR"s},
+        {"qp_init"s, &config::video.qp},
+      },
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      "hevc_rkmpp"s,
+    },
+    {
+      // Common options
+      {
+        {"rc_mode"s, "CBR"s},
+        {"qp_init"s, &config::video.qp},
+        {"profile"s, (int) AV_PROFILE_H264_HIGH},
+        {"coder"s, 1},
+      },
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      "h264_rkmpp"s,
+    },
+    LIMITED_GOP_SIZE | PARALLEL_ENCODING
+  };
+
+  #endif
+
   encoder_t vaapi {
     "vaapi"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
@@ -1171,6 +1226,9 @@ namespace video {
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
   #ifdef SUNSHINE_BUILD_VULKAN
     &vulkan,
+  #endif
+  #ifdef __linux__
+    &rockchip,
   #endif
     &vaapi,
 #endif
@@ -2625,8 +2683,8 @@ namespace video {
       BOOST_LOG(info) << "Encoder ["sv << encoder.name << "] failed"sv;
     });
 
-    auto test_hevc = active_hevc_mode >= 2 || (active_hevc_mode == 0 && !(encoder.flags & H264_ONLY));
-    auto test_av1 = active_av1_mode >= 2 || (active_av1_mode == 0 && !(encoder.flags & H264_ONLY));
+    auto test_hevc = !encoder.hevc.name.empty() && (active_hevc_mode >= 2 || (active_hevc_mode == 0 && !(encoder.flags & H264_ONLY)));
+    auto test_av1 = !encoder.av1.name.empty() && (active_av1_mode >= 2 || (active_av1_mode == 0 && !(encoder.flags & H264_ONLY)));
 
     encoder.h264.capabilities.set();
     encoder.hevc.capabilities.set();
@@ -2747,12 +2805,11 @@ namespace video {
       auto test_hdr_and_yuv444 = [&](auto &flag_map, auto video_format) {
         auto config = generic_hdr_config;
         config.videoFormat = video_format;
+        auto encoder_codec_name = encoder.codec_from_config(config).name;
 
-        if (!flag_map[encoder_t::PASSED]) {
+        if (!flag_map[encoder_t::PASSED] || encoder_codec_name.empty()) {
           return;
         }
-
-        auto encoder_codec_name = encoder.codec_from_config(config).name;
 
         // Test 4:4:4 HDR first. If 4:4:4 is supported, 4:2:0 should also be supported.
         config.chromaSamplingType = 1;

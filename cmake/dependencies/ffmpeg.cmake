@@ -13,6 +13,11 @@ if(NOT DEFINED FFMPEG_PREPARED_BINARIES)
         set(FFMPEG_PLATFORM_LIBRARIES va va-drm va-x11 X11)
     elseif(UNIX AND NOT APPLE)
         set(FFMPEG_PLATFORM_LIBRARIES numa va va-drm va-x11 X11)
+
+        if(SUNSHINE_ENABLE_RKMPP)
+            pkg_check_modules(FFMPEG_RKMPP REQUIRED rockchip_mpp libdrm)
+            list(APPEND FFMPEG_PLATFORM_LIBRARIES ${FFMPEG_RKMPP_LDFLAGS})
+        endif()
     endif()
 
     # Determine download location
@@ -143,6 +148,11 @@ else()
             set(FFMPEG_PLATFORM_LIBRARIES va va-drm va-x11 X11)
         elseif(UNIX AND NOT APPLE)
             set(FFMPEG_PLATFORM_LIBRARIES numa va va-drm va-x11 X11)
+
+            if(SUNSHINE_ENABLE_RKMPP)
+                pkg_check_modules(FFMPEG_RKMPP REQUIRED rockchip_mpp libdrm)
+                list(APPEND FFMPEG_PLATFORM_LIBRARIES ${FFMPEG_RKMPP_LDFLAGS})
+            endif()
         endif()
     endif()
 

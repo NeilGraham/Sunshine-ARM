@@ -29,11 +29,21 @@ find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(CURL REQUIRED libcurl)
 
+if(WIN32)
+    set(FFMPEG_PLATFORM_LIBRARIES mfplat ole32 strmiids mfuuid vpl)
+elseif(UNIX AND NOT APPLE)
+    set(FFMPEG_PLATFORM_LIBRARIES numa va va-drm va-x11 X11)
+
+    if(SUNSHINE_ENABLE_RKMPP)
+        pkg_check_modules(FFMPEG_RKMPP REQUIRED rockchip_mpp libdrm)
+        list(APPEND FFMPEG_PLATFORM_LIBRARIES ${FFMPEG_RKMPP_LDFLAGS})
+    endif()
+endif()
+
 # miniupnp
 pkg_check_modules(MINIUPNP miniupnpc REQUIRED)
 include_directories(SYSTEM ${MINIUPNP_INCLUDE_DIRS})
 
-# ffmpeg pre-compiled binaries
 include("${CMAKE_MODULE_PATH}/dependencies/ffmpeg.cmake")
 
 # Opus
