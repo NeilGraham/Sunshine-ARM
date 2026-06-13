@@ -22,6 +22,7 @@
  */
 // standard includes
 #include <cstring>
+#include <tuple>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -95,6 +96,12 @@ namespace rkmpp {
     }
 
     int set_frame(AVFrame *frame, AVBufferRef *hw_frames_ctx_buf) override {
+      // The capture display has its own EGL context that may be current on this
+      // thread. Ensure our context (which owns the render target/shaders) is
+      // current before touching any GL object, otherwise the FBO appears
+      // incomplete (GL_INVALID_FRAMEBUFFER_OPERATION) and nothing is rendered.
+      make_current();
+
       this->hwframe.reset(frame);
       this->frame = frame;
 
@@ -154,6 +161,10 @@ namespace rkmpp {
     }
 
     int convert(platf::img_t &img) override {
+      // Our GL objects only exist in our context; make it current (the capture
+      // display may have left its own context current on this thread).
+      make_current();
+
       auto &descriptor = (egl::img_descriptor_t &) img;
 
       if (descriptor.sequence == 0) {
@@ -229,6 +240,10 @@ namespace rkmpp {
     std::uint64_t sequence {};
 
   private:
+    void make_current() {
+      eglMakeCurrent(display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, std::get<1>(ctx.el));
+    }
+
     void sync_dma_buf(std::uint64_t flags) {
       struct dma_buf_sync sync {};
       sync.flags = flags;
