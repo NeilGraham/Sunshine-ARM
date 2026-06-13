@@ -51,9 +51,9 @@ find_program(NPM npm REQUIRED)
 
 set(NPM_INSTALL_FLAGS "--ignore-scripts")
 if (NPM_OFFLINE)
-    set(NPM_INSTALL_FLAGS "${NPM_INSTALL_FLAGS}" "--offline" "--include=optional")
+    set(NPM_INSTALL_FLAGS "${NPM_INSTALL_FLAGS}" "--offline" "--include=optional" "--no-package-lock")
 else()
-    set(NPM_INSTALL_FLAGS "${NPM_INSTALL_FLAGS}" "--include=optional")
+    set(NPM_INSTALL_FLAGS "${NPM_INSTALL_FLAGS}" "--include=optional" "--no-package-lock")
 endif()
 
 add_custom_target(web-ui ALL
