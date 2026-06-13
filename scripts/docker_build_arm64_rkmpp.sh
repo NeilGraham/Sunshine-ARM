@@ -8,6 +8,7 @@ apt_dir="${sunshine_dir}/docker/radxa-apt"
 image_name="sunshine-radxa-bookworm-arm64-rkmpp"
 docker_context="$(mktemp -d)"
 artifact_dir="${sunshine_dir}/build/docker-artifacts"
+build_jobs="${SUNSHINE_DOCKER_BUILD_JOBS:-2}"
 trap 'rm -rf "$docker_context"' EXIT
 
 missing=0
@@ -52,6 +53,7 @@ docker run --rm \
   --platform linux/arm64/v8 \
   -v "${integration_dir}:/src/SUNSHINE-ROCKCHIP-INTEGRATION:ro" \
   -v "${artifact_dir}:/out" \
+  -e "SUNSHINE_DOCKER_BUILD_JOBS=${build_jobs}" \
   "$image_name" \
   bash -lc '
     set -euo pipefail
@@ -66,7 +68,7 @@ docker run --rm \
       -cf - . | tar -C /work/SUNSHINE-ROCKCHIP-INTEGRATION -xf -
 
     cd /work/SUNSHINE-ROCKCHIP-INTEGRATION/Sunshine-ARM
-    ./scripts/linux_build.sh --sudo-off --skip-cuda --rkmpp=../ffmpeg-rockchip
+    ./scripts/linux_build.sh --sudo-off --skip-cuda --num-processors="${SUNSHINE_DOCKER_BUILD_JOBS}" --rkmpp=../ffmpeg-rockchip
 
     if [ -d build/cpack_artifacts ]; then
       cp -a build/cpack_artifacts/. /out/
