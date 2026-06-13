@@ -50,4 +50,4 @@ docker run --rm \
   --platform linux/arm64/v8 \
   -v "${integration_dir}:/work/SUNSHINE-ROCKCHIP-INTEGRATION" \
   "$image_name" \
-  bash -lc 'rm -f CMakeCache.txt build/CMakeCache.txt && rm -rf build/CMakeFiles && ./scripts/linux_build.sh --sudo-off --skip-cuda --rkmpp=../ffmpeg-rockchip'
+  bash -lc 'rm -rf build && ./scripts/linux_build.sh --sudo-off --skip-cuda --rkmpp=../ffmpeg-rockchip'
