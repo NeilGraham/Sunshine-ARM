@@ -245,6 +245,7 @@ namespace platf {
     ayuv,  ///< AYUV
     yuv444p16,  ///< Planar 10-bit (shifted to 16-bit) YUV 4:4:4
     y410,  ///< Y410
+    bgr0,  ///< Packed 8-bit BGRX (RGB encoder input, VPU does CSC)
     unknown  ///< Unknown
   };
 
@@ -261,6 +262,7 @@ namespace platf {
       _CONVERT(ayuv);
       _CONVERT(yuv444p16);
       _CONVERT(y410);
+      _CONVERT(bgr0);
       _CONVERT(unknown);
     }
 #undef _CONVERT

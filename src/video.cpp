@@ -3297,6 +3297,8 @@ namespace video {
         return platf::pix_fmt_e::nv12;
       case AV_PIX_FMT_P010:
         return platf::pix_fmt_e::p010;
+      case AV_PIX_FMT_BGR0:
+        return platf::pix_fmt_e::bgr0;
       default:
         return platf::pix_fmt_e::unknown;
     }
