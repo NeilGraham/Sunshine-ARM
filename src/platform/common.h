@@ -233,6 +233,7 @@ namespace platf {
     cuda,  ///< CUDA
     videotoolbox,  ///< VideoToolbox
     vulkan,  ///< Vulkan
+    rkmpp,  ///< Rockchip MPP (DRM PRIME)
     unknown  ///< Unknown
   };
 

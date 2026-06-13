@@ -37,6 +37,10 @@ extern "C" {
 }
 #endif
 
+#ifdef SUNSHINE_BUILD_RKMPP
+  #include "platform/linux/rkmpp.h"
+#endif
+
 using namespace std::literals;
 
 namespace video {
@@ -124,6 +128,9 @@ namespace video {
   util::Either<avcodec_buffer_t, int> cuda_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *);
   util::Either<avcodec_buffer_t, int> vt_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *);
   util::Either<avcodec_buffer_t, int> vulkan_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *);
+#ifdef SUNSHINE_BUILD_RKMPP
+  util::Either<avcodec_buffer_t, int> rkmpp_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *);
+#endif
 
   class avcodec_software_encode_device_t: public platf::avcodec_encode_device_t {
   public:
@@ -961,6 +968,22 @@ namespace video {
   #ifdef __linux__
   encoder_t rockchip {
     "rkmpp"sv,
+#ifdef SUNSHINE_BUILD_RKMPP
+    // Zero-copy path: the Mali GPU converts RGB->NV12 into a DMA-BUF that the
+    // encoder imports directly via AV_PIX_FMT_DRM_PRIME, avoiding CPU color
+    // conversion and frame copies. See src/platform/linux/rkmpp.cpp.
+    std::make_unique<encoder_platform_formats_avcodec>(
+      AV_HWDEVICE_TYPE_RKMPP,
+      AV_HWDEVICE_TYPE_NONE,
+      AV_PIX_FMT_DRM_PRIME,
+      AV_PIX_FMT_NV12,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NONE,
+      rkmpp_init_avcodec_hardware_input_buffer
+    ),
+#else
+    // Fallback: feed the encoder system-memory NV12 frames (CPU color conversion).
     std::make_unique<encoder_platform_formats_avcodec>(
       AV_HWDEVICE_TYPE_NONE,
       AV_HWDEVICE_TYPE_NONE,
@@ -971,6 +994,7 @@ namespace video {
       AV_PIX_FMT_NONE,
       nullptr
     ),
+#endif
     {
       {},  // Common options
       {},  // SDR-specific options
@@ -3114,6 +3138,32 @@ namespace video {
   }
 #endif
 
+#ifdef SUNSHINE_BUILD_RKMPP
+  typedef int (*rkmpp_init_avcodec_hardware_input_buffer_fn)(platf::avcodec_encode_device_t *encode_device, AVBufferRef **hw_device_buf);
+
+  util::Either<avcodec_buffer_t, int> rkmpp_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *encode_device) {
+    avcodec_buffer_t hw_device_buf;
+
+    // The encode device builds the RKMPP hwdevice context (see rkmpp.cpp).
+    if (encode_device->data) {
+      if (((rkmpp_init_avcodec_hardware_input_buffer_fn) encode_device->data)(encode_device, &hw_device_buf)) {
+        return -1;
+      }
+
+      return hw_device_buf;
+    }
+
+    auto status = av_hwdevice_ctx_create(&hw_device_buf, AV_HWDEVICE_TYPE_RKMPP, nullptr, nullptr, 0);
+    if (status < 0) {
+      char string[AV_ERROR_MAX_STRING_SIZE];
+      BOOST_LOG(error) << "Failed to create an RKMPP device: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+      return -1;
+    }
+
+    return hw_device_buf;
+  }
+#endif
+
   util::Either<avcodec_buffer_t, int> cuda_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *encode_device) {
     avcodec_buffer_t hw_device_buf;
 
@@ -3221,6 +3271,10 @@ namespace video {
         return platf::mem_type_e::system;
       case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
         return platf::mem_type_e::videotoolbox;
+#ifdef SUNSHINE_BUILD_RKMPP
+      case AV_HWDEVICE_TYPE_RKMPP:
+        return platf::mem_type_e::rkmpp;
+#endif
       default:
         return platf::mem_type_e::unknown;
     }

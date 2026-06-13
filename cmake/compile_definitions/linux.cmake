@@ -197,6 +197,15 @@ if(${SUNSHINE_ENABLE_VULKAN})
     set(SUNSHINE_TARGET_DEPENDENCIES ${SUNSHINE_TARGET_DEPENDENCIES} vulkan_shaders)
 endif()
 
+# rkmpp (Rockchip MPP zero-copy encode device)
+# Requires KMS capture (DMA-BUF) and the RKMPP-enabled FFmpeg.
+if(SUNSHINE_ENABLE_RKMPP AND LIBDRM_FOUND AND LIBCAP_FOUND)
+    add_compile_definitions(SUNSHINE_BUILD_RKMPP)
+    list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.cpp")
+endif()
+
 # wayland
 if(${SUNSHINE_ENABLE_WAYLAND})
     find_package(Wayland REQUIRED)

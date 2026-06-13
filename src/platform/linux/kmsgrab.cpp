@@ -29,6 +29,9 @@
 #include "vaapi.h"
 #include "vulkan_encode.h"
 #include "wayland.h"
+#ifdef SUNSHINE_BUILD_RKMPP
+  #include "rkmpp.h"
+#endif
 
 using namespace std::literals;
 namespace fs = std::filesystem;
@@ -1383,6 +1386,12 @@ namespace platf {
         }
 #endif
 
+#ifdef SUNSHINE_BUILD_RKMPP
+        if (mem_type == mem_type_e::rkmpp) {
+          return rkmpp::make_avcodec_encode_device(width, height, dup(card.render_fd.el), img_offset_x, img_offset_y);
+        }
+#endif
+
 #ifdef SUNSHINE_BUILD_CUDA
         if (mem_type == mem_type_e::cuda) {
           return cuda::make_avcodec_gl_encode_device(width, height, img_offset_x, img_offset_y);
@@ -1528,7 +1537,7 @@ namespace platf {
   }  // namespace kms
 
   std::shared_ptr<display_t> kms_display(mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config) {
-    if (hwdevice_type == mem_type_e::vaapi || hwdevice_type == mem_type_e::cuda || hwdevice_type == mem_type_e::vulkan) {
+    if (hwdevice_type == mem_type_e::vaapi || hwdevice_type == mem_type_e::cuda || hwdevice_type == mem_type_e::vulkan || hwdevice_type == mem_type_e::rkmpp) {
       auto disp = std::make_shared<kms::display_vram_t>(hwdevice_type);
 
       if (!disp->init(display_name, config)) {
