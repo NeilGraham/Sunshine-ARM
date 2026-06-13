@@ -2,8 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-sunshine_dir="$(readlink -f "${script_dir}/..")"
-integration_dir="$(readlink -f "${sunshine_dir}/..")"
+sunshine_dir="$(cd "${script_dir}/.." >/dev/null 2>&1 && pwd -P)"
+integration_dir="$(cd "${sunshine_dir}/.." >/dev/null 2>&1 && pwd -P)"
 apt_dir="${sunshine_dir}/docker/radxa-apt"
 image_name="sunshine-radxa-bookworm-arm64-rkmpp"
 
