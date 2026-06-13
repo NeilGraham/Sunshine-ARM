@@ -4,6 +4,7 @@
  */
 // lib includes
 #include <boost/locale.hpp>
+#include <format>
 #include <inputtino/input.hpp>
 #include <libevdev/libevdev.h>
 
