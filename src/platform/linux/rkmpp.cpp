@@ -1,22 +1,24 @@
 /**
  * @file src/platform/linux/rkmpp.cpp
- * @brief Zero-copy Rockchip MPP (RKMPP) encode device.
+ * @brief Zero-copy Rockchip MPP (RKMPP) encode device using RGA for scaling.
  *
- * RKMPP encodes in hardware, but feeding it software NV12 frames forces Sunshine
- * to perform the RGB->NV12 color conversion on the CPU (libswscale) plus a full
- * GPU->CPU readback every frame. That dominates CPU usage while streaming.
+ * RKMPP encodes in hardware, but feeding it software frames forces Sunshine to
+ * do the capture color conversion and scaling on the CPU (libswscale), which
+ * dominates CPU usage while streaming.
  *
- * This device avoids that entirely: it allocates an NV12 frame from FFmpeg's
- * RKMPP hardware frames pool (which is backed by a DMA-BUF / MppBuffer), imports
- * that DMA-BUF into EGL, and performs the RGB->NV12 conversion on the Mali GPU.
- * The same MppBuffer is then handed straight to h264_rkmpp / hevc_rkmpp via an
- * AV_PIX_FMT_DRM_PRIME frame, so the encoder imports it without any copy.
+ * The Mali GPU cannot render into the MPP-allocated encoder buffer (Panfrost
+ * refuses to use an imported DMA-BUF as a multi-plane FBO colour attachment,
+ * which produced an all-green image). So instead this device uses the RGA 2D
+ * engine: it crops+scales the captured RGB framebuffer DMA-BUF straight into an
+ * RGB DMA-BUF allocated from FFmpeg's RKMPP hardware frames pool, then hands
+ * that buffer to h264_rkmpp / hevc_rkmpp as an AV_PIX_FMT_DRM_PRIME frame. The
+ * VPU performs the RGB->YUV colour conversion internally during encode.
  *
- * This mirrors the structure of the VAAPI integration in vaapi.cpp.
+ * Result: capture -> RGA (crop/scale, no CPU) -> VPU (CSC + encode), with no CPU
+ * colour conversion and no GPU readback.
  */
 // standard includes
-#include <array>
-#include <cstring>
+#include <cstdint>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -25,11 +27,13 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+#include <rga/im2d.h>
+#include <rga/rga.h>
+
 // local includes
-#include "graphics.h"
+#include "graphics.h"  // egl::img_descriptor_t / surface_descriptor_t (capture descriptor types)
 #include "misc.h"
 #include "rkmpp.h"
-#include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/utility.h"
@@ -38,61 +42,49 @@ extern "C" {
 using namespace std::literals;
 
 namespace rkmpp {
-  // DRM fourcc codes for the NV12 sub-planes as imported into EGL.
-  // NV12 is exposed to GL as a single-channel R8 luma plane and a two-channel
-  // GR88 chroma plane, matching how the VAAPI path imports NV12 surfaces.
   constexpr std::uint32_t fourcc(char a, char b, char c, char d) {
     return (std::uint32_t) a | ((std::uint32_t) b << 8) | ((std::uint32_t) c << 16) | ((std::uint32_t) d << 24);
   }
 
-  constexpr std::uint32_t DRM_FORMAT_R8 = fourcc('R', '8', ' ', ' ');
-  constexpr std::uint32_t DRM_FORMAT_GR88 = fourcc('G', 'R', '8', '8');
+  // DRM packed 32-bit RGB fourccs (matches drm_fourcc.h).
+  constexpr std::uint32_t DRM_FORMAT_XRGB8888 = fourcc('X', 'R', '2', '4');
+  constexpr std::uint32_t DRM_FORMAT_ARGB8888 = fourcc('A', 'R', '2', '4');
+  constexpr std::uint32_t DRM_FORMAT_XBGR8888 = fourcc('X', 'B', '2', '4');
+  constexpr std::uint32_t DRM_FORMAT_ABGR8888 = fourcc('A', 'B', '2', '4');
 
-  // Matches the sentinel in graphics.cpp. RKMPP buffers are always linear, so we
-  // import them via the implicit (no explicit modifier) EGL path, which is the
-  // most broadly compatible across Mali/Panfrost drivers.
-  constexpr std::uint64_t DRM_FORMAT_MOD_INVALID = (((std::uint64_t) 0 << 56) | (((1ULL << 56) - 1) & 0x00ffffffffffffffULL));
+  /**
+   * @brief Map a DRM packed-RGB fourcc to the matching RGA format.
+   *
+   * DRM fourccs name channels MSB->LSB of a little-endian 32-bit word, so e.g.
+   * XRGB8888 is stored in memory as B,G,R,X -> RK_FORMAT_BGRA_8888.
+   */
+  static int drm_fourcc_to_rga(std::uint32_t drm_fourcc) {
+    switch (drm_fourcc) {
+      case DRM_FORMAT_XRGB8888:
+      case DRM_FORMAT_ARGB8888:
+        return RK_FORMAT_BGRA_8888;
+      case DRM_FORMAT_XBGR8888:
+      case DRM_FORMAT_ABGR8888:
+        return RK_FORMAT_RGBA_8888;
+      default:
+        // Sunshine treats the KMS framebuffer as BGRx, so default to that.
+        return RK_FORMAT_BGRA_8888;
+    }
+  }
 
   class rkmpp_t: public platf::avcodec_encode_device_t {
   public:
-    int init(int in_width, int in_height, file_t &&render_device, int offset_x, int offset_y) {
-      file = std::move(render_device);
-
-      if (!gbm::create_device) {
-        BOOST_LOG(warning) << "libgbm not initialized"sv;
-        return -1;
-      }
-
-      // Marker used by video.cpp to recognise this as a real hardware encode
-      // device (rather than falling back to the CPU software encode device).
+    int init(int in_width, int in_height, int offset_x, int offset_y) {
+      // Marker so video.cpp uses this device instead of the CPU software path.
       this->data = (void *) rkmpp_init_avcodec_hardware_input_buffer;
 
-      gbm.reset(gbm::create_device(file.el));
-      if (!gbm) {
-        char string[1024];
-        BOOST_LOG(error) << "Couldn't create GBM device: ["sv << strerror_r(errno, string, sizeof(string)) << ']';
-        return -1;
-      }
-
-      display = egl::make_display(gbm.get());
-      if (!display) {
-        return -1;
-      }
-
-      auto ctx_opt = egl::make_ctx(display.get());
-      if (!ctx_opt) {
-        return -1;
-      }
-
-      ctx = std::move(*ctx_opt);
-
-      width = in_width;
-      height = in_height;
+      // Source crop region within the captured framebuffer.
+      this->crop_width = in_width;
+      this->crop_height = in_height;
       this->offset_x = offset_x;
       this->offset_y = offset_y;
-      sequence = 0;
 
-      BOOST_LOG(info) << "Using zero-copy RKMPP encode path"sv;
+      BOOST_LOG(info) << "Using RGA zero-copy RKMPP encode path"sv;
 
       return 0;
     }
@@ -106,16 +98,14 @@ namespace rkmpp {
         return -1;
       }
 
-      // Allocate an NV12 frame from the RKMPP pool. The backing MppBuffer is a
-      // DMA-BUF we can both render into (via EGL) and submit to the encoder.
+      // Allocate the destination RGB buffer (a DMA-BUF backed MppBuffer) that
+      // both RGA writes into and the encoder reads from.
       if (!frame->buf[0]) {
         if (av_hwframe_get_buffer(hw_frames_ctx_buf, frame, 0)) {
           BOOST_LOG(error) << "Couldn't get an RKMPP hwframe"sv;
           return -1;
         }
       }
-
-      auto hw_frames_ctx = (AVHWFramesContext *) hw_frames_ctx_buf->data;
 
       auto desc = (const AVDRMFrameDescriptor *) frame->data[0];
       if (!desc || desc->nb_objects < 1 || desc->nb_layers < 1) {
@@ -127,120 +117,96 @@ namespace rkmpp {
         return -1;
       }
 
-      const auto &layer = desc->layers[0];
-      if (layer.nb_planes < 2) {
-        BOOST_LOG(error) << "RKMPP hwframe is not a biplanar (NV12) surface"sv;
-        return -1;
-      }
-
-      // The NV12 surface is a single DMA-BUF object with two planes (Y, UV).
-      // EGL imports each plane as its own texture, so they share the same fd.
-      // The nv12 target takes ownership of the duplicated fd (unused entries
-      // default to -1).
-      std::array<file_t, egl::nv12_img_t::num_fds> fds;
-
-      int dmabuf_fd = dup(desc->objects[0].fd);
-      if (dmabuf_fd < 0) {
-        BOOST_LOG(error) << "Couldn't duplicate RKMPP DMA-BUF fd"sv;
-        return -1;
-      }
-      fds[0] = dmabuf_fd;
-
-      egl::surface_descriptor_t sd_y {};
-      sd_y.width = frame->width;
-      sd_y.height = frame->height;
-      sd_y.fourcc = DRM_FORMAT_R8;
-      sd_y.modifier = DRM_FORMAT_MOD_INVALID;
-      std::fill_n(sd_y.fds, 4, -1);
-      sd_y.fds[0] = dmabuf_fd;
-      sd_y.offsets[0] = layer.planes[0].offset;
-      sd_y.pitches[0] = layer.planes[0].pitch;
-
-      egl::surface_descriptor_t sd_uv {};
-      sd_uv.width = frame->width / 2;
-      sd_uv.height = frame->height / 2;
-      sd_uv.fourcc = DRM_FORMAT_GR88;
-      sd_uv.modifier = DRM_FORMAT_MOD_INVALID;
-      std::fill_n(sd_uv.fds, 4, -1);
-      sd_uv.fds[0] = dmabuf_fd;
-      sd_uv.offsets[0] = layer.planes[1].offset;
-      sd_uv.pitches[0] = layer.planes[1].pitch;
-
-      auto nv12_opt = egl::import_target(display.get(), std::move(fds), sd_y, sd_uv);
-      if (!nv12_opt) {
-        return -1;
-      }
-
-      auto sws_opt = egl::sws_t::make(width, height, frame->width, frame->height, (AVPixelFormat) hw_frames_ctx->sw_format);
-      if (!sws_opt) {
-        return -1;
-      }
-
-      this->sws = std::move(*sws_opt);
-      this->nv12 = std::move(*nv12_opt);
+      dst_fd = desc->objects[0].fd;
+      dst_width = frame->width;
+      dst_height = frame->height;
+      // Pitch is in bytes; RGA strides are in pixels (32 bpp packed RGB).
+      dst_wstride = desc->layers[0].planes[0].pitch / 4;
+      dst_format = drm_fourcc_to_rga(desc->layers[0].format);
 
       return 0;
-    }
-
-    void apply_colorspace() override {
-      sws.apply_colorspace(colorspace);
     }
 
     int convert(platf::img_t &img) override {
       auto &descriptor = (egl::img_descriptor_t &) img;
 
-      if (descriptor.sequence == 0) {
-        // For dummy images, use a blank RGB texture instead of importing a DMA-BUF
-        rgb = egl::create_blank(img);
-      } else if (descriptor.sequence > sequence) {
-        sequence = descriptor.sequence;
-
-        rgb = egl::rgb_t {};
-
-        auto rgb_opt = egl::import_source(display.get(), descriptor.sd);
-        if (!rgb_opt) {
-          return -1;
-        }
-
-        rgb = std::move(*rgb_opt);
+      // Dummy/probe images (sequence 0) and cursor-only frames have no captured
+      // framebuffer. Leave the destination buffer as-is (encodes as black).
+      if (descriptor.sequence == 0 || descriptor.sd.fds[0] < 0) {
+        return 0;
       }
 
-      sws.load_vram(descriptor, offset_x, offset_y, rgb->tex[0]);
+      const auto &sd = descriptor.sd;
 
-      if (sws.convert(nv12->buf)) {
+      if (!logged_src) {
+        logged_src = true;
+        BOOST_LOG(info) << "RGA source framebuffer: "sv << sd.width << 'x' << sd.height
+                        << " fourcc=0x"sv << util::hex(sd.fourcc).to_string_view()
+                        << " modifier=0x"sv << util::hex(sd.modifier).to_string_view()
+                        << " pitch="sv << sd.pitches[0]
+                        << " -> dst "sv << dst_width << 'x' << dst_height << " wstride="sv << dst_wstride;
+      }
+
+      im_handle_param_t src_param {
+        (uint32_t) (sd.pitches[0] / 4),
+        (uint32_t) sd.height,
+        (uint32_t) drm_fourcc_to_rga(sd.fourcc)
+      };
+      im_handle_param_t dst_param {
+        (uint32_t) dst_wstride,
+        (uint32_t) dst_height,
+        (uint32_t) dst_format
+      };
+
+      rga_buffer_handle_t src_handle = importbuffer_fd(sd.fds[0], &src_param);
+      rga_buffer_handle_t dst_handle = importbuffer_fd(dst_fd, &dst_param);
+      if (!src_handle || !dst_handle) {
+        BOOST_LOG(error) << "RGA: failed to import DMA-BUF (src="sv << sd.fds[0] << ", dst="sv << dst_fd << ')';
+        if (src_handle) {
+          releasebuffer_handle(src_handle);
+        }
+        if (dst_handle) {
+          releasebuffer_handle(dst_handle);
+        }
         return -1;
       }
 
-      // The encoder (MPP) reads this DMA-BUF directly with no implicit fence
-      // against the GPU. Ensure the RGB->NV12 render is complete before the
-      // buffer is handed to the encoder to avoid reading a partial frame.
-      gl::ctx.Finish();
+      rga_buffer_t src = wrapbuffer_handle_t(src_handle, sd.width, sd.height, sd.pitches[0] / 4, sd.height, drm_fourcc_to_rga(sd.fourcc));
+      rga_buffer_t dst = wrapbuffer_handle_t(dst_handle, dst_width, dst_height, dst_wstride, dst_height, dst_format);
+      rga_buffer_t pat {};
+
+      // Crop the captured region, scale it to the encoder dimensions.
+      im_rect src_rect {offset_x, offset_y, crop_width, crop_height};
+      im_rect dst_rect {0, 0, dst_width, dst_height};
+      im_rect pat_rect {0, 0, 0, 0};
+
+      auto status = improcess(src, dst, pat, src_rect, dst_rect, pat_rect, 0, nullptr, nullptr, IM_SYNC);
+
+      releasebuffer_handle(src_handle);
+      releasebuffer_handle(dst_handle);
+
+      if (status != IM_STATUS_SUCCESS) {
+        BOOST_LOG(error) << "RGA conversion failed: "sv << imStrError_t(status);
+        return -1;
+      }
 
       return 0;
     }
 
-    file_t file;
-
-    gbm::gbm_t gbm;
-    egl::display_t display;
-    egl::ctx_t ctx;
-
-    // This must be destroyed before display_t to ensure the GPU driver is still
-    // loaded when the underlying buffers are released.
+    // Owns the encoder input frame for the session lifetime.
     frame_t hwframe;
 
-    egl::sws_t sws;
-    egl::nv12_t nv12;
-    egl::rgb_t rgb;
+    int dst_fd {-1};
+    int dst_width {}, dst_height {}, dst_wstride {}, dst_format {};
 
-    int width, height;
-    int offset_x, offset_y;
-    std::uint64_t sequence;
+    int crop_width {}, crop_height {};
+    int offset_x {}, offset_y {};
+
+    bool logged_src {false};
   };
 
   int rkmpp_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t * /* base */, AVBufferRef **hw_device_buf) {
-    // The RKMPP device talks to the MPP service directly; it does not take a DRI
-    // render-node path, so no device string is passed.
+    // The RKMPP device talks to the MPP service directly; no DRI node path.
     auto status = av_hwdevice_ctx_create(hw_device_buf, AV_HWDEVICE_TYPE_RKMPP, nullptr, nullptr, 0);
     if (status < 0) {
       char string[AV_ERROR_MAX_STRING_SIZE];
@@ -251,10 +217,10 @@ namespace rkmpp {
     return 0;
   }
 
-  std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(int width, int height, file_t &&card, int offset_x, int offset_y) {
+  std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(int width, int height, int offset_x, int offset_y) {
     auto device = std::make_unique<rkmpp_t>();
 
-    if (device->init(width, height, std::move(card), offset_x, offset_y)) {
+    if (device->init(width, height, offset_x, offset_y)) {
       return nullptr;
     }
 

@@ -27,13 +27,12 @@ namespace rkmpp {
   int rkmpp_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *base, AVBufferRef **hw_device_buf);
 
   /**
-   * @brief Create a zero-copy RKMPP encode device backed by EGL color conversion.
-   * @param width Captured image width.
-   * @param height Captured image height.
-   * @param card Render node fd used for GBM/EGL (ownership transferred).
+   * @brief Create a zero-copy RKMPP encode device backed by RGA scaling.
+   * @param width Captured region width.
+   * @param height Captured region height.
    * @param offset_x Horizontal offset of the captured region.
    * @param offset_y Vertical offset of the captured region.
    * @return The encode device or nullptr on failure.
    */
-  std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(int width, int height, file_t &&card, int offset_x, int offset_y);
+  std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(int width, int height, int offset_x, int offset_y);
 }  // namespace rkmpp

@@ -969,14 +969,15 @@ namespace video {
   encoder_t rockchip {
     "rkmpp"sv,
 #ifdef SUNSHINE_BUILD_RKMPP
-    // Zero-copy path: the Mali GPU converts RGB->NV12 into a DMA-BUF that the
-    // encoder imports directly via AV_PIX_FMT_DRM_PRIME, avoiding CPU color
-    // conversion and frame copies. See src/platform/linux/rkmpp.cpp.
+    // Zero-copy path: RGA crops/scales the captured RGB framebuffer into a
+    // DMA-BUF that the encoder imports directly via AV_PIX_FMT_DRM_PRIME. The
+    // VPU performs the RGB->YUV conversion internally, so we feed it a packed
+    // RGB (BGR0) buffer and avoid all CPU color conversion. See rkmpp.cpp.
     std::make_unique<encoder_platform_formats_avcodec>(
       AV_HWDEVICE_TYPE_RKMPP,
       AV_HWDEVICE_TYPE_NONE,
       AV_PIX_FMT_DRM_PRIME,
-      AV_PIX_FMT_NV12,
+      AV_PIX_FMT_BGR0,
       AV_PIX_FMT_NONE,
       AV_PIX_FMT_NONE,
       AV_PIX_FMT_NONE,

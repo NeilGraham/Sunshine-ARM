@@ -198,9 +198,13 @@ if(${SUNSHINE_ENABLE_VULKAN})
 endif()
 
 # rkmpp (Rockchip MPP zero-copy encode device)
-# Requires KMS capture (DMA-BUF) and the RKMPP-enabled FFmpeg.
+# Requires KMS capture (DMA-BUF), the RKMPP-enabled FFmpeg, and librga for the
+# hardware crop/scale of captured frames.
 if(SUNSHINE_ENABLE_RKMPP AND LIBDRM_FOUND AND LIBCAP_FOUND)
+    pkg_check_modules(RGA REQUIRED librga)
     add_compile_definitions(SUNSHINE_BUILD_RKMPP)
+    include_directories(SYSTEM ${RGA_INCLUDE_DIRS})
+    list(APPEND PLATFORM_LIBRARIES ${RGA_LIBRARIES})
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.h"
             "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.cpp")
