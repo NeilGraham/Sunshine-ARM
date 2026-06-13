@@ -6,6 +6,8 @@ sunshine_dir="$(cd "${script_dir}/.." >/dev/null 2>&1 && pwd -P)"
 integration_dir="$(cd "${sunshine_dir}/.." >/dev/null 2>&1 && pwd -P)"
 apt_dir="${sunshine_dir}/docker/radxa-apt"
 image_name="sunshine-radxa-bookworm-arm64-rkmpp"
+docker_context="$(mktemp -d)"
+trap 'rm -rf "$docker_context"' EXIT
 
 missing=0
 for file in \
@@ -33,11 +35,16 @@ EOF
   exit 1
 fi
 
+mkdir -p "${docker_context}/docker/radxa-apt"
+cp "${sunshine_dir}/docker/radxa-bookworm-arm64-rkmpp.Dockerfile" "${docker_context}/"
+cp "${apt_dir}/"*.list "${docker_context}/docker/radxa-apt/"
+cp "${apt_dir}/radxa-archive-keyring.gpg" "${docker_context}/docker/radxa-apt/"
+
 docker build \
   --platform linux/arm64/v8 \
-  -f "${sunshine_dir}/docker/radxa-bookworm-arm64-rkmpp.Dockerfile" \
+  -f "${docker_context}/radxa-bookworm-arm64-rkmpp.Dockerfile" \
   -t "$image_name" \
-  "$sunshine_dir"
+  "$docker_context"
 
 docker run --rm \
   --platform linux/arm64/v8 \
