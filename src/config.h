@@ -5,10 +5,12 @@
 #pragma once
 
 // standard includes
+#include <array>
 #include <bitset>
 #include <chrono>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -26,8 +28,8 @@ namespace config {
   inline std::unordered_map<std::string, std::string> modified_config_settings;
 
   // sensitive values that should be redacted from logging
-  inline constexpr std::array redacted_config = {
-    "csrf_allowed_origins"
+  inline constexpr std::array<std::string_view, 1> redacted_config = {
+    std::string_view {"csrf_allowed_origins"}
   };
 
   void log_config_settings(const std::unordered_map<std::string, std::string> &vars, bool save);
