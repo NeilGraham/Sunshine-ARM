@@ -72,7 +72,7 @@ namespace gl {
       int x = 0;
       for (auto fb : (*this)) {
         ctx.BindFramebuffer(GL_FRAMEBUFFER, fb);
-        ctx.FramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + x, 0, 0);
+        ctx.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + x, GL_TEXTURE_2D, 0, 0);
 
         ++x;
       }
@@ -92,7 +92,7 @@ namespace gl {
         ctx.BindFramebuffer(GL_FRAMEBUFFER, (*this)[x]);
         ctx.BindTexture(GL_TEXTURE_2D, tex);
 
-        ctx.FramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + x, tex, 0);
+        ctx.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + x, GL_TEXTURE_2D, tex, 0);
 
         ++x;
       });
