@@ -185,8 +185,22 @@ namespace rkmpp {
         return false;
       }
 
+      missing_frame_logged = false;
       copy_nv12(latest_frame.data(), mapped_frame, dst_width, dst_height);
       return true;
+    }
+
+    bool should_log_missing_frame() {
+      if (missing_frame_logged) {
+        return false;
+      }
+      missing_frame_logged = true;
+      return true;
+    }
+
+    void copy_black_to(AVFrame *mapped_frame, int dst_width, int dst_height) {
+      std::fill_n(mapped_frame->data[0], (std::size_t) mapped_frame->linesize[0] * dst_height, 16);
+      std::fill_n(mapped_frame->data[1], (std::size_t) mapped_frame->linesize[1] * (dst_height / 2), 128);
     }
 
     int width {};
@@ -211,6 +225,14 @@ namespace rkmpp {
         }
       }
       buffers.clear();
+
+      if (fd >= 0) {
+        v4l2_requestbuffers req {};
+        req.count = 0;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        xioctl(fd, VIDIOC_REQBUFS, &req);
+      }
 
       if (fd >= 0) {
         close(fd);
@@ -267,6 +289,7 @@ namespace rkmpp {
 
     int fd {-1};
     bool streaming {};
+    bool missing_frame_logged {};
     std::vector<std::uint8_t> latest_frame;
     std::vector<buffer_t> buffers;
   };
@@ -404,8 +427,10 @@ namespace rkmpp {
 
       if (direct_v4l2) {
         if (!direct_v4l2->copy_latest_to(mapped_frame.get(), frame->width, frame->height)) {
-          BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available"sv;
-          return -1;
+          if (direct_v4l2->should_log_missing_frame()) {
+            BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available; sending black frames until capture resumes"sv;
+          }
+          direct_v4l2->copy_black_to(mapped_frame.get(), frame->width, frame->height);
         }
         return 0;
       }
