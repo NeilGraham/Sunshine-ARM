@@ -21,8 +21,20 @@
  * colour conversion; the only remaining cost is a single NV12 read-back.
  */
 // standard includes
+#include <algorithm>
+#include <cerrno>
 #include <cstring>
+#include <cstdlib>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <tuple>
+#include <unistd.h>
+#include <vector>
+
+// lib includes
+#include <linux/videodev2.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -43,6 +55,208 @@ extern "C" {
 using namespace std::literals;
 
 namespace rkmpp {
+  int xioctl(int fd, unsigned long request, void *arg) {
+    int status;
+    do {
+      status = ioctl(fd, request, arg);
+    } while (status < 0 && errno == EINTR);
+    return status;
+  }
+
+  class v4l2_nv12_source_t {
+  public:
+    ~v4l2_nv12_source_t() {
+      stop();
+    }
+
+    bool init(const char *device, int width, int height, int fps) {
+      fd = open(device, O_RDWR | O_NONBLOCK);
+      if (fd < 0) {
+        char string[1024];
+        BOOST_LOG(warning) << "RKMPP direct V4L2: couldn't open "sv << device << ": "sv << strerror_r(errno, string, sizeof(string));
+        return false;
+      }
+
+      this->width = width;
+      this->height = height;
+
+      v4l2_format fmt {};
+      fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      fmt.fmt.pix.width = width;
+      fmt.fmt.pix.height = height;
+      fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+      fmt.fmt.pix.field = V4L2_FIELD_NONE;
+      if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        char string[1024];
+        BOOST_LOG(warning) << "RKMPP direct V4L2: VIDIOC_S_FMT failed: "sv << strerror_r(errno, string, sizeof(string));
+        return false;
+      }
+
+      if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 || (int) fmt.fmt.pix.width != width || (int) fmt.fmt.pix.height != height) {
+        BOOST_LOG(warning) << "RKMPP direct V4L2: device returned unsupported format "
+                           << fmt.fmt.pix.width << 'x' << fmt.fmt.pix.height
+                           << " fourcc=0x"sv << util::hex(fmt.fmt.pix.pixelformat).to_string_view();
+        return false;
+      }
+
+      v4l2_streamparm parm {};
+      parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      parm.parm.capture.timeperframe.numerator = 1;
+      parm.parm.capture.timeperframe.denominator = fps;
+      xioctl(fd, VIDIOC_S_PARM, &parm);
+
+      v4l2_requestbuffers req {};
+      req.count = 4;
+      req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      req.memory = V4L2_MEMORY_MMAP;
+      if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 2) {
+        char string[1024];
+        BOOST_LOG(warning) << "RKMPP direct V4L2: VIDIOC_REQBUFS failed: "sv << strerror_r(errno, string, sizeof(string));
+        return false;
+      }
+
+      buffers.resize(req.count);
+      for (std::uint32_t x = 0; x < req.count; ++x) {
+        v4l2_buffer buf {};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = x;
+        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+          return false;
+        }
+
+        buffers[x].length = buf.length;
+        buffers[x].start = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (buffers[x].start == MAP_FAILED) {
+          buffers[x].start = nullptr;
+          return false;
+        }
+
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+          return false;
+        }
+      }
+
+      int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        return false;
+      }
+
+      streaming = true;
+      BOOST_LOG(info) << "RKMPP direct V4L2: capturing "sv << device << " as NV12 "sv << width << 'x' << height << '@' << fps;
+      return true;
+    }
+
+    bool copy_latest_to(AVFrame *mapped_frame, int dst_width, int dst_height) {
+      v4l2_buffer latest {};
+      bool have_latest = false;
+
+      for (;;) {
+        v4l2_buffer buf {};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+          if (errno == EAGAIN && !have_latest) {
+            pollfd pfd {fd, POLLIN, 0};
+            if (poll(&pfd, 1, 8) > 0) {
+              continue;
+            }
+          }
+          break;
+        }
+
+        if (have_latest) {
+          xioctl(fd, VIDIOC_QBUF, &latest);
+        }
+        latest = buf;
+        have_latest = true;
+      }
+
+      if (have_latest) {
+        auto *src = (const std::uint8_t *) buffers[latest.index].start;
+        latest_frame.assign(src, src + width * height * 3 / 2);
+        xioctl(fd, VIDIOC_QBUF, &latest);
+      }
+
+      if (latest_frame.empty()) {
+        return false;
+      }
+
+      copy_nv12(latest_frame.data(), mapped_frame, dst_width, dst_height);
+      return true;
+    }
+
+    int width {};
+    int height {};
+
+  private:
+    struct buffer_t {
+      void *start {};
+      std::size_t length {};
+    };
+
+    void stop() {
+      if (fd >= 0 && streaming) {
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        xioctl(fd, VIDIOC_STREAMOFF, &type);
+      }
+      streaming = false;
+
+      for (auto &buffer : buffers) {
+        if (buffer.start) {
+          munmap(buffer.start, buffer.length);
+        }
+      }
+      buffers.clear();
+
+      if (fd >= 0) {
+        close(fd);
+      }
+      fd = -1;
+    }
+
+    void copy_nv12(const std::uint8_t *src, AVFrame *dst, int dst_width, int dst_height) {
+      std::fill_n(dst->data[0], (std::size_t) dst->linesize[0] * dst_height, 16);
+      std::fill_n(dst->data[1], (std::size_t) dst->linesize[1] * (dst_height / 2), 128);
+
+      auto scale = std::min((float) dst_width / width, (float) dst_height / height);
+      auto out_w = std::max(2, (int) (width * scale) & ~1);
+      auto out_h = std::max(2, (int) (height * scale) & ~1);
+      auto off_x = ((dst_width - out_w) / 2) & ~1;
+      auto off_y = ((dst_height - out_h) / 2) & ~1;
+
+      const auto *src_y = src;
+      const auto *src_uv = src + width * height;
+
+      for (int y = 0; y < out_h; ++y) {
+        auto sy = std::min(height - 1, (int) ((std::int64_t) y * height / out_h));
+        auto *dst_row = dst->data[0] + (std::size_t) (off_y + y) * dst->linesize[0] + off_x;
+        const auto *src_row = src_y + (std::size_t) sy * width;
+        for (int x = 0; x < out_w; ++x) {
+          auto sx = std::min(width - 1, (int) ((std::int64_t) x * width / out_w));
+          dst_row[x] = src_row[sx];
+        }
+      }
+
+      for (int y = 0; y < out_h / 2; ++y) {
+        auto sy = std::min(height / 2 - 1, (int) ((std::int64_t) y * (height / 2) / (out_h / 2)));
+        auto *dst_row = dst->data[1] + (std::size_t) (off_y / 2 + y) * dst->linesize[1] + off_x;
+        const auto *src_row = src_uv + (std::size_t) sy * width;
+        for (int x = 0; x < out_w; x += 2) {
+          auto sx = std::min(width - 2, ((int) ((std::int64_t) x * width / out_w)) & ~1);
+          dst_row[x] = src_row[sx];
+          dst_row[x + 1] = src_row[sx + 1];
+        }
+      }
+    }
+
+    int fd {-1};
+    bool streaming {};
+    std::vector<std::uint8_t> latest_frame;
+    std::vector<buffer_t> buffers;
+  };
+
   class rkmpp_t: public platf::avcodec_encode_device_t {
   public:
     ~rkmpp_t() override {
@@ -83,7 +297,22 @@ namespace rkmpp {
       this->offset_y = offset_y;
       sequence = 0;
 
-      BOOST_LOG(info) << "Using RKMPP GPU-convert + read-back encode path"sv;
+      if (auto v4l2_device = std::getenv("SUNSHINE_RKMPP_V4L2")) {
+        if (*v4l2_device) {
+          auto source = std::make_unique<v4l2_nv12_source_t>();
+          if (source->init(v4l2_device, width, height, 60)) {
+            direct_v4l2 = std::move(source);
+          } else {
+            BOOST_LOG(warning) << "RKMPP direct V4L2 unavailable; falling back to KMS GPU-convert path"sv;
+          }
+        }
+      }
+
+      if (direct_v4l2) {
+        BOOST_LOG(info) << "Using RKMPP direct V4L2 NV12 encode path"sv;
+      } else {
+        BOOST_LOG(info) << "Using RKMPP GPU-convert + read-back encode path"sv;
+      }
 
       return 0;
     }
@@ -110,31 +339,62 @@ namespace rkmpp {
         }
       }
 
-      // Native NV12 render target the GPU converts into.
-      auto nv12_opt = egl::create_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
-      if (!nv12_opt) {
-        return -1;
-      }
+      if (!direct_v4l2) {
+        // Native NV12 render target the GPU converts into.
+        auto nv12_opt = egl::create_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
+        if (!nv12_opt) {
+          return -1;
+        }
 
-      auto sws_opt = egl::sws_t::make(width, height, frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
-      if (!sws_opt) {
-        return -1;
-      }
+        auto sws_opt = egl::sws_t::make(width, height, frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
+        if (!sws_opt) {
+          return -1;
+        }
 
-      this->nv12 = std::move(*nv12_opt);
-      this->sws = std::move(*sws_opt);
+        this->nv12 = std::move(*nv12_opt);
+        this->sws = std::move(*sws_opt);
+      }
 
       return 0;
     }
 
     void apply_colorspace() override {
-      sws.apply_colorspace(colorspace);
+      if (!direct_v4l2) {
+        sws.apply_colorspace(colorspace);
+      }
     }
 
     int convert(platf::img_t &img) override {
       // Our GL objects only exist in our context; make it current (the capture
       // display may have left its own context current on this thread).
       make_current();
+
+      video::avcodec_frame_t mapped_frame {av_frame_alloc()};
+      if (!mapped_frame) {
+        BOOST_LOG(error) << "Couldn't allocate RKMPP mapped frame"sv;
+        return -1;
+      }
+      mapped_frame->format = AV_PIX_FMT_NV12;
+
+      auto status = av_hwframe_map(mapped_frame.get(), frame, AV_HWFRAME_MAP_WRITE | AV_HWFRAME_MAP_OVERWRITE);
+      if (status < 0) {
+        char string[AV_ERROR_MAX_STRING_SIZE];
+        BOOST_LOG(error) << "Couldn't map RKMPP hwframe for writing: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+        return -1;
+      }
+
+      if (!mapped_frame->data[0] || !mapped_frame->data[1] || mapped_frame->linesize[0] <= 0 || mapped_frame->linesize[1] <= 0) {
+        BOOST_LOG(error) << "RKMPP mapped frame is not writable NV12"sv;
+        return -1;
+      }
+
+      if (direct_v4l2) {
+        if (!direct_v4l2->copy_latest_to(mapped_frame.get(), frame->width, frame->height)) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available"sv;
+          return -1;
+        }
+        return 0;
+      }
 
       auto &descriptor = (egl::img_descriptor_t &) img;
 
@@ -163,25 +423,6 @@ namespace rkmpp {
       }
 
       if (sws.convert(nv12->buf)) {
-        return -1;
-      }
-
-      video::avcodec_frame_t mapped_frame {av_frame_alloc()};
-      if (!mapped_frame) {
-        BOOST_LOG(error) << "Couldn't allocate RKMPP mapped frame"sv;
-        return -1;
-      }
-      mapped_frame->format = AV_PIX_FMT_NV12;
-
-      auto status = av_hwframe_map(mapped_frame.get(), frame, AV_HWFRAME_MAP_WRITE | AV_HWFRAME_MAP_OVERWRITE);
-      if (status < 0) {
-        char string[AV_ERROR_MAX_STRING_SIZE];
-        BOOST_LOG(error) << "Couldn't map RKMPP hwframe for writing: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
-        return -1;
-      }
-
-      if (!mapped_frame->data[0] || !mapped_frame->data[1] || mapped_frame->linesize[0] <= 0 || mapped_frame->linesize[1] <= 0) {
-        BOOST_LOG(error) << "RKMPP mapped frame is not writable NV12"sv;
         return -1;
       }
 
@@ -229,6 +470,7 @@ namespace rkmpp {
     int width {}, height {};
     int offset_x {}, offset_y {};
     std::uint64_t sequence {};
+    std::unique_ptr<v4l2_nv12_source_t> direct_v4l2;
 
   private:
     void make_current() {
