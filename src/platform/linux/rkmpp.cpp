@@ -177,7 +177,9 @@ namespace rkmpp {
 
       if (have_latest) {
         auto *src = (const std::uint8_t *) buffers[latest.index].start;
-        latest_frame.assign(src, src + width * height * 3 / 2);
+        if (!is_zeroed_nv12(src)) {
+          latest_frame.assign(src, src + width * height * 3 / 2);
+        }
         xioctl(fd, VIDIOC_QBUF, &latest);
       }
 
@@ -195,6 +197,19 @@ namespace rkmpp {
         return false;
       }
       missing_frame_logged = true;
+      return true;
+    }
+
+    bool is_zeroed_nv12(const std::uint8_t *src) const {
+      auto size = (std::size_t) width * height * 3 / 2;
+      auto step = std::max<std::size_t>(1, size / 4096);
+
+      for (std::size_t offset = 0; offset < size; offset += step) {
+        if (src[offset] != 0) {
+          return false;
+        }
+      }
+
       return true;
     }
 
