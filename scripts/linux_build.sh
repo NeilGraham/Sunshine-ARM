@@ -766,6 +766,7 @@ function run_step_cmake() {
       --jobs "$num_processors"
     cmake_args+=("-DFFMPEG_PREPARED_BINARIES=${build_dir}/ffmpeg-rkmpp")
     cmake_args+=("-DSUNSHINE_ENABLE_RKMPP=ON")
+    cmake_args+=("-DSUNSHINE_ENABLE_VULKAN=OFF")
   fi
 
   # Cmake stuff here
