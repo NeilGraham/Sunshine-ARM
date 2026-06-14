@@ -8,89 +8,16 @@
 
 #ifndef __cpp_lib_format
 
-#include <iomanip>
-#include <sstream>
-#include <stdexcept>
 #include <string>
 #include <string_view>
-#include <tuple>
-#include <type_traits>
 
-namespace sunshine_format_compat {
-  template<class T>
-  void append_arg(std::ostringstream &out, std::string_view spec, T &&value) {
-    if (spec == ":02x") {
-      auto flags = out.flags();
-      auto fill = out.fill();
-
-      out << std::hex << std::nouppercase << std::setw(2) << std::setfill('0');
-      if constexpr (std::is_integral_v<std::remove_cvref_t<T>>) {
-        out << static_cast<unsigned long long>(value);
-      } else {
-        out << value;
-      }
-
-      out.flags(flags);
-      out.fill(fill);
-      return;
-    }
-
-    if (!spec.empty() && spec != ":") {
-      throw std::runtime_error("unsupported std::format specifier");
-    }
-
-    out << std::forward<T>(value);
-  }
-
-  template<std::size_t I = 0, class Tuple>
-  void append_index(std::ostringstream &out, std::size_t index, std::string_view spec, Tuple &&tuple) {
-    if constexpr (I < std::tuple_size_v<std::remove_reference_t<Tuple>>) {
-      if (index == I) {
-        append_arg(out, spec, std::get<I>(std::forward<Tuple>(tuple)));
-      } else {
-        append_index<I + 1>(out, index, spec, std::forward<Tuple>(tuple));
-      }
-    } else {
-      throw std::runtime_error("not enough arguments for std::format");
-    }
-  }
-}  // namespace sunshine_format_compat
+#define FMT_HEADER_ONLY 1
+#include <fmt/format.h>
 
 namespace std {
   template<class... Args>
-  string format(string_view fmt, Args &&...args) {
-    ostringstream out;
-    auto tuple = std::forward_as_tuple(std::forward<Args>(args)...);
-    size_t arg_index = 0;
-
-    for (size_t i = 0; i < fmt.size(); ++i) {
-      if (fmt[i] == '{') {
-        if (i + 1 < fmt.size() && fmt[i + 1] == '{') {
-          out << '{';
-          ++i;
-          continue;
-        }
-
-        auto end = fmt.find('}', i + 1);
-        if (end == string_view::npos) {
-          throw runtime_error("invalid std::format string");
-        }
-
-        sunshine_format_compat::append_index(out, arg_index++, fmt.substr(i + 1, end - i - 1), tuple);
-        i = end;
-      } else if (fmt[i] == '}') {
-        if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
-          out << '}';
-          ++i;
-        } else {
-          throw runtime_error("invalid std::format string");
-        }
-      } else {
-        out << fmt[i];
-      }
-    }
-
-    return out.str();
+  string format(string_view fmt_str, Args &&...args) {
+    return fmt::vformat(fmt_str, fmt::make_format_args(args...));
   }
 }  // namespace std
 

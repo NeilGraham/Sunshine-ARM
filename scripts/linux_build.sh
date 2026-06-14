@@ -347,6 +347,7 @@ function add_debian_based_deps() {
     "libcurl4-openssl-dev"
     "libdrm-dev"  # KMS
     "libevdev-dev"
+    "libfmt-dev"
     "libgbm-dev"
     "libminiupnpc-dev"
     "libnotify-dev"

@@ -8,6 +8,10 @@ find_package(OpenSSL REQUIRED)
 # boost, this should be before Simple-Web-Server as it also depends on boost
 include(dependencies/Boost_Sunshine)
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+    include_directories(BEFORE "${CMAKE_SOURCE_DIR}")
+endif()
+
 # submodules
 # moonlight common library
 set(ENET_NO_INSTALL ON CACHE BOOL "Don't install any libraries built for enet")
