@@ -160,7 +160,8 @@ namespace rkmpp {
         if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
           if (errno == EAGAIN && !have_latest) {
             pollfd pfd {fd, POLLIN, 0};
-            if (poll(&pfd, 1, 8) > 0) {
+            auto timeout_ms = latest_frame.empty() ? 250 : 8;
+            if (poll(&pfd, 1, timeout_ms) > 0) {
               continue;
             }
           }
