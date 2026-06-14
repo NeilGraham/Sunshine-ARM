@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <poll.h>
+#include <string>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <tuple>
@@ -217,6 +218,21 @@ namespace rkmpp {
     }
 
     void copy_nv12(const std::uint8_t *src, AVFrame *dst, int dst_width, int dst_height) {
+      const auto *src_y = src;
+      const auto *src_uv = src + width * height;
+
+      if (dst_width == width && dst_height == height) {
+        for (int y = 0; y < height; ++y) {
+          std::memcpy(dst->data[0] + (std::size_t) y * dst->linesize[0], src_y + (std::size_t) y * width, width);
+        }
+
+        for (int y = 0; y < height / 2; ++y) {
+          std::memcpy(dst->data[1] + (std::size_t) y * dst->linesize[1], src_uv + (std::size_t) y * width, width);
+        }
+
+        return;
+      }
+
       std::fill_n(dst->data[0], (std::size_t) dst->linesize[0] * dst_height, 16);
       std::fill_n(dst->data[1], (std::size_t) dst->linesize[1] * (dst_height / 2), 128);
 
@@ -225,9 +241,6 @@ namespace rkmpp {
       auto out_h = std::max(2, (int) (height * scale) & ~1);
       auto off_x = ((dst_width - out_w) / 2) & ~1;
       auto off_y = ((dst_height - out_h) / 2) & ~1;
-
-      const auto *src_y = src;
-      const auto *src_uv = src + width * height;
 
       for (int y = 0; y < out_h; ++y) {
         auto sy = std::min(height - 1, (int) ((std::int64_t) y * height / out_h));
@@ -298,20 +311,7 @@ namespace rkmpp {
       sequence = 0;
 
       if (auto v4l2_device = std::getenv("SUNSHINE_RKMPP_V4L2")) {
-        if (*v4l2_device) {
-          auto source = std::make_unique<v4l2_nv12_source_t>();
-          if (source->init(v4l2_device, width, height, 60)) {
-            direct_v4l2 = std::move(source);
-          } else {
-            BOOST_LOG(warning) << "RKMPP direct V4L2 unavailable; falling back to KMS GPU-convert path"sv;
-          }
-        }
-      }
-
-      if (direct_v4l2) {
-        BOOST_LOG(info) << "Using RKMPP direct V4L2 NV12 encode path"sv;
-      } else {
-        BOOST_LOG(info) << "Using RKMPP GPU-convert + read-back encode path"sv;
+        direct_v4l2_device = v4l2_device;
       }
 
       return 0;
@@ -339,7 +339,20 @@ namespace rkmpp {
         }
       }
 
-      if (!direct_v4l2) {
+      if (!direct_v4l2_device.empty() && !direct_v4l2) {
+        auto source = std::make_unique<v4l2_nv12_source_t>();
+        if (source->init(direct_v4l2_device.c_str(), frame->width, frame->height, 60)) {
+          direct_v4l2 = std::move(source);
+        } else {
+          BOOST_LOG(warning) << "RKMPP direct V4L2 unavailable; falling back to KMS GPU-convert path"sv;
+        }
+      }
+
+      if (direct_v4l2) {
+        BOOST_LOG(info) << "Using RKMPP direct V4L2 NV12 encode path"sv;
+      } else {
+        BOOST_LOG(info) << "Using RKMPP GPU-convert + read-back encode path"sv;
+
         // Native NV12 render target the GPU converts into.
         auto nv12_opt = egl::create_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
         if (!nv12_opt) {
@@ -470,6 +483,7 @@ namespace rkmpp {
     int width {}, height {};
     int offset_x {}, offset_y {};
     std::uint64_t sequence {};
+    std::string direct_v4l2_device;
     std::unique_ptr<v4l2_nv12_source_t> direct_v4l2;
 
   private:
