@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <span>
 #include <sstream>
 
 // platform includes
