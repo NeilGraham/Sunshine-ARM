@@ -558,6 +558,7 @@ namespace egl {
    */
   std::vector<EGLAttrib> surface_descriptor_to_egl_attribs(const surface_descriptor_t &surface) {
     std::vector<EGLAttrib> attribs;
+    attribs.reserve(47);
 
     attribs.emplace_back(EGL_WIDTH);
     attribs.emplace_back(surface.width);
