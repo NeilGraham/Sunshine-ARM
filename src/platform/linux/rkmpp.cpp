@@ -95,9 +95,14 @@ namespace rkmpp {
 
       if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG &&
           (int) fmt.fmt.pix.width == width && (int) fmt.fmt.pix.height == height) {
-        const AVCodec *mjpeg_codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+        // Prefer hardware MJPEG decode; SW decoder is a fallback for kernels without MPP.
+        const AVCodec *mjpeg_codec = avcodec_find_decoder_by_name("mjpeg_rkmpp");
+        mjpeg_hw = (mjpeg_codec != nullptr);
         if (!mjpeg_codec) {
-          BOOST_LOG(warning) << "RKMPP direct V4L2: MJPEG decoder not available"sv;
+          mjpeg_codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+        }
+        if (!mjpeg_codec) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: no MJPEG decoder available"sv;
           return false;
         }
         mjpeg_ctx = avcodec_alloc_context3(mjpeg_codec);
@@ -159,7 +164,9 @@ namespace rkmpp {
 
       streaming = true;
       BOOST_LOG(info) << "RKMPP direct V4L2: capturing "sv << device
-                      << (is_mjpeg ? " as MJPEG(SW-decode)->NV12 "sv : " as NV12 "sv)
+                      << (is_mjpeg ? (mjpeg_hw ? " as MJPEG(HW-decode)->NV12 "sv
+                                               : " as MJPEG(SW-decode)->NV12 "sv)
+                                   : " as NV12 "sv)
                       << width << 'x' << height << '@' << fps;
       return true;
     }
@@ -341,39 +348,62 @@ namespace rkmpp {
         return false;
       }
 
-      AVFrame *yuv_frame = av_frame_alloc();
-      if (!yuv_frame) {
+      AVFrame *decoded = av_frame_alloc();
+      if (!decoded) {
         return false;
       }
-      ret = avcodec_receive_frame(mjpeg_ctx, yuv_frame);
+      ret = avcodec_receive_frame(mjpeg_ctx, decoded);
       if (ret < 0) {
-        av_frame_free(&yuv_frame);
+        av_frame_free(&decoded);
         return false;
       }
 
-      // Convert YUV420P/YUVJ420P planar output to NV12 semi-planar layout.
+      // mjpeg_rkmpp outputs DRM_PRIME (hardware buffer); download to CPU NV12.
+      // SW mjpeg decoder outputs YUVJ420P (planar).
+      AVFrame *cpu = decoded;
+      if (decoded->format == AV_PIX_FMT_DRM_PRIME) {
+        cpu = av_frame_alloc();
+        if (!cpu || av_hwframe_transfer_data(cpu, decoded, 0) < 0) {
+          av_frame_free(&cpu);
+          av_frame_free(&decoded);
+          return false;
+        }
+        av_frame_free(&decoded);
+      }
+
       auto nv12_size = (std::size_t) width * height * 3 / 2;
       latest_frame.resize(nv12_size);
-
-      auto *dst_y = latest_frame.data();
+      auto *dst_y  = latest_frame.data();
       auto *dst_uv = dst_y + (std::size_t) width * height;
 
+      // Y plane is the same layout for both NV12 and YUVJ420P.
       for (int y = 0; y < height; ++y) {
         std::memcpy(dst_y + (std::size_t) y * width,
-                    yuv_frame->data[0] + (std::size_t) y * yuv_frame->linesize[0],
+                    cpu->data[0] + (std::size_t) y * cpu->linesize[0],
                     width);
       }
-      for (int y = 0; y < height / 2; ++y) {
-        const auto *src_u = yuv_frame->data[1] + (std::size_t) y * yuv_frame->linesize[1];
-        const auto *src_v = yuv_frame->data[2] + (std::size_t) y * yuv_frame->linesize[2];
-        auto *dst_row = dst_uv + (std::size_t) y * width;
-        for (int x = 0; x < width / 2; ++x) {
-          dst_row[x * 2]     = src_u[x];
-          dst_row[x * 2 + 1] = src_v[x];
+
+      if (cpu->format == AV_PIX_FMT_NV12) {
+        // HW path: UV is already interleaved.
+        for (int y = 0; y < height / 2; ++y) {
+          std::memcpy(dst_uv + (std::size_t) y * width,
+                      cpu->data[1] + (std::size_t) y * cpu->linesize[1],
+                      width);
+        }
+      } else {
+        // SW path: YUVJ420P is planar; interleave U and V.
+        for (int y = 0; y < height / 2; ++y) {
+          const auto *src_u = cpu->data[1] + (std::size_t) y * cpu->linesize[1];
+          const auto *src_v = cpu->data[2] + (std::size_t) y * cpu->linesize[2];
+          auto *dst_row = dst_uv + (std::size_t) y * width;
+          for (int x = 0; x < width / 2; ++x) {
+            dst_row[x * 2]     = src_u[x];
+            dst_row[x * 2 + 1] = src_v[x];
+          }
         }
       }
 
-      av_frame_free(&yuv_frame);
+      av_frame_free(&cpu);
       return true;
     }
 
@@ -381,6 +411,7 @@ namespace rkmpp {
     bool streaming {};
     bool missing_frame_logged {};
     bool is_mjpeg {};
+    bool mjpeg_hw {};
     AVCodecContext *mjpeg_ctx {};
     std::vector<std::uint8_t> latest_frame;
     std::vector<buffer_t> buffers;
