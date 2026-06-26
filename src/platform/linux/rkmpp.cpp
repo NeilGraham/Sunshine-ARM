@@ -332,6 +332,7 @@ namespace rkmpp {
     }
 
     bool decode_mjpeg_to_nv12(const std::uint8_t *mjpeg_data, std::uint32_t mjpeg_size) {
+      if (mjpeg_size == 0) return false;
       AVPacket *pkt = av_packet_alloc();
       if (!pkt) {
         return false;
