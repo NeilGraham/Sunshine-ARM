@@ -93,7 +93,21 @@ namespace rkmpp {
         return false;
       }
 
-      if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 || (int) fmt.fmt.pix.width != width || (int) fmt.fmt.pix.height != height) {
+      if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG &&
+          (int) fmt.fmt.pix.width == width && (int) fmt.fmt.pix.height == height) {
+        const AVCodec *mjpeg_codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+        if (!mjpeg_codec) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: MJPEG decoder not available"sv;
+          return false;
+        }
+        mjpeg_ctx = avcodec_alloc_context3(mjpeg_codec);
+        if (!mjpeg_ctx || avcodec_open2(mjpeg_ctx, mjpeg_codec, nullptr) < 0) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: MJPEG avcodec_open2 failed"sv;
+          avcodec_free_context(&mjpeg_ctx);
+          return false;
+        }
+        is_mjpeg = true;
+      } else if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 || (int) fmt.fmt.pix.width != width || (int) fmt.fmt.pix.height != height) {
         BOOST_LOG(warning) << "RKMPP direct V4L2: device returned unsupported format "
                            << fmt.fmt.pix.width << 'x' << fmt.fmt.pix.height
                            << " fourcc=0x"sv << util::hex(fmt.fmt.pix.pixelformat).to_string_view();
@@ -144,7 +158,9 @@ namespace rkmpp {
       }
 
       streaming = true;
-      BOOST_LOG(info) << "RKMPP direct V4L2: capturing "sv << device << " as NV12 "sv << width << 'x' << height << '@' << fps;
+      BOOST_LOG(info) << "RKMPP direct V4L2: capturing "sv << device
+                      << (is_mjpeg ? " as MJPEG(SW-decode)->NV12 "sv : " as NV12 "sv)
+                      << width << 'x' << height << '@' << fps;
       return true;
     }
 
@@ -177,7 +193,9 @@ namespace rkmpp {
 
       if (have_latest) {
         auto *src = (const std::uint8_t *) buffers[latest.index].start;
-        if (!is_zeroed_nv12(src)) {
+        if (is_mjpeg) {
+          decode_mjpeg_to_nv12(src, latest.bytesused);
+        } else if (!is_zeroed_nv12(src)) {
           latest_frame.assign(src, src + width * height * 3 / 2);
         }
         xioctl(fd, VIDIOC_QBUF, &latest);
@@ -228,6 +246,10 @@ namespace rkmpp {
     };
 
     void stop() {
+      if (mjpeg_ctx) {
+        avcodec_free_context(&mjpeg_ctx);
+        mjpeg_ctx = nullptr;
+      }
       if (fd >= 0 && streaming) {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         xioctl(fd, VIDIOC_STREAMOFF, &type);
@@ -302,9 +324,64 @@ namespace rkmpp {
       }
     }
 
+    bool decode_mjpeg_to_nv12(const std::uint8_t *mjpeg_data, std::uint32_t mjpeg_size) {
+      AVPacket *pkt = av_packet_alloc();
+      if (!pkt) {
+        return false;
+      }
+      if (av_new_packet(pkt, (int) mjpeg_size) < 0) {
+        av_packet_free(&pkt);
+        return false;
+      }
+      std::memcpy(pkt->data, mjpeg_data, mjpeg_size);
+
+      int ret = avcodec_send_packet(mjpeg_ctx, pkt);
+      av_packet_free(&pkt);
+      if (ret < 0) {
+        return false;
+      }
+
+      AVFrame *yuv_frame = av_frame_alloc();
+      if (!yuv_frame) {
+        return false;
+      }
+      ret = avcodec_receive_frame(mjpeg_ctx, yuv_frame);
+      if (ret < 0) {
+        av_frame_free(&yuv_frame);
+        return false;
+      }
+
+      // Convert YUV420P/YUVJ420P planar output to NV12 semi-planar layout.
+      auto nv12_size = (std::size_t) width * height * 3 / 2;
+      latest_frame.resize(nv12_size);
+
+      auto *dst_y = latest_frame.data();
+      auto *dst_uv = dst_y + (std::size_t) width * height;
+
+      for (int y = 0; y < height; ++y) {
+        std::memcpy(dst_y + (std::size_t) y * width,
+                    yuv_frame->data[0] + (std::size_t) y * yuv_frame->linesize[0],
+                    width);
+      }
+      for (int y = 0; y < height / 2; ++y) {
+        const auto *src_u = yuv_frame->data[1] + (std::size_t) y * yuv_frame->linesize[1];
+        const auto *src_v = yuv_frame->data[2] + (std::size_t) y * yuv_frame->linesize[2];
+        auto *dst_row = dst_uv + (std::size_t) y * width;
+        for (int x = 0; x < width / 2; ++x) {
+          dst_row[x * 2]     = src_u[x];
+          dst_row[x * 2 + 1] = src_v[x];
+        }
+      }
+
+      av_frame_free(&yuv_frame);
+      return true;
+    }
+
     int fd {-1};
     bool streaming {};
     bool missing_frame_logged {};
+    bool is_mjpeg {};
+    AVCodecContext *mjpeg_ctx {};
     std::vector<std::uint8_t> latest_frame;
     std::vector<buffer_t> buffers;
   };
@@ -388,7 +465,7 @@ namespace rkmpp {
       }
 
       if (direct_v4l2) {
-        BOOST_LOG(info) << "Using RKMPP direct V4L2 NV12 encode path"sv;
+        BOOST_LOG(info) << "Using RKMPP direct V4L2 encode path"sv;
       } else {
         BOOST_LOG(info) << "Using RKMPP GPU-convert + read-back encode path"sv;
 
