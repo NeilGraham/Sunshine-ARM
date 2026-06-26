@@ -106,6 +106,10 @@ namespace rkmpp {
           return false;
         }
         mjpeg_ctx = avcodec_alloc_context3(mjpeg_codec);
+        if (mjpeg_ctx) {
+          mjpeg_ctx->width  = width;
+          mjpeg_ctx->height = height;
+        }
         if (!mjpeg_ctx || avcodec_open2(mjpeg_ctx, mjpeg_codec, nullptr) < 0) {
           BOOST_LOG(warning) << "RKMPP direct V4L2: MJPEG avcodec_open2 failed"sv;
           avcodec_free_context(&mjpeg_ctx);
