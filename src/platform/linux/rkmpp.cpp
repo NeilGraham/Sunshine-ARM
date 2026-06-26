@@ -95,11 +95,13 @@ namespace rkmpp {
 
       if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG &&
           (int) fmt.fmt.pix.width == width && (int) fmt.fmt.pix.height == height) {
-        // Prefer hardware MJPEG decode; SW decoder is a fallback for kernels without MPP.
-        const AVCodec *mjpeg_codec = avcodec_find_decoder_by_name("mjpeg_rkmpp");
-        mjpeg_hw = (mjpeg_codec != nullptr);
+        // SW MJPEG decoder handles all JPEG variants from UVC capture cards.
+        // mjpeg_rkmpp has stricter parser requirements and rejects some UVC MJPEG streams.
+        const AVCodec *mjpeg_codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+        mjpeg_hw = false;
         if (!mjpeg_codec) {
-          mjpeg_codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+          mjpeg_codec = avcodec_find_decoder_by_name("mjpeg_rkmpp");
+          mjpeg_hw    = (mjpeg_codec != nullptr);
         }
         if (!mjpeg_codec) {
           BOOST_LOG(warning) << "RKMPP direct V4L2: no MJPEG decoder available"sv;
