@@ -83,6 +83,8 @@ pushd "$build_dir" >/dev/null
   --disable-everything \
   --enable-libdrm \
   --enable-rkmpp \
+  --enable-decoder=mjpeg_rkmpp \
+  --enable-decoder=mjpeg \
   --enable-encoder=h264_rkmpp \
   --enable-encoder=hevc_rkmpp \
   --enable-bsf=h264_metadata \
