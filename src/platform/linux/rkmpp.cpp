@@ -22,6 +22,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
@@ -329,7 +330,17 @@ namespace rkmpp {
         {V4L2_PIX_FMT_BGR24, AV_PIX_FMT_BGR24},
       };
 
+      // SUNSHINE_RKMPP_V4L2_FORMAT (fed from [capture].format in retro-stream.toml)
+      // pins one format; unset/"auto" keeps the preference-ordered negotiation.
+      std::uint32_t forced = parse_forced_format(std::getenv("SUNSHINE_RKMPP_V4L2_FORMAT"));
+      if (forced) {
+        BOOST_LOG(info) << "RKMPP direct V4L2: format pinned to "sv << fourcc_str(forced);
+      }
+
       for (auto candidate : candidates) {
+        if (forced && candidate.v4l2 != forced) {
+          continue;
+        }
         v4l2_format fmt {};
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width = width;
@@ -357,9 +368,57 @@ namespace rkmpp {
         return true;
       }
 
-      BOOST_LOG(warning) << "RKMPP direct V4L2: device offers no supported pixel format at "sv
-                         << width << 'x' << height;
+      if (forced) {
+        BOOST_LOG(warning) << "RKMPP direct V4L2: pinned format "sv << fourcc_str(forced)
+                           << " not supported by device at "sv << width << 'x' << height;
+      } else {
+        BOOST_LOG(warning) << "RKMPP direct V4L2: device offers no supported pixel format at "sv
+                           << width << 'x' << height;
+      }
       return false;
+    }
+
+    // FourCC (e.g. V4L2_PIX_FMT_YUYV) as its four ASCII characters, for logs.
+    static std::string fourcc_str(std::uint32_t fourcc) {
+      char chars[5] = {
+        (char) (fourcc & 0xff),
+        (char) ((fourcc >> 8) & 0xff),
+        (char) ((fourcc >> 16) & 0xff),
+        (char) ((fourcc >> 24) & 0xff),
+        0,
+      };
+      return chars;
+    }
+
+    // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc, or 0 for
+    // auto/unset/unknown (negotiate normally). Accepts the retro-stream config
+    // tokens and common synonyms.
+    static std::uint32_t parse_forced_format(const char *env) {
+      if (!env) {
+        return 0;
+      }
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      if (v.empty() || v == "auto") {
+        return 0;
+      }
+      if (v == "nv12") {
+        return V4L2_PIX_FMT_NV12;
+      }
+      if (v == "mjpeg" || v == "mjpg") {
+        return V4L2_PIX_FMT_MJPEG;
+      }
+      if (v == "yuyv" || v == "yuyv422" || v == "yuy2") {
+        return V4L2_PIX_FMT_YUYV;
+      }
+      if (v == "yu12" || v == "yuv420" || v == "i420") {
+        return V4L2_PIX_FMT_YUV420;
+      }
+      if (v == "bgr3" || v == "bgr24") {
+        return V4L2_PIX_FMT_BGR24;
+      }
+      BOOST_LOG(warning) << "RKMPP direct V4L2: unknown SUNSHINE_RKMPP_V4L2_FORMAT '"sv << env << "'; using auto"sv;
+      return 0;
     }
 
     bool open_mjpeg_decoder(int width, int height) {
