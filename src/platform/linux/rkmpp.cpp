@@ -21,6 +21,7 @@
  * colour conversion; the only remaining cost is a single NV12 read-back.
  */
 // standard includes
+#include <array>
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -337,15 +338,26 @@ namespace rkmpp {
       };
 
       // SUNSHINE_RKMPP_V4L2_FORMAT (fed from [capture].format in retro-stream.toml)
-      // pins one format; unset/"auto" keeps the preference-ordered negotiation.
+      // keeps the default preference-ordered negotiation unless a format is
+      // explicitly pinned.
       auto forced = parse_forced_format(std::getenv("SUNSHINE_RKMPP_V4L2_FORMAT"));
-      if (forced.is_forced) {
+      std::array<std::size_t, sizeof(candidates) / sizeof(candidates[0])> order {
+        0, 1, 2, 3, 4
+      };
+      const bool mjpeg_prefers_fallback = forced.is_forced && forced.v4l2 == V4L2_PIX_FMT_MJPEG;
+
+      if (mjpeg_prefers_fallback) {
+        BOOST_LOG(info) << "RKMPP direct V4L2: format preference "sv << fourcc_str(forced.v4l2)
+                        << (forced.mjpeg_hw ? " with hardware MJPEG decode"sv : ""sv);
+        order = std::array<std::size_t, sizeof(candidates) / sizeof(candidates[0])> {4, 0, 1, 2, 3};
+      } else if (forced.is_forced) {
         BOOST_LOG(info) << "RKMPP direct V4L2: format pinned to "sv << fourcc_str(forced.v4l2)
                         << (forced.mjpeg_hw ? " with hardware MJPEG decode"sv : ""sv);
       }
 
-      for (auto candidate : candidates) {
-        if (forced.is_forced && candidate.v4l2 != forced.v4l2) {
+      for (auto idx : order) {
+        auto candidate = candidates[idx];
+        if (forced.is_forced && !mjpeg_prefers_fallback && candidate.v4l2 != forced.v4l2) {
           continue;
         }
         v4l2_format fmt {};
@@ -371,6 +383,10 @@ namespace rkmpp {
         } else if (candidate.av != AV_PIX_FMT_NONE) {
           raw_av_fmt = candidate.av;
           is_raw_convert = true;
+          if (mjpeg_prefers_fallback) {
+            BOOST_LOG(info) << "RKMPP direct V4L2: MJPG unsupported at "sv << width << 'x' << height
+                            << "; falling back to "sv << fourcc_str(candidate.v4l2);
+          }
         }
         return true;
       }
@@ -397,8 +413,10 @@ namespace rkmpp {
       return chars;
     }
 
-    // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc. "mjpeg" uses
-    // software decode; only "mjpeg-hw" opts into the potentially blocking
+    // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc. Plain "mjpeg"
+    // still uses software decode, but the capture negotiation treats it as a
+    // preference rather than a hard pin so unsupported resolutions can fall
+    // back to a raw format. Only "mjpeg-hw" opts into the potentially blocking
     // mjpeg_rkmpp decoder for experiments.
     static forced_format_t parse_forced_format(const char *env) {
       if (!env) {
