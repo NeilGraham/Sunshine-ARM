@@ -83,6 +83,7 @@ namespace rkmpp {
         return false;
       }
 
+      forced_aspect_ratio = parse_aspect_ratio(std::getenv("SUNSHINE_RKMPP_ASPECT_RATIO"));
       if (!negotiate_format(width, height)) {
         return false;
       }
@@ -284,9 +285,15 @@ namespace rkmpp {
       std::fill_n(dst->data[0], (std::size_t) dst->linesize[0] * dst_height, 16);
       std::fill_n(dst->data[1], (std::size_t) dst->linesize[1] * (dst_height / 2), 128);
 
-      auto scale = std::min((float) dst_width / width, (float) dst_height / height);
-      auto out_w = std::max(2, (int) (width * scale) & ~1);
-      auto out_h = std::max(2, (int) (height * scale) & ~1);
+      auto output_aspect = forced_aspect_ratio > 0.0f ? forced_aspect_ratio : (float) width / height;
+      auto out_w = dst_width;
+      auto out_h = (int) (dst_width / output_aspect);
+      if (out_h > dst_height) {
+        out_h = dst_height;
+        out_w = (int) (dst_height * output_aspect);
+      }
+      out_w = std::max(2, out_w & ~1);
+      out_h = std::max(2, out_h & ~1);
       auto off_x = ((dst_width - out_w) / 2) & ~1;
       auto off_y = ((dst_height - out_h) / 2) & ~1;
 
@@ -449,6 +456,44 @@ namespace rkmpp {
         0,
       };
       return chars;
+    }
+
+    static float parse_aspect_ratio(const char *env) {
+      if (!env || !*env) {
+        return 0.0f;
+      }
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c); }), v.end());
+      if (v.empty() || v == "auto" || v == "current") {
+        return 0.0f;
+      }
+
+      auto colon = v.find(':');
+      if (colon == std::string::npos) {
+        colon = v.find('/');
+      }
+      if (colon != std::string::npos) {
+        try {
+          auto num = std::stof(v.substr(0, colon));
+          auto den = std::stof(v.substr(colon + 1));
+          if (num > 0.0f && den > 0.0f) {
+            return num / den;
+          }
+        } catch (...) {
+        }
+      }
+
+      try {
+        auto ratio = std::stof(v);
+        if (ratio > 0.0f) {
+          return ratio;
+        }
+      } catch (...) {
+      }
+
+      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_ASPECT_RATIO '"sv << env << "'; using auto"sv;
+      return 0.0f;
     }
 
     // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc. Plain "mjpeg"
@@ -750,6 +795,7 @@ namespace rkmpp {
     bool is_mjpeg {};
     bool mjpeg_hw {};
     bool is_raw_convert {};
+    float forced_aspect_ratio {};
     std::uint32_t capture_fourcc {V4L2_PIX_FMT_NV12};
     AVPixelFormat raw_av_fmt {AV_PIX_FMT_NONE};
     AVCodecContext *mjpeg_ctx {};
