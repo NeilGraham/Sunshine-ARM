@@ -34,6 +34,7 @@
 #include <sys/mman.h>
 #include <tuple>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 // lib includes
@@ -81,9 +82,6 @@ namespace rkmpp {
         BOOST_LOG(warning) << "RKMPP direct V4L2: couldn't open "sv << device << ": "sv << strerror_r(errno, string, sizeof(string));
         return false;
       }
-
-      this->width = width;
-      this->height = height;
 
       if (!negotiate_format(width, height)) {
         return false;
@@ -142,7 +140,7 @@ namespace rkmpp {
         format_label = "NV12";
       }
       BOOST_LOG(info) << "RKMPP direct V4L2: capturing "sv << device << " as "sv << format_label
-                      << ' ' << width << 'x' << height << '@' << fps;
+                      << ' ' << this->width << 'x' << this->height << '@' << fps;
       return true;
     }
 
@@ -325,7 +323,7 @@ namespace rkmpp {
     // MJPEG decoded with software. Hardware MJPEG is only used when explicitly
     // requested with SUNSHINE_RKMPP_V4L2_FORMAT=mjpeg-hw because mjpeg_rkmpp can
     // block inside MPP on UVC streams.
-    bool negotiate_format(int width, int height) {
+    bool negotiate_format(int requested_width, int requested_height) {
       static const struct {
         std::uint32_t v4l2;
         AVPixelFormat av;  // AV_PIX_FMT_NONE: NV12 (native) or MJPEG (decoded)
@@ -355,50 +353,90 @@ namespace rkmpp {
                         << (forced.mjpeg_hw ? " with hardware MJPEG decode"sv : ""sv);
       }
 
-      for (auto idx : order) {
-        auto candidate = candidates[idx];
-        if (forced.is_forced && !mjpeg_prefers_fallback && candidate.v4l2 != forced.v4l2) {
-          continue;
-        }
-        v4l2_format fmt {};
-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        fmt.fmt.pix.width = width;
-        fmt.fmt.pix.height = height;
-        fmt.fmt.pix.pixelformat = candidate.v4l2;
-        fmt.fmt.pix.field = V4L2_FIELD_NONE;
-        if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-          continue;
-        }
-        if (fmt.fmt.pix.pixelformat != candidate.v4l2 ||
-            (int) fmt.fmt.pix.width != width || (int) fmt.fmt.pix.height != height) {
-          continue;
-        }
+      const auto sizes = capture_size_fallbacks(requested_width, requested_height);
+      for (auto size : sizes) {
+        for (auto idx : order) {
+          auto candidate = candidates[idx];
+          if (forced.is_forced && !mjpeg_prefers_fallback && candidate.v4l2 != forced.v4l2) {
+            continue;
+          }
+          v4l2_format fmt {};
+          fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+          fmt.fmt.pix.width = size.first;
+          fmt.fmt.pix.height = size.second;
+          fmt.fmt.pix.pixelformat = candidate.v4l2;
+          fmt.fmt.pix.field = V4L2_FIELD_NONE;
+          if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+            continue;
+          }
+          if (fmt.fmt.pix.pixelformat != candidate.v4l2 ||
+              (int) fmt.fmt.pix.width != size.first || (int) fmt.fmt.pix.height != size.second) {
+            continue;
+          }
 
-        capture_fourcc = candidate.v4l2;
-        if (candidate.v4l2 == V4L2_PIX_FMT_MJPEG) {
-          if (!open_mjpeg_decoder(width, height, forced.mjpeg_hw)) {
+          if (!activate_format(candidate.v4l2, candidate.av, size.first, size.second, forced.mjpeg_hw)) {
             return false;
           }
-          is_mjpeg = true;
-        } else if (candidate.av != AV_PIX_FMT_NONE) {
-          raw_av_fmt = candidate.av;
-          is_raw_convert = true;
-          if (mjpeg_prefers_fallback) {
-            BOOST_LOG(info) << "RKMPP direct V4L2: MJPG unsupported at "sv << width << 'x' << height
+          if (size.first != requested_width || size.second != requested_height) {
+            BOOST_LOG(info) << "RKMPP direct V4L2: requested "sv << requested_width << 'x' << requested_height
+                            << " unavailable; capturing "sv << size.first << 'x' << size.second
+                            << " and scaling to encoder frame"sv;
+          }
+          if (mjpeg_prefers_fallback && candidate.v4l2 != V4L2_PIX_FMT_MJPEG) {
+            BOOST_LOG(info) << "RKMPP direct V4L2: MJPG unsupported at "sv << size.first << 'x' << size.second
                             << "; falling back to "sv << fourcc_str(candidate.v4l2);
           }
+          return true;
         }
-        return true;
       }
 
       if (forced.is_forced) {
         BOOST_LOG(warning) << "RKMPP direct V4L2: pinned format "sv << fourcc_str(forced.v4l2)
-                           << " not supported by device at "sv << width << 'x' << height;
+                           << " not supported by device at "sv << requested_width << 'x' << requested_height;
       } else {
         BOOST_LOG(warning) << "RKMPP direct V4L2: device offers no supported pixel format at "sv
-                           << width << 'x' << height;
+                           << requested_width << 'x' << requested_height;
       }
       return false;
+    }
+
+    static std::vector<std::pair<int, int>> capture_size_fallbacks(int width, int height) {
+      std::vector<std::pair<int, int>> sizes;
+      auto add = [&](int w, int h) {
+        if (std::find(sizes.begin(), sizes.end(), std::make_pair(w, h)) == sizes.end()) {
+          sizes.emplace_back(w, h);
+        }
+      };
+
+      add(width, height);
+      if (height == 480) {
+        add(720, 480);
+        add(640, 480);
+      } else if (height == 576) {
+        add(720, 576);
+      }
+
+      return sizes;
+    }
+
+    bool activate_format(std::uint32_t v4l2, AVPixelFormat av, int width, int height, bool mjpeg_hw) {
+      capture_fourcc = v4l2;
+      this->width = width;
+      this->height = height;
+      is_mjpeg = false;
+      is_raw_convert = false;
+      raw_av_fmt = AV_PIX_FMT_NONE;
+
+      if (v4l2 == V4L2_PIX_FMT_MJPEG) {
+        if (!open_mjpeg_decoder(width, height, mjpeg_hw)) {
+          return false;
+        }
+        is_mjpeg = true;
+      } else if (av != AV_PIX_FMT_NONE) {
+        raw_av_fmt = av;
+        is_raw_convert = true;
+      }
+      return true;
     }
 
     // FourCC (e.g. V4L2_PIX_FMT_YUYV) as its four ASCII characters, for logs.
@@ -586,6 +624,51 @@ namespace rkmpp {
       return true;
     }
 
+    bool convert_planar_yuv_to_nv12(const AVFrame *cpu, std::vector<std::uint8_t> &out) {
+      const auto pix_fmt = (AVPixelFormat) cpu->format;
+      const bool is_420 = pix_fmt == AV_PIX_FMT_YUV420P || pix_fmt == AV_PIX_FMT_YUVJ420P;
+      const bool is_422 = pix_fmt == AV_PIX_FMT_YUV422P || pix_fmt == AV_PIX_FMT_YUVJ422P;
+      if (!is_420 && !is_422) {
+        return false;
+      }
+
+      auto *dst_y = out.data();
+      auto *dst_uv = dst_y + (std::size_t) width * height;
+
+      for (int y = 0; y < height; ++y) {
+        std::memcpy(dst_y + (std::size_t) y * width,
+                    cpu->data[0] + (std::size_t) y * cpu->linesize[0],
+                    width);
+      }
+
+      for (int y = 0; y < height / 2; ++y) {
+        const auto *src_u0 = cpu->data[1] + (std::size_t) y * cpu->linesize[1];
+        const auto *src_v0 = cpu->data[2] + (std::size_t) y * cpu->linesize[2];
+        const std::uint8_t *src_u1 = src_u0;
+        const std::uint8_t *src_v1 = src_v0;
+
+        if (is_422) {
+          src_u0 = cpu->data[1] + (std::size_t) (y * 2) * cpu->linesize[1];
+          src_v0 = cpu->data[2] + (std::size_t) (y * 2) * cpu->linesize[2];
+          src_u1 = cpu->data[1] + (std::size_t) std::min(y * 2 + 1, height - 1) * cpu->linesize[1];
+          src_v1 = cpu->data[2] + (std::size_t) std::min(y * 2 + 1, height - 1) * cpu->linesize[2];
+        }
+
+        auto *dst = dst_uv + (std::size_t) y * width;
+        for (int x = 0; x < width / 2; ++x) {
+          if (is_422) {
+            dst[x * 2] = (std::uint8_t) (((int) src_u0[x] + src_u1[x] + 1) / 2);
+            dst[x * 2 + 1] = (std::uint8_t) (((int) src_v0[x] + src_v1[x] + 1) / 2);
+          } else {
+            dst[x * 2] = src_u0[x];
+            dst[x * 2 + 1] = src_v0[x];
+          }
+        }
+      }
+
+      return true;
+    }
+
     bool decode_mjpeg_to_nv12(const std::uint8_t *mjpeg_data, std::uint32_t mjpeg_size) {
       if (mjpeg_size == 0) return false;
 
@@ -600,7 +683,7 @@ namespace rkmpp {
 
       // mjpeg_rkmpp outputs DRM_PRIME (hardware buffer); download to CPU NV12.
       // SW MJPEG may output 4:2:0 or 4:2:2 planar JPEG formats, so normalize
-      // anything non-NV12 through swscale instead of assuming a fixed layout.
+      // known layouts directly and keep swscale as the uncommon-format fallback.
       AVFrame *cpu = decoded;
       if (decoded->format == AV_PIX_FMT_DRM_PRIME) {
         cpu = av_frame_alloc();
@@ -615,6 +698,7 @@ namespace rkmpp {
       auto nv12_size = (std::size_t) width * height * 3 / 2;
       latest_frame.resize(nv12_size);
 
+      bool converted = false;
       if (cpu->format == AV_PIX_FMT_NV12) {
         auto *dst_y  = latest_frame.data();
         auto *dst_uv = dst_y + (std::size_t) width * height;
@@ -630,7 +714,12 @@ namespace rkmpp {
                       cpu->data[1] + (std::size_t) y * cpu->linesize[1],
                       width);
         }
+        converted = true;
       } else {
+        converted = convert_planar_yuv_to_nv12(cpu, latest_frame);
+      }
+
+      if (!converted) {
         std::uint8_t *dst[4] = {latest_frame.data(), latest_frame.data() + (std::size_t) width * height, nullptr, nullptr};
         int dst_stride[4] = {width, width, 0, 0};
 
