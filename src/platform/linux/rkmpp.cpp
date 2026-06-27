@@ -69,6 +69,12 @@ namespace rkmpp {
     return status;
   }
 
+  enum class scale_filter_e {
+    automatic,
+    nearest,
+    linear,
+  };
+
   class v4l2_nv12_source_t {
   public:
     ~v4l2_nv12_source_t() {
@@ -84,6 +90,7 @@ namespace rkmpp {
       }
 
       forced_aspect_ratio = parse_aspect_ratio(std::getenv("SUNSHINE_RKMPP_ASPECT_RATIO"));
+      scale_filter = parse_scale_filter(std::getenv("SUNSHINE_RKMPP_SCALE_FILTER"));
       if (!negotiate_format(width, height)) {
         return false;
       }
@@ -297,6 +304,16 @@ namespace rkmpp {
       auto off_x = ((dst_width - out_w) / 2) & ~1;
       auto off_y = ((dst_height - out_h) / 2) & ~1;
 
+      const bool linear_scale = scale_filter == scale_filter_e::linear ||
+                                (scale_filter == scale_filter_e::automatic && (out_w != width || out_h != height));
+      if (linear_scale) {
+        scale_nv12_linear(src_y, src_uv, dst, off_x, off_y, out_w, out_h);
+      } else {
+        scale_nv12_nearest(src_y, src_uv, dst, off_x, off_y, out_w, out_h);
+      }
+    }
+
+    void scale_nv12_nearest(const std::uint8_t *src_y, const std::uint8_t *src_uv, AVFrame *dst, int off_x, int off_y, int out_w, int out_h) {
       for (int y = 0; y < out_h; ++y) {
         auto sy = std::min(height - 1, (int) ((std::int64_t) y * height / out_h));
         auto *dst_row = dst->data[0] + (std::size_t) (off_y + y) * dst->linesize[0] + off_x;
@@ -317,6 +334,50 @@ namespace rkmpp {
           dst_row[x + 1] = src_row[sx + 1];
         }
       }
+    }
+
+    void scale_plane_linear(const std::uint8_t *src, int src_stride, int src_w, int src_h, std::uint8_t *dst, int dst_stride, int dst_w, int dst_h, int channels) {
+      for (int y = 0; y < dst_h; ++y) {
+        float src_y_f = ((y + 0.5f) * src_h / dst_h) - 0.5f;
+        if (src_y_f < 0.0f) {
+          src_y_f = 0.0f;
+        }
+        int y0 = std::min(src_h - 1, (int) src_y_f);
+        int y1 = std::min(src_h - 1, y0 + 1);
+        float fy = src_y_f - y0;
+
+        auto *dst_row = dst + (std::size_t) y * dst_stride;
+        const auto *src_row0 = src + (std::size_t) y0 * src_stride;
+        const auto *src_row1 = src + (std::size_t) y1 * src_stride;
+        for (int x = 0; x < dst_w; ++x) {
+          float src_x_f = ((x + 0.5f) * src_w / dst_w) - 0.5f;
+          if (src_x_f < 0.0f) {
+            src_x_f = 0.0f;
+          }
+          int x0 = std::min(src_w - 1, (int) src_x_f);
+          int x1 = std::min(src_w - 1, x0 + 1);
+          float fx = src_x_f - x0;
+
+          for (int c = 0; c < channels; ++c) {
+            auto p00 = src_row0[x0 * channels + c];
+            auto p10 = src_row0[x1 * channels + c];
+            auto p01 = src_row1[x0 * channels + c];
+            auto p11 = src_row1[x1 * channels + c];
+            auto top = p00 + (p10 - p00) * fx;
+            auto bottom = p01 + (p11 - p01) * fx;
+            auto value = top + (bottom - top) * fy;
+            dst_row[x * channels + c] = (std::uint8_t) std::min(255.0f, std::max(0.0f, value + 0.5f));
+          }
+        }
+      }
+    }
+
+    void scale_nv12_linear(const std::uint8_t *src_y, const std::uint8_t *src_uv, AVFrame *dst, int off_x, int off_y, int out_w, int out_h) {
+      auto *dst_y = dst->data[0] + (std::size_t) off_y * dst->linesize[0] + off_x;
+      auto *dst_uv = dst->data[1] + (std::size_t) (off_y / 2) * dst->linesize[1] + off_x;
+
+      scale_plane_linear(src_y, width, width, height, dst_y, dst->linesize[0], out_w, out_h, 1);
+      scale_plane_linear(src_uv, width, width / 2, height / 2, dst_uv, dst->linesize[1], out_w / 2, out_h / 2, 2);
     }
 
     struct forced_format_t {
@@ -494,6 +555,28 @@ namespace rkmpp {
 
       BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_ASPECT_RATIO '"sv << env << "'; using auto"sv;
       return 0.0f;
+    }
+
+    static scale_filter_e parse_scale_filter(const char *env) {
+      if (!env || !*env) {
+        return scale_filter_e::automatic;
+      }
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c) || c == '-' || c == '_'; }), v.end());
+
+      if (v.empty() || v == "auto" || v == "automatic") {
+        return scale_filter_e::automatic;
+      }
+      if (v == "nearest" || v == "point") {
+        return scale_filter_e::nearest;
+      }
+      if (v == "linear" || v == "bilinear") {
+        return scale_filter_e::linear;
+      }
+
+      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_SCALE_FILTER '"sv << env << "'; using auto"sv;
+      return scale_filter_e::automatic;
     }
 
     // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc. Plain "mjpeg"
@@ -796,6 +879,7 @@ namespace rkmpp {
     bool mjpeg_hw {};
     bool is_raw_convert {};
     float forced_aspect_ratio {};
+    scale_filter_e scale_filter {scale_filter_e::automatic};
     std::uint32_t capture_fourcc {V4L2_PIX_FMT_NV12};
     AVPixelFormat raw_av_fmt {AV_PIX_FMT_NONE};
     AVCodecContext *mjpeg_ctx {};
