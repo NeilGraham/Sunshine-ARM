@@ -1,0 +1,24 @@
+# Furnace config for building the Rockchip RKMPP Sunshine fork on `mbp`.
+#
+# `furnace run` syncs this checkout to mbp's reusable remote workspace, builds it
+# inside the Debian image furnace infers for this host (overridden by the
+# furnace/<platform>.Dockerfile next to this file — debian-12-bookworm by
+# default), then pulls the packaged .deb back to build/cpack_artifacts/.
+#
+# The image bakes in ffmpeg-rockchip at /opt; the first build compiles it into
+# build/ffmpeg-rkmpp and furnace's persistent (gitignore-protected) build/ keeps
+# it cached, so later builds only recompile Sunshine.
+#
+# Deploy the pulled package with scripts/copy_build_to_rock_3c.sh (or scp +
+# `sudo apt install`), then `sudo systemctl restart sunshine`.
+#
+# To build Debian 13 instead, force the trixie image:
+#   furnace run --image furnace/debian-13-trixie.Dockerfile
+
+[run]
+ssh = "mbp"
+docker = true
+include_pull = ["build/cpack_artifacts/Sunshine.deb"]
+commands = [
+    "./scripts/linux_build.sh --sudo-off --skip-cuda --num-processors=4 --rkmpp=/opt/ffmpeg-rockchip",
+]

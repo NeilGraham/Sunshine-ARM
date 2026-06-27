@@ -41,7 +41,9 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 }
 
 // local includes
@@ -81,47 +83,7 @@ namespace rkmpp {
       this->width = width;
       this->height = height;
 
-      v4l2_format fmt {};
-      fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-      fmt.fmt.pix.width = width;
-      fmt.fmt.pix.height = height;
-      fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
-      fmt.fmt.pix.field = V4L2_FIELD_NONE;
-      if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-        char string[1024];
-        BOOST_LOG(warning) << "RKMPP direct V4L2: VIDIOC_S_FMT failed: "sv << strerror_r(errno, string, sizeof(string));
-        return false;
-      }
-
-      if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG &&
-          (int) fmt.fmt.pix.width == width && (int) fmt.fmt.pix.height == height) {
-        // SW MJPEG decoder handles all JPEG variants from UVC capture cards.
-        // mjpeg_rkmpp has stricter parser requirements and rejects some UVC MJPEG streams.
-        const AVCodec *mjpeg_codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
-        mjpeg_hw = false;
-        if (!mjpeg_codec) {
-          mjpeg_codec = avcodec_find_decoder_by_name("mjpeg_rkmpp");
-          mjpeg_hw    = (mjpeg_codec != nullptr);
-        }
-        if (!mjpeg_codec) {
-          BOOST_LOG(warning) << "RKMPP direct V4L2: no MJPEG decoder available"sv;
-          return false;
-        }
-        mjpeg_ctx = avcodec_alloc_context3(mjpeg_codec);
-        if (mjpeg_ctx) {
-          mjpeg_ctx->width  = width;
-          mjpeg_ctx->height = height;
-        }
-        if (!mjpeg_ctx || avcodec_open2(mjpeg_ctx, mjpeg_codec, nullptr) < 0) {
-          BOOST_LOG(warning) << "RKMPP direct V4L2: MJPEG avcodec_open2 failed"sv;
-          avcodec_free_context(&mjpeg_ctx);
-          return false;
-        }
-        is_mjpeg = true;
-      } else if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 || (int) fmt.fmt.pix.width != width || (int) fmt.fmt.pix.height != height) {
-        BOOST_LOG(warning) << "RKMPP direct V4L2: device returned unsupported format "
-                           << fmt.fmt.pix.width << 'x' << fmt.fmt.pix.height
-                           << " fourcc=0x"sv << util::hex(fmt.fmt.pix.pixelformat).to_string_view();
+      if (!negotiate_format(width, height)) {
         return false;
       }
 
@@ -169,11 +131,16 @@ namespace rkmpp {
       }
 
       streaming = true;
-      BOOST_LOG(info) << "RKMPP direct V4L2: capturing "sv << device
-                      << (is_mjpeg ? (mjpeg_hw ? " as MJPEG(HW-decode)->NV12 "sv
-                                               : " as MJPEG(SW-decode)->NV12 "sv)
-                                   : " as NV12 "sv)
-                      << width << 'x' << height << '@' << fps;
+      std::string format_label;
+      if (is_mjpeg) {
+        format_label = mjpeg_hw ? "MJPEG(HW-decode)->NV12" : "MJPEG(SW-decode)->NV12";
+      } else if (is_raw_convert) {
+        format_label = std::string(av_get_pix_fmt_name(raw_av_fmt)) + "(swscale)->NV12";
+      } else {
+        format_label = "NV12";
+      }
+      BOOST_LOG(info) << "RKMPP direct V4L2: capturing "sv << device << " as "sv << format_label
+                      << ' ' << width << 'x' << height << '@' << fps;
       return true;
     }
 
@@ -208,6 +175,10 @@ namespace rkmpp {
         auto *src = (const std::uint8_t *) buffers[latest.index].start;
         if (is_mjpeg) {
           decode_mjpeg_to_nv12(src, latest.bytesused);
+        } else if (is_raw_convert) {
+          if (convert_raw_to_nv12(src, convert_buf) && !is_zeroed_nv12(convert_buf.data())) {
+            latest_frame = convert_buf;
+          }
         } else if (!is_zeroed_nv12(src)) {
           latest_frame.assign(src, src + width * height * 3 / 2);
         }
@@ -262,6 +233,10 @@ namespace rkmpp {
       if (mjpeg_ctx) {
         avcodec_free_context(&mjpeg_ctx);
         mjpeg_ctx = nullptr;
+      }
+      if (sws_ctx) {
+        sws_freeContext(sws_ctx);
+        sws_ctx = nullptr;
       }
       if (fd >= 0 && streaming) {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -337,31 +312,178 @@ namespace rkmpp {
       }
     }
 
-    bool decode_mjpeg_to_nv12(const std::uint8_t *mjpeg_data, std::uint32_t mjpeg_size) {
-      if (mjpeg_size == 0) return false;
+    // Negotiate the capture format, preferring the one that reaches NV12 with
+    // the least work: NV12 (native, no conversion), then YU12/YUYV/BGR3
+    // (converted with libswscale), then MJPEG (decoded with libavcodec). A card
+    // may expose any subset, so we ask for each in turn and accept the first it
+    // keeps at the requested resolution. Returns false if it accepts none.
+    bool negotiate_format(int width, int height) {
+      static const struct {
+        std::uint32_t v4l2;
+        AVPixelFormat av;  // AV_PIX_FMT_NONE: NV12 (native) or MJPEG (decoded)
+      } candidates[] = {
+        {V4L2_PIX_FMT_NV12, AV_PIX_FMT_NONE},    // native, zero conversion
+        {V4L2_PIX_FMT_MJPEG, AV_PIX_FMT_NONE},   // hardware JPEG decode (mjpeg_rkmpp)
+        {V4L2_PIX_FMT_YUYV, AV_PIX_FMT_YUYV422}, // raw, libswscale convert
+        {V4L2_PIX_FMT_YUV420, AV_PIX_FMT_YUV420P},
+        {V4L2_PIX_FMT_BGR24, AV_PIX_FMT_BGR24},
+      };
+
+      for (auto candidate : candidates) {
+        v4l2_format fmt {};
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fmt.fmt.pix.width = width;
+        fmt.fmt.pix.height = height;
+        fmt.fmt.pix.pixelformat = candidate.v4l2;
+        fmt.fmt.pix.field = V4L2_FIELD_NONE;
+        if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+          continue;
+        }
+        if (fmt.fmt.pix.pixelformat != candidate.v4l2 ||
+            (int) fmt.fmt.pix.width != width || (int) fmt.fmt.pix.height != height) {
+          continue;
+        }
+
+        capture_fourcc = candidate.v4l2;
+        if (candidate.v4l2 == V4L2_PIX_FMT_MJPEG) {
+          if (!open_mjpeg_decoder(width, height)) {
+            return false;
+          }
+          is_mjpeg = true;
+        } else if (candidate.av != AV_PIX_FMT_NONE) {
+          raw_av_fmt = candidate.av;
+          is_raw_convert = true;
+        }
+        return true;
+      }
+
+      BOOST_LOG(warning) << "RKMPP direct V4L2: device offers no supported pixel format at "sv
+                         << width << 'x' << height;
+      return false;
+    }
+
+    bool open_mjpeg_decoder(int width, int height) {
+      // Prefer the RK3566/RK3588 hardware JPEG unit (mjpeg_rkmpp): it decodes on
+      // the VPU straight to NV12/DRM_PRIME, offloading the CPU entirely. If a
+      // stream trips its parser at runtime we fall back to the software decoder
+      // (see decode_mjpeg_to_nv12 / reopen_mjpeg_sw), which also fixes up UVC
+      // frames missing Huffman tables. The SW decoder is used directly only when
+      // the hardware one isn't built in.
+      const AVCodec *mjpeg_codec = avcodec_find_decoder_by_name("mjpeg_rkmpp");
+      mjpeg_hw = (mjpeg_codec != nullptr);
+      if (!mjpeg_codec) {
+        mjpeg_codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+      }
+      if (!mjpeg_codec) {
+        BOOST_LOG(warning) << "RKMPP direct V4L2: no MJPEG decoder available"sv;
+        return false;
+      }
+      mjpeg_ctx = avcodec_alloc_context3(mjpeg_codec);
+      if (mjpeg_ctx) {
+        mjpeg_ctx->width  = width;
+        mjpeg_ctx->height = height;
+      }
+      if (!mjpeg_ctx || avcodec_open2(mjpeg_ctx, mjpeg_codec, nullptr) < 0) {
+        BOOST_LOG(warning) << "RKMPP direct V4L2: MJPEG avcodec_open2 failed"sv;
+        avcodec_free_context(&mjpeg_ctx);
+        return false;
+      }
+      return true;
+    }
+
+    // Convert one raw capture buffer (raw_av_fmt at width x height) to NV12 with
+    // libswscale, into out. UVC raw formats are tightly packed, so we describe
+    // the planes with av_image_fill_arrays at byte alignment.
+    bool convert_raw_to_nv12(const std::uint8_t *src, std::vector<std::uint8_t> &out) {
+      out.resize((std::size_t) width * height * 3 / 2);
+
+      std::uint8_t *planes[4] = {};
+      int src_stride[4] = {};
+      if (av_image_fill_arrays(planes, src_stride, src, raw_av_fmt, width, height, 1) < 0) {
+        return false;
+      }
+      const std::uint8_t *src_data[4] = {planes[0], planes[1], planes[2], planes[3]};
+
+      std::uint8_t *dst[4] = {out.data(), out.data() + (std::size_t) width * height, nullptr, nullptr};
+      int dst_stride[4] = {width, width, 0, 0};
+
+      sws_ctx = sws_getCachedContext(
+        sws_ctx,
+        width, height, raw_av_fmt,
+        width, height, AV_PIX_FMT_NV12,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+      );
+      if (!sws_ctx) {
+        return false;
+      }
+
+      sws_scale(sws_ctx, src_data, src_stride, 0, height, dst, dst_stride);
+      return true;
+    }
+
+    // Decode one MJPEG packet into a fresh AVFrame with the current decoder, or
+    // nullptr on failure.
+    AVFrame *mjpeg_decode_frame(const std::uint8_t *mjpeg_data, std::uint32_t mjpeg_size) {
       AVPacket *pkt = av_packet_alloc();
       if (!pkt) {
-        return false;
+        return nullptr;
       }
       if (av_new_packet(pkt, (int) mjpeg_size) < 0) {
         av_packet_free(&pkt);
-        return false;
+        return nullptr;
       }
       std::memcpy(pkt->data, mjpeg_data, mjpeg_size);
 
       int ret = avcodec_send_packet(mjpeg_ctx, pkt);
       av_packet_free(&pkt);
       if (ret < 0) {
-        return false;
+        return nullptr;
       }
 
       AVFrame *decoded = av_frame_alloc();
       if (!decoded) {
+        return nullptr;
+      }
+      if (avcodec_receive_frame(mjpeg_ctx, decoded) < 0) {
+        av_frame_free(&decoded);
+        return nullptr;
+      }
+      return decoded;
+    }
+
+    // Reopen the MJPEG context with the software decoder. Runtime fallback for
+    // when the hardware decoder rejects a stream; the SW decoder also handles
+    // UVC frames that omit Huffman tables (it inserts default tables).
+    bool reopen_mjpeg_sw() {
+      if (mjpeg_ctx) {
+        avcodec_free_context(&mjpeg_ctx);
+      }
+      const AVCodec *sw = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+      if (!sw) {
         return false;
       }
-      ret = avcodec_receive_frame(mjpeg_ctx, decoded);
-      if (ret < 0) {
-        av_frame_free(&decoded);
+      mjpeg_ctx = avcodec_alloc_context3(sw);
+      if (mjpeg_ctx) {
+        mjpeg_ctx->width  = width;
+        mjpeg_ctx->height = height;
+      }
+      if (!mjpeg_ctx || avcodec_open2(mjpeg_ctx, sw, nullptr) < 0) {
+        avcodec_free_context(&mjpeg_ctx);
+        return false;
+      }
+      mjpeg_hw = false;
+      return true;
+    }
+
+    bool decode_mjpeg_to_nv12(const std::uint8_t *mjpeg_data, std::uint32_t mjpeg_size) {
+      if (mjpeg_size == 0) return false;
+
+      AVFrame *decoded = mjpeg_decode_frame(mjpeg_data, mjpeg_size);
+      if (!decoded && mjpeg_hw && reopen_mjpeg_sw()) {
+        BOOST_LOG(warning) << "RKMPP direct V4L2: hardware MJPEG decode failed; falling back to software decoder"sv;
+        decoded = mjpeg_decode_frame(mjpeg_data, mjpeg_size);
+      }
+      if (!decoded) {
         return false;
       }
 
@@ -419,8 +541,13 @@ namespace rkmpp {
     bool missing_frame_logged {};
     bool is_mjpeg {};
     bool mjpeg_hw {};
+    bool is_raw_convert {};
+    std::uint32_t capture_fourcc {V4L2_PIX_FMT_NV12};
+    AVPixelFormat raw_av_fmt {AV_PIX_FMT_NONE};
     AVCodecContext *mjpeg_ctx {};
+    SwsContext *sws_ctx {};
     std::vector<std::uint8_t> latest_frame;
+    std::vector<std::uint8_t> convert_buf;
     std::vector<buffer_t> buffers;
   };
 
