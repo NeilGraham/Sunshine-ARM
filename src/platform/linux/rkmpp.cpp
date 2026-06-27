@@ -559,7 +559,7 @@ namespace rkmpp {
 
     static scale_filter_e parse_scale_filter(const char *env) {
       if (!env || !*env) {
-        return scale_filter_e::automatic;
+        return scale_filter_e::nearest;
       }
       std::string v(env);
       std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
@@ -575,8 +575,8 @@ namespace rkmpp {
         return scale_filter_e::linear;
       }
 
-      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_SCALE_FILTER '"sv << env << "'; using auto"sv;
-      return scale_filter_e::automatic;
+      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_SCALE_FILTER '"sv << env << "'; using nearest"sv;
+      return scale_filter_e::nearest;
     }
 
     // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc. Plain "mjpeg"
@@ -879,7 +879,7 @@ namespace rkmpp {
     bool mjpeg_hw {};
     bool is_raw_convert {};
     float forced_aspect_ratio {};
-    scale_filter_e scale_filter {scale_filter_e::automatic};
+    scale_filter_e scale_filter {scale_filter_e::nearest};
     std::uint32_t capture_fourcc {V4L2_PIX_FMT_NV12};
     AVPixelFormat raw_av_fmt {AV_PIX_FMT_NONE};
     AVCodecContext *mjpeg_ctx {};
