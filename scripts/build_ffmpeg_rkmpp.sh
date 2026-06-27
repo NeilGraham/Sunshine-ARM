@@ -91,7 +91,11 @@ pushd "$build_dir" >/dev/null
   --enable-bsf=hevc_metadata
 
 make -j"$jobs"
-make install
+# Sunshine only needs the libraries and headers from the RKMPP FFmpeg build.
+# The example-doc install step can fail on some mounted build volumes when it
+# tries to adjust permissions on doc/examples/Makefile, so avoid the broader
+# top-level install target here.
+make install-libs install-headers
 
 cbs_objects=()
 while IFS= read -r object; do
