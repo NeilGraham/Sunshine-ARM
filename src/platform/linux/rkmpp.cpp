@@ -313,32 +313,39 @@ namespace rkmpp {
       }
     }
 
-    // Negotiate the capture format, preferring the one that reaches NV12 with
-    // the least work: NV12 (native, no conversion), then YU12/YUYV/BGR3
-    // (converted with libswscale), then MJPEG (decoded with libavcodec). A card
-    // may expose any subset, so we ask for each in turn and accept the first it
-    // keeps at the requested resolution. Returns false if it accepts none.
+    struct forced_format_t {
+      std::uint32_t v4l2 {};
+      bool mjpeg_hw {};
+      bool is_forced {};
+    };
+
+    // Negotiate the capture format, preferring non-blocking paths: NV12
+    // (native, no conversion), then raw formats converted with libswscale, then
+    // MJPEG decoded with software. Hardware MJPEG is only used when explicitly
+    // requested with SUNSHINE_RKMPP_V4L2_FORMAT=mjpeg-hw because mjpeg_rkmpp can
+    // block inside MPP on UVC streams.
     bool negotiate_format(int width, int height) {
       static const struct {
         std::uint32_t v4l2;
         AVPixelFormat av;  // AV_PIX_FMT_NONE: NV12 (native) or MJPEG (decoded)
       } candidates[] = {
         {V4L2_PIX_FMT_NV12, AV_PIX_FMT_NONE},    // native, zero conversion
-        {V4L2_PIX_FMT_MJPEG, AV_PIX_FMT_NONE},   // hardware JPEG decode (mjpeg_rkmpp)
         {V4L2_PIX_FMT_YUYV, AV_PIX_FMT_YUYV422}, // raw, libswscale convert
         {V4L2_PIX_FMT_YUV420, AV_PIX_FMT_YUV420P},
         {V4L2_PIX_FMT_BGR24, AV_PIX_FMT_BGR24},
+        {V4L2_PIX_FMT_MJPEG, AV_PIX_FMT_NONE}, // JPEG decode
       };
 
       // SUNSHINE_RKMPP_V4L2_FORMAT (fed from [capture].format in retro-stream.toml)
       // pins one format; unset/"auto" keeps the preference-ordered negotiation.
-      std::uint32_t forced = parse_forced_format(std::getenv("SUNSHINE_RKMPP_V4L2_FORMAT"));
-      if (forced) {
-        BOOST_LOG(info) << "RKMPP direct V4L2: format pinned to "sv << fourcc_str(forced);
+      auto forced = parse_forced_format(std::getenv("SUNSHINE_RKMPP_V4L2_FORMAT"));
+      if (forced.is_forced) {
+        BOOST_LOG(info) << "RKMPP direct V4L2: format pinned to "sv << fourcc_str(forced.v4l2)
+                        << (forced.mjpeg_hw ? " with hardware MJPEG decode"sv : ""sv);
       }
 
       for (auto candidate : candidates) {
-        if (forced && candidate.v4l2 != forced) {
+        if (forced.is_forced && candidate.v4l2 != forced.v4l2) {
           continue;
         }
         v4l2_format fmt {};
@@ -357,7 +364,7 @@ namespace rkmpp {
 
         capture_fourcc = candidate.v4l2;
         if (candidate.v4l2 == V4L2_PIX_FMT_MJPEG) {
-          if (!open_mjpeg_decoder(width, height)) {
+          if (!open_mjpeg_decoder(width, height, forced.mjpeg_hw)) {
             return false;
           }
           is_mjpeg = true;
@@ -368,8 +375,8 @@ namespace rkmpp {
         return true;
       }
 
-      if (forced) {
-        BOOST_LOG(warning) << "RKMPP direct V4L2: pinned format "sv << fourcc_str(forced)
+      if (forced.is_forced) {
+        BOOST_LOG(warning) << "RKMPP direct V4L2: pinned format "sv << fourcc_str(forced.v4l2)
                            << " not supported by device at "sv << width << 'x' << height;
       } else {
         BOOST_LOG(warning) << "RKMPP direct V4L2: device offers no supported pixel format at "sv
@@ -390,48 +397,66 @@ namespace rkmpp {
       return chars;
     }
 
-    // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc, or 0 for
-    // auto/unset/unknown (negotiate normally). Accepts the retro-stream config
-    // tokens and common synonyms.
-    static std::uint32_t parse_forced_format(const char *env) {
+    // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc. "mjpeg" uses
+    // software decode; only "mjpeg-hw" opts into the potentially blocking
+    // mjpeg_rkmpp decoder for experiments.
+    static forced_format_t parse_forced_format(const char *env) {
       if (!env) {
-        return 0;
+        return {};
       }
       std::string v(env);
       std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
       if (v.empty() || v == "auto") {
-        return 0;
+        return {};
       }
       if (v == "nv12") {
-        return V4L2_PIX_FMT_NV12;
+        return {V4L2_PIX_FMT_NV12, false, true};
       }
       if (v == "mjpeg" || v == "mjpg") {
-        return V4L2_PIX_FMT_MJPEG;
+        return {V4L2_PIX_FMT_MJPEG, false, true};
+      }
+      if (v == "mjpeg-hw" || v == "mjpg-hw" || v == "mjpeg_rkmpp" || v == "mjpg_rkmpp") {
+        return {V4L2_PIX_FMT_MJPEG, true, true};
       }
       if (v == "yuyv" || v == "yuyv422" || v == "yuy2") {
-        return V4L2_PIX_FMT_YUYV;
+        return {V4L2_PIX_FMT_YUYV, false, true};
       }
       if (v == "yu12" || v == "yuv420" || v == "i420") {
-        return V4L2_PIX_FMT_YUV420;
+        return {V4L2_PIX_FMT_YUV420, false, true};
       }
       if (v == "bgr3" || v == "bgr24") {
-        return V4L2_PIX_FMT_BGR24;
+        return {V4L2_PIX_FMT_BGR24, false, true};
       }
       BOOST_LOG(warning) << "RKMPP direct V4L2: unknown SUNSHINE_RKMPP_V4L2_FORMAT '"sv << env << "'; using auto"sv;
-      return 0;
+      return {};
     }
 
-    bool open_mjpeg_decoder(int width, int height) {
-      // Prefer the RK3566/RK3588 hardware JPEG unit (mjpeg_rkmpp): it decodes on
-      // the VPU straight to NV12/DRM_PRIME, offloading the CPU entirely. If a
-      // stream trips its parser at runtime we fall back to the software decoder
-      // (see decode_mjpeg_to_nv12 / reopen_mjpeg_sw), which also fixes up UVC
-      // frames missing Huffman tables. The SW decoder is used directly only when
-      // the hardware one isn't built in.
-      const AVCodec *mjpeg_codec = avcodec_find_decoder_by_name("mjpeg_rkmpp");
+    static AVPixelFormat mjpeg_rkmpp_get_format(AVCodecContext * /* ctx */, const AVPixelFormat *pix_fmts) {
+      for (const AVPixelFormat *fmt = pix_fmts; *fmt != AV_PIX_FMT_NONE; ++fmt) {
+        if (*fmt == AV_PIX_FMT_NV12) {
+          return *fmt;
+        }
+      }
+      for (const AVPixelFormat *fmt = pix_fmts; *fmt != AV_PIX_FMT_NONE; ++fmt) {
+        if (*fmt == AV_PIX_FMT_DRM_PRIME) {
+          return *fmt;
+        }
+      }
+      return pix_fmts[0];
+    }
+
+    bool open_mjpeg_decoder(int width, int height, bool prefer_hw) {
+      // UVC MJPEG works reliably with FFmpeg's software decoder. mjpeg_rkmpp is
+      // useful to test on hardware, but some streams block inside MPP instead
+      // of returning an error, so never select it implicitly.
+      const AVCodec *mjpeg_codec = prefer_hw ? avcodec_find_decoder_by_name("mjpeg_rkmpp") : nullptr;
       mjpeg_hw = (mjpeg_codec != nullptr);
+      if (!mjpeg_codec && prefer_hw) {
+        BOOST_LOG(warning) << "RKMPP direct V4L2: mjpeg_rkmpp unavailable; falling back to software MJPEG decoder"sv;
+      }
       if (!mjpeg_codec) {
         mjpeg_codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+        mjpeg_hw = false;
       }
       if (!mjpeg_codec) {
         BOOST_LOG(warning) << "RKMPP direct V4L2: no MJPEG decoder available"sv;
@@ -441,10 +466,19 @@ namespace rkmpp {
       if (mjpeg_ctx) {
         mjpeg_ctx->width  = width;
         mjpeg_ctx->height = height;
+        if (mjpeg_hw) {
+          mjpeg_ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+          mjpeg_ctx->get_format = mjpeg_rkmpp_get_format;
+        }
       }
       if (!mjpeg_ctx || avcodec_open2(mjpeg_ctx, mjpeg_codec, nullptr) < 0) {
         BOOST_LOG(warning) << "RKMPP direct V4L2: MJPEG avcodec_open2 failed"sv;
         avcodec_free_context(&mjpeg_ctx);
+        if (mjpeg_hw) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: falling back to software MJPEG decoder"sv;
+          mjpeg_hw = false;
+          return open_mjpeg_decoder(width, height, false);
+        }
         return false;
       }
       return true;
@@ -547,7 +581,8 @@ namespace rkmpp {
       }
 
       // mjpeg_rkmpp outputs DRM_PRIME (hardware buffer); download to CPU NV12.
-      // SW mjpeg decoder outputs YUVJ420P (planar).
+      // SW MJPEG may output 4:2:0 or 4:2:2 planar JPEG formats, so normalize
+      // anything non-NV12 through swscale instead of assuming a fixed layout.
       AVFrame *cpu = decoded;
       if (decoded->format == AV_PIX_FMT_DRM_PRIME) {
         cpu = av_frame_alloc();
@@ -561,34 +596,41 @@ namespace rkmpp {
 
       auto nv12_size = (std::size_t) width * height * 3 / 2;
       latest_frame.resize(nv12_size);
-      auto *dst_y  = latest_frame.data();
-      auto *dst_uv = dst_y + (std::size_t) width * height;
-
-      // Y plane is the same layout for both NV12 and YUVJ420P.
-      for (int y = 0; y < height; ++y) {
-        std::memcpy(dst_y + (std::size_t) y * width,
-                    cpu->data[0] + (std::size_t) y * cpu->linesize[0],
-                    width);
-      }
 
       if (cpu->format == AV_PIX_FMT_NV12) {
-        // HW path: UV is already interleaved.
+        auto *dst_y  = latest_frame.data();
+        auto *dst_uv = dst_y + (std::size_t) width * height;
+
+        for (int y = 0; y < height; ++y) {
+          std::memcpy(dst_y + (std::size_t) y * width,
+                      cpu->data[0] + (std::size_t) y * cpu->linesize[0],
+                      width);
+        }
+
         for (int y = 0; y < height / 2; ++y) {
           std::memcpy(dst_uv + (std::size_t) y * width,
                       cpu->data[1] + (std::size_t) y * cpu->linesize[1],
                       width);
         }
       } else {
-        // SW path: YUVJ420P is planar; interleave U and V.
-        for (int y = 0; y < height / 2; ++y) {
-          const auto *src_u = cpu->data[1] + (std::size_t) y * cpu->linesize[1];
-          const auto *src_v = cpu->data[2] + (std::size_t) y * cpu->linesize[2];
-          auto *dst_row = dst_uv + (std::size_t) y * width;
-          for (int x = 0; x < width / 2; ++x) {
-            dst_row[x * 2]     = src_u[x];
-            dst_row[x * 2 + 1] = src_v[x];
+        std::uint8_t *dst[4] = {latest_frame.data(), latest_frame.data() + (std::size_t) width * height, nullptr, nullptr};
+        int dst_stride[4] = {width, width, 0, 0};
+
+        sws_ctx = sws_getCachedContext(
+          sws_ctx,
+          width, height, (AVPixelFormat) cpu->format,
+          width, height, AV_PIX_FMT_NV12,
+          SWS_BILINEAR, nullptr, nullptr, nullptr
+        );
+        if (!sws_ctx) {
+          av_frame_free(&cpu);
+          if (cpu != decoded) {
+            av_frame_free(&decoded);
           }
+          return false;
         }
+
+        sws_scale(sws_ctx, cpu->data, cpu->linesize, 0, height, dst, dst_stride);
       }
 
       av_frame_free(&cpu);
