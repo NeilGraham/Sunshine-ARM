@@ -1326,6 +1326,32 @@ namespace rkmpp {
       }
 
       if (direct_v4l2) {
+        if (direct_gpu_ready && pipeline_enabled) {
+          // Pipelined path: hand the encoder the frame the GPU rendered during
+          // the previous encode cycle, then capture the next frame and kick its
+          // render so the GPU works while the VPU encodes what we just handed
+          // off. The render flushed last cycle is already complete, so this
+          // readback does not stall. Costs one frame of latency.
+          if (gpu_render_pending) {
+            readback_direct_v4l2_gpu(mapped_frame.get());
+          } else {
+            direct_v4l2->copy_black_to(mapped_frame.get(), frame->width, frame->height);
+          }
+
+          gpu_render_pending = false;
+          if (!direct_v4l2->update_latest_frame()) {
+            if (direct_v4l2->should_log_missing_frame()) {
+              BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available; sending black frames until capture resumes"sv;
+            }
+          } else if (render_direct_v4l2_gpu(direct_v4l2->latest_direct_frame(), direct_v4l2->scale_region(frame->width, frame->height))) {
+            gpu_render_pending = true;
+          } else if (direct_v4l2->should_log_missing_frame()) {
+            BOOST_LOG(warning) << "RKMPP direct V4L2: GPU render failed; sending black frame"sv;
+          }
+          return 0;
+        }
+
+        // Synchronous path (SUNSHINE_RKMPP_PIPELINE=off or GPU unavailable).
         if (!direct_v4l2->update_latest_frame()) {
           if (direct_v4l2->should_log_missing_frame()) {
             BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available; sending black frames until capture resumes"sv;
@@ -1419,11 +1445,28 @@ namespace rkmpp {
     gl::tex_t direct_v4l2_tex;
     direct_program_t direct_v4l2_program[3];
     bool direct_gpu_ready {};
+    bool pipeline_enabled {true};
+    bool gpu_render_pending {};
     int direct_tex_width {};
     int direct_tex_height {};
     std::uint32_t direct_tex_fourcc {};
 
   private:
+    // SUNSHINE_RKMPP_PIPELINE toggles deferred-readback pipelining (default on).
+    // Disabling restores the synchronous render+readback path for comparison.
+    static bool parse_pipeline_enabled(const char *env) {
+      if (!env || !*env) {
+        return true;
+      }
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c) || c == '-' || c == '_'; }), v.end());
+      if (v == "off" || v == "false" || v == "0" || v == "disabled" || v == "none" || v == "sync") {
+        return false;
+      }
+      return true;
+    }
+
     util::Either<gl::program_t, std::string> make_direct_program(const std::string_view &fragment_source) {
       static constexpr std::string_view vertex_source = R"glsl(
 #version 300 es
@@ -1561,6 +1604,10 @@ void main()
 
       direct_v4l2_tex = gl::tex_t::make(2);
       direct_gpu_ready = true;
+      pipeline_enabled = parse_pipeline_enabled(std::getenv("SUNSHINE_RKMPP_PIPELINE"));
+      gpu_render_pending = false;
+      BOOST_LOG(info) << "RKMPP direct V4L2: GPU readback pipelining "sv
+                      << (pipeline_enabled ? "enabled (+1 frame latency)"sv : "disabled"sv);
       gl_drain_errors;
       return true;
     }
@@ -1656,7 +1703,12 @@ void main()
       return true;
     }
 
-    bool convert_direct_v4l2_gpu(const direct_frame_t &src, const scale_region_t &region, AVFrame *mapped_frame) {
+    // Upload the captured frame and draw the scaled/letterboxed result into the
+    // NV12 render target, then flush so the GPU starts immediately. The result
+    // is left in nv12->tex for readback_direct_v4l2_gpu(). Splitting render from
+    // readback lets the pipelined path overlap this GPU work with the VPU encode
+    // of the previous frame (see convert()).
+    bool render_direct_v4l2_gpu(const direct_frame_t &src, const scale_region_t &region) {
       const bool linear_filter = false;
       if (!upload_direct_frame(src, linear_filter)) {
         return false;
@@ -1700,8 +1752,20 @@ void main()
         return false;
       }
 
-      // No explicit glFlush: glGetTextureSubImage below performs the necessary
-      // synchronization, so an extra flush would only add a redundant submit.
+      gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
+      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+      // Kick the GPU now so the draws execute while the CPU returns to encode
+      // the previous frame; without this the commands could sit in the client
+      // command buffer until the next GL call, defeating the overlap.
+      gl::ctx.Flush();
+      gl_drain_errors;
+      return true;
+    }
+
+    // Read the rendered NV12 planes from nv12->tex into the encoder's mapped
+    // DMA buffer. In the pipelined path the render was flushed a full encode
+    // cycle earlier, so the GPU is already done and this does not stall.
+    void readback_direct_v4l2_gpu(AVFrame *mapped_frame) {
       gl::ctx.PixelStorei(GL_PACK_ALIGNMENT, 1);
       gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, mapped_frame->linesize[0]);
       gl::ctx.GetTextureSubImage(
@@ -1719,9 +1783,17 @@ void main()
         mapped_frame->linesize[1] * (frame->height / 2), mapped_frame->data[1]
       );
       gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, 0);
-      gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
       gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
       gl_drain_errors;
+    }
+
+    // Synchronous render + immediate readback (no pipelining): used when
+    // SUNSHINE_RKMPP_PIPELINE is disabled.
+    bool convert_direct_v4l2_gpu(const direct_frame_t &src, const scale_region_t &region, AVFrame *mapped_frame) {
+      if (!render_direct_v4l2_gpu(src, region)) {
+        return false;
+      }
+      readback_direct_v4l2_gpu(mapped_frame);
       return true;
     }
 
