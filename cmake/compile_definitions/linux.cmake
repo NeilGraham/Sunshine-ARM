@@ -205,6 +205,18 @@ if(SUNSHINE_ENABLE_RKMPP AND LIBDRM_FOUND AND LIBCAP_FOUND)
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.h"
             "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.cpp")
+
+    # Optional: Rockchip RGA 2D engine, used as an alternative capture
+    # scaler/converter to the Mali GPU path (SUNSHINE_RKMPP_SCALER=rga).
+    pkg_check_modules(LIBRGA librga)
+    if(LIBRGA_FOUND)
+        add_compile_definitions(SUNSHINE_BUILD_RGA)
+        list(APPEND PLATFORM_LIBRARIES ${LIBRGA_LIBRARIES})
+        include_directories(SYSTEM ${LIBRGA_INCLUDE_DIRS})
+        message(STATUS "RKMPP: RGA 2D scaler enabled (librga ${LIBRGA_VERSION})")
+    else()
+        message(STATUS "RKMPP: librga not found; RGA scaler path disabled")
+    endif()
 endif()
 
 # wayland

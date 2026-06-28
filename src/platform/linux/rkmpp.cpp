@@ -49,6 +49,13 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#ifdef SUNSHINE_BUILD_RGA
+#include <linux/dma-buf.h>
+#include <linux/dma-heap.h>
+#include <rga/rga.h>
+#include <rga/im2d.hpp>
+#endif
+
 // local includes
 #include "graphics.h"
 #include "misc.h"
@@ -1213,6 +1220,244 @@ namespace rkmpp {
     std::vector<buffer_t> buffers;
   };
 
+#ifdef SUNSHINE_BUILD_RGA
+  // Scales/letterboxes a captured NV12 frame into the encoder's NV12 buffer
+  // using the Rockchip RGA 2D engine instead of the Mali GPU, freeing the GPU.
+  //
+  // RGA2 can only address low (<4 GB) memory and can't reach the UVC capture
+  // buffer directly, so the capture is copied into a CMA dma-buf, RGA scales +
+  // crops + letterboxes into a second CMA dma-buf, and the result is copied into
+  // the encoder frame. The CMA heap must be large enough (grow with cma=256M);
+  // init() probes that and the caller falls back to the GPU path if it isn't.
+  class rga_scaler_t {
+  public:
+    ~rga_scaler_t() {
+      release(src_buf);
+      release(dst_buf);
+      if (heap_fd >= 0) {
+        close(heap_fd);
+      }
+    }
+
+    bool init(int dst_w, int dst_h) {
+      const char *heap_env = std::getenv("SUNSHINE_RKMPP_RGA_HEAP");
+      heap_name = (heap_env && *heap_env) ? heap_env : "/dev/dma_heap/reserved";
+      interp = parse_interp(std::getenv("SUNSHINE_RKMPP_RGA_INTERP"));
+
+      heap_fd = open(heap_name.c_str(), O_RDWR | O_CLOEXEC);
+      if (heap_fd < 0) {
+        BOOST_LOG(warning) << "RGA: cannot open dma-heap "sv << heap_name << "; RGA scaler unavailable"sv;
+        return false;
+      }
+
+      // Confirm the heap can supply, and RGA can map, an output-frame-sized
+      // low-memory buffer. This catches the too-small-CMA case at startup.
+      buffer_t probe {};
+      if (!alloc(probe, (std::size_t) dst_w * dst_h * 3 / 2)) {
+        BOOST_LOG(warning) << "RGA: dma-heap "sv << heap_name << " cannot supply a "sv
+                           << dst_w << 'x' << dst_h << " NV12 buffer (grow CMA, e.g. cma=256M); RGA scaler unavailable"sv;
+        return false;
+      }
+      auto handle = importbuffer_fd(probe.fd, (int) probe.len);
+      bool importable = handle > 0;
+      if (importable) {
+        releasebuffer_handle(handle);
+      }
+      release(probe);
+      if (!importable) {
+        BOOST_LOG(warning) << "RGA: importbuffer_fd failed (buffer not RGA-addressable); RGA scaler unavailable"sv;
+        return false;
+      }
+      return true;
+    }
+
+    bool scale(const direct_frame_t &src, const scale_region_t &region, AVFrame *dst, int dst_w, int dst_h) {
+      // Only NV12 capture is handled on the RGA path; other formats fall back.
+      if (!src.nv12) {
+        return false;
+      }
+      if (!ensure(src_buf, src.width, src.height) || !ensure(dst_buf, dst_w, dst_h)) {
+        return false;
+      }
+
+      // Copy the (possibly strided) capture into the packed src dma-buf.
+      sync(src_buf.fd, true, DMA_BUF_SYNC_WRITE);
+      copy_nv12_in(src, src_buf);
+      sync(src_buf.fd, false, DMA_BUF_SYNC_WRITE);
+
+      // Pre-clear letterbox bars; only needed when the output geometry changes
+      // since RGA overwrites just the active rectangle each frame.
+      const bool letterboxed = region.out_w != dst_w || region.out_h != dst_h;
+      if (letterboxed && geometry_changed(region, dst_w, dst_h)) {
+        sync(dst_buf.fd, true, DMA_BUF_SYNC_WRITE);
+        fill_black(dst_buf, dst_w, dst_h);
+        sync(dst_buf.fd, false, DMA_BUF_SYNC_WRITE);
+      }
+      last_region = region;
+      last_dst_w = dst_w;
+      last_dst_h = dst_h;
+
+      rga_buffer_t s = wrapbuffer_handle(src_buf.handle, src.width, src.height, RK_FORMAT_YCbCr_420_SP);
+      rga_buffer_t d = wrapbuffer_handle(dst_buf.handle, dst_w, dst_h, RK_FORMAT_YCbCr_420_SP);
+      im_rect srect {region.src_left, region.src_top, region.src_w, region.src_h};
+      im_rect drect {region.off_x, region.off_y, region.out_w, region.out_h};
+      im_rect prect {};
+      im_opt_t opt {};
+      opt.interp = interp;
+      rga_buffer_t pat {};
+      auto status = improcess(s, d, pat, srect, drect, prect, -1, nullptr, &opt, IM_SYNC);
+      if (status != IM_STATUS_SUCCESS) {
+        if (!fail_logged) {
+          BOOST_LOG(warning) << "RGA: improcess failed: "sv << imStrError_t(status);
+          fail_logged = true;
+        }
+        return false;
+      }
+      fail_logged = false;
+
+      // Copy the scaled NV12 result into the encoder's mapped frame.
+      sync(dst_buf.fd, true, DMA_BUF_SYNC_READ);
+      copy_nv12_out(dst_buf, dst, dst_w, dst_h);
+      sync(dst_buf.fd, false, DMA_BUF_SYNC_READ);
+      return true;
+    }
+
+  private:
+    struct buffer_t {
+      int fd {-1};
+      void *map {};
+      std::size_t len {};
+      int w {};
+      int h {};
+      rga_buffer_handle_t handle {};
+    };
+
+    static int parse_interp(const char *env) {
+      if (!env || !*env) {
+        return IM_INTERP_DEFAULT;
+      }
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c) || c == '-' || c == '_'; }), v.end());
+      if (v == "linear" || v == "bilinear") {
+        return IM_INTERP_LINEAR;
+      }
+      if (v == "cubic" || v == "bicubic") {
+        return IM_INTERP_CUBIC;
+      }
+      if (v == "average" || v == "avg") {
+        return IM_INTERP_AVERAGE;
+      }
+      return IM_INTERP_DEFAULT;
+    }
+
+    bool alloc(buffer_t &b, std::size_t len) {
+      dma_heap_allocation_data data {};
+      data.len = len;
+      data.fd_flags = O_RDWR | O_CLOEXEC;
+      if (xioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &data) < 0) {
+        return false;
+      }
+      b.fd = (int) data.fd;
+      b.len = len;
+      b.map = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, b.fd, 0);
+      if (b.map == MAP_FAILED) {
+        b.map = nullptr;
+        close(b.fd);
+        b.fd = -1;
+        return false;
+      }
+      return true;
+    }
+
+    void release(buffer_t &b) {
+      if (b.handle > 0) {
+        releasebuffer_handle(b.handle);
+        b.handle = 0;
+      }
+      if (b.map) {
+        munmap(b.map, b.len);
+        b.map = nullptr;
+      }
+      if (b.fd >= 0) {
+        close(b.fd);
+        b.fd = -1;
+      }
+      b.w = b.h = 0;
+      b.len = 0;
+    }
+
+    bool ensure(buffer_t &b, int w, int h) {
+      if (b.fd >= 0 && b.w == w && b.h == h) {
+        return true;
+      }
+      release(b);
+      if (!alloc(b, (std::size_t) w * h * 3 / 2)) {
+        return false;
+      }
+      b.handle = importbuffer_fd(b.fd, (int) b.len);
+      if (b.handle <= 0) {
+        release(b);
+        return false;
+      }
+      b.w = w;
+      b.h = h;
+      return true;
+    }
+
+    void sync(int fd, bool start, std::uint64_t rw) {
+      dma_buf_sync s {};
+      s.flags = rw | (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END);
+      xioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+    }
+
+    void copy_nv12_in(const direct_frame_t &src, buffer_t &b) {
+      auto *dstp = (std::uint8_t *) b.map;
+      for (int row = 0; row < src.height; ++row) {
+        std::memcpy(dstp + (std::size_t) row * src.width, src.data + (std::size_t) row * src.stride, src.width);
+      }
+      const auto *uv = src.data + (std::size_t) src.stride * src.height;
+      auto *dstuv = dstp + (std::size_t) src.width * src.height;
+      for (int row = 0; row < src.height / 2; ++row) {
+        std::memcpy(dstuv + (std::size_t) row * src.width, uv + (std::size_t) row * src.stride, src.width);
+      }
+    }
+
+    void copy_nv12_out(buffer_t &b, AVFrame *dst, int dst_w, int dst_h) {
+      const auto *srcp = (const std::uint8_t *) b.map;
+      for (int row = 0; row < dst_h; ++row) {
+        std::memcpy(dst->data[0] + (std::size_t) row * dst->linesize[0], srcp + (std::size_t) row * dst_w, dst_w);
+      }
+      const auto *srcuv = srcp + (std::size_t) dst_w * dst_h;
+      for (int row = 0; row < dst_h / 2; ++row) {
+        std::memcpy(dst->data[1] + (std::size_t) row * dst->linesize[1], srcuv + (std::size_t) row * dst_w, dst_w);
+      }
+    }
+
+    void fill_black(buffer_t &b, int w, int h) {
+      auto *p = (std::uint8_t *) b.map;
+      std::memset(p, 16, (std::size_t) w * h);
+      std::memset(p + (std::size_t) w * h, 128, (std::size_t) w * h / 2);
+    }
+
+    bool geometry_changed(const scale_region_t &r, int dst_w, int dst_h) const {
+      return dst_w != last_dst_w || dst_h != last_dst_h ||
+             r.off_x != last_region.off_x || r.off_y != last_region.off_y ||
+             r.out_w != last_region.out_w || r.out_h != last_region.out_h;
+    }
+
+    int heap_fd {-1};
+    std::string heap_name;
+    int interp {IM_INTERP_DEFAULT};
+    buffer_t src_buf;
+    buffer_t dst_buf;
+    scale_region_t last_region;
+    int last_dst_w {-1};
+    int last_dst_h {-1};
+    bool fail_logged {};
+  };
+#endif
+
   class rkmpp_t: public platf::avcodec_encode_device_t {
   public:
     ~rkmpp_t() override {
@@ -1257,6 +1502,17 @@ namespace rkmpp {
         direct_v4l2_device = v4l2_device;
       }
 
+#ifdef SUNSHINE_BUILD_RGA
+      // SUNSHINE_RKMPP_SCALER=rga selects the RGA 2D engine for capture scaling
+      // instead of the Mali GPU (default). Falls back to GPU if RGA is
+      // unavailable at runtime (e.g. CMA too small).
+      if (auto scaler = std::getenv("SUNSHINE_RKMPP_SCALER")) {
+        std::string v(scaler);
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        use_rga = (v == "rga" || v == "rga2" || v == "rga3");
+      }
+#endif
+
       return 0;
     }
 
@@ -1298,9 +1554,19 @@ namespace rkmpp {
           return -1;
         }
         this->nv12 = std::move(*nv12_opt);
-        if (init_direct_v4l2_gpu()) {
+#ifdef SUNSHINE_BUILD_RGA
+        if (use_rga) {
+          if (rga.init(frame->width, frame->height)) {
+            rga_ready = true;
+            BOOST_LOG(info) << "RKMPP direct V4L2: RGA 2D scaler enabled"sv;
+          } else {
+            BOOST_LOG(warning) << "RKMPP direct V4L2: RGA scaler unavailable; falling back to GPU scaling"sv;
+          }
+        }
+#endif
+        if (!rga_ready && init_direct_v4l2_gpu()) {
           BOOST_LOG(info) << "RKMPP direct V4L2: GPU scaling/conversion enabled"sv;
-        } else {
+        } else if (!rga_ready) {
           BOOST_LOG(warning) << "RKMPP direct V4L2: GPU scaling unavailable; falling back to CPU scaling"sv;
         }
       } else {
@@ -1355,6 +1621,24 @@ namespace rkmpp {
       }
 
       if (direct_v4l2) {
+#ifdef SUNSHINE_BUILD_RGA
+        if (rga_ready) {
+          // RGA 2D engine path: scale/convert on the dedicated 2D block instead
+          // of the Mali GPU. Synchronous (RGA is fast and on its own engine).
+          if (!direct_v4l2->update_latest_frame()) {
+            if (direct_v4l2->should_log_missing_frame()) {
+              BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available; sending black frames until capture resumes"sv;
+            }
+            direct_v4l2->copy_black_to(mapped_frame.get(), frame->width, frame->height);
+          } else if (!rga.scale(direct_v4l2->latest_direct_frame(), direct_v4l2->scale_region(frame->width, frame->height), mapped_frame.get(), frame->width, frame->height)) {
+            if (direct_v4l2->should_log_missing_frame()) {
+              BOOST_LOG(warning) << "RKMPP direct V4L2: RGA scale failed; sending black frame"sv;
+            }
+            direct_v4l2->copy_black_to(mapped_frame.get(), frame->width, frame->height);
+          }
+          return 0;
+        }
+#endif
         if (direct_gpu_ready && pipeline_enabled) {
           // Pipelined path: hand the encoder the frame the GPU rendered during
           // the previous encode cycle, then capture the next frame and kick its
@@ -1479,6 +1763,11 @@ namespace rkmpp {
     int direct_tex_width {};
     int direct_tex_height {};
     std::uint32_t direct_tex_fourcc {};
+    bool rga_ready {};
+#ifdef SUNSHINE_BUILD_RGA
+    bool use_rga {};
+    rga_scaler_t rga;
+#endif
 
   private:
     // SUNSHINE_RKMPP_PIPELINE toggles deferred-readback pipelining (default on).
