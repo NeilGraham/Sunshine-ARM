@@ -109,6 +109,16 @@ namespace rkmpp {
     int out_h {};
   };
 
+  // A linked GPU program together with its uniform locations, resolved once at
+  // link time. glGetUniformLocation does a string lookup plus driver-side
+  // validation, so caching avoids repeating it for every draw of every frame.
+  struct direct_program_t {
+    gl::program_t program;
+    GLint image_loc {-1};
+    GLint rect_loc {-1};
+    GLint width_loc {-1};
+  };
+
   class v4l2_nv12_source_t {
   public:
     ~v4l2_nv12_source_t() {
@@ -1407,7 +1417,7 @@ namespace rkmpp {
     std::string direct_v4l2_device;
     std::unique_ptr<v4l2_nv12_source_t> direct_v4l2;
     gl::tex_t direct_v4l2_tex;
-    gl::program_t direct_v4l2_program[3];
+    direct_program_t direct_v4l2_program[3];
     bool direct_gpu_ready {};
     int direct_tex_width {};
     int direct_tex_height {};
@@ -1526,21 +1536,28 @@ void main()
         BOOST_LOG(error) << "RKMPP direct V4L2: NV12 GPU shader failed: "sv << nv12.right();
         return false;
       }
-      direct_v4l2_program[0] = std::move(nv12.left());
+      direct_v4l2_program[0].program = std::move(nv12.left());
 
       auto yuyv_y = make_direct_program(yuyv_y_fragment);
       if (yuyv_y.has_right()) {
         BOOST_LOG(error) << "RKMPP direct V4L2: YUYV luma GPU shader failed: "sv << yuyv_y.right();
         return false;
       }
-      direct_v4l2_program[1] = std::move(yuyv_y.left());
+      direct_v4l2_program[1].program = std::move(yuyv_y.left());
 
       auto yuyv_uv = make_direct_program(yuyv_uv_fragment);
       if (yuyv_uv.has_right()) {
         BOOST_LOG(error) << "RKMPP direct V4L2: YUYV chroma GPU shader failed: "sv << yuyv_uv.right();
         return false;
       }
-      direct_v4l2_program[2] = std::move(yuyv_uv.left());
+      direct_v4l2_program[2].program = std::move(yuyv_uv.left());
+
+      for (auto &entry : direct_v4l2_program) {
+        auto handle = entry.program.handle();
+        entry.image_loc = gl::ctx.GetUniformLocation(handle, "image");
+        entry.rect_loc = gl::ctx.GetUniformLocation(handle, "src_rect");
+        entry.width_loc = gl::ctx.GetUniformLocation(handle, "src_width");
+      }
 
       direct_v4l2_tex = gl::tex_t::make(2);
       direct_gpu_ready = true;
@@ -1548,16 +1565,14 @@ void main()
       return true;
     }
 
-    void set_direct_sampler(gl::program_t &program, int texture_index, const scale_region_t &region, const direct_frame_t &src, bool uv_plane) {
-      gl::ctx.UseProgram(program.handle());
+    void set_direct_sampler(direct_program_t &program, int texture_index, const scale_region_t &region, const direct_frame_t &src, bool uv_plane) {
+      gl::ctx.UseProgram(program.program.handle());
 
-      auto image_loc = gl::ctx.GetUniformLocation(program.handle(), "image");
-      if (image_loc >= 0) {
-        gl::ctx.Uniform1i(image_loc, texture_index);
+      if (program.image_loc >= 0) {
+        gl::ctx.Uniform1i(program.image_loc, texture_index);
       }
 
-      auto rect_loc = gl::ctx.GetUniformLocation(program.handle(), "src_rect");
-      if (rect_loc >= 0) {
+      if (program.rect_loc >= 0) {
         float src_w = (float) src.width;
         float src_h = (float) src.height;
         float left = region.src_left / src_w;
@@ -1570,12 +1585,11 @@ void main()
           right = ((region.src_left + region.src_w) / 2) / (src_w / 2.0f);
           bottom = ((region.src_top + region.src_h) / 2) / (src_h / 2.0f);
         }
-        gl::ctx.Uniform4f(rect_loc, left, top, right, bottom);
+        gl::ctx.Uniform4f(program.rect_loc, left, top, right, bottom);
       }
 
-      auto width_loc = gl::ctx.GetUniformLocation(program.handle(), "src_width");
-      if (width_loc >= 0) {
-        gl::ctx.Uniform1f(width_loc, (float) src.width);
+      if (program.width_loc >= 0) {
+        gl::ctx.Uniform1f(program.width_loc, (float) src.width);
       }
     }
 
@@ -1648,12 +1662,13 @@ void main()
         return false;
       }
 
+      // Fuse the black-border clear with the scaled draw in a single render
+      // pass per plane. On the Mali (tile-based) GPU this lets the driver use a
+      // fast tile clear and resolve each framebuffer once; clearing in a
+      // separate pass first would force the cleared contents to be reloaded
+      // into tile memory before the draw.
       const float y_black[] = {16.0f / 255.0f, 0.0f, 0.0f, 0.0f};
       const float uv_black[] = {128.0f / 255.0f, 128.0f / 255.0f, 0.0f, 0.0f};
-      for (int plane = 0; plane < 2; ++plane) {
-        gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[plane]);
-        gl::ctx.ClearBufferfv(GL_COLOR, 0, plane == 0 ? y_black : uv_black);
-      }
 
       if (src.nv12) {
         for (int plane = 0; plane < 2; ++plane) {
@@ -1662,6 +1677,7 @@ void main()
           gl::ctx.BindTexture(GL_TEXTURE_2D, direct_v4l2_tex[plane]);
           set_direct_sampler(program, plane, region, src, plane == 1);
           gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[plane]);
+          gl::ctx.ClearBufferfv(GL_COLOR, 0, plane == 0 ? y_black : uv_black);
           gl::ctx.Viewport(region.off_x / (plane + 1), region.off_y / (plane + 1), region.out_w / (plane + 1), region.out_h / (plane + 1));
           gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
         }
@@ -1671,19 +1687,21 @@ void main()
 
         set_direct_sampler(direct_v4l2_program[1], 0, region, src, false);
         gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[0]);
+        gl::ctx.ClearBufferfv(GL_COLOR, 0, y_black);
         gl::ctx.Viewport(region.off_x, region.off_y, region.out_w, region.out_h);
         gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
 
         set_direct_sampler(direct_v4l2_program[2], 0, region, src, true);
         gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[1]);
+        gl::ctx.ClearBufferfv(GL_COLOR, 0, uv_black);
         gl::ctx.Viewport(region.off_x / 2, region.off_y / 2, region.out_w / 2, region.out_h / 2);
         gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
       } else {
         return false;
       }
 
-      gl::ctx.Flush();
-
+      // No explicit glFlush: glGetTextureSubImage below performs the necessary
+      // synchronization, so an extra flush would only add a redundant submit.
       gl::ctx.PixelStorei(GL_PACK_ALIGNMENT, 1);
       gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, mapped_frame->linesize[0]);
       gl::ctx.GetTextureSubImage(
