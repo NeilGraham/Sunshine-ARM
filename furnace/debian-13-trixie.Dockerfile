@@ -10,6 +10,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 ARG FFMPEG_ROCKCHIP_REF=40c412dacc
 
+# See debian-12-bookworm.Dockerfile for the rationale; furnace runs as the build
+# host's uid:gid (mbp = 501:20) and linux_build.sh needs root via sudo.
+ARG BUILD_UID=501
+ARG BUILD_GID=20
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
@@ -35,5 +40,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN git clone --filter=blob:none https://github.com/nyanmisaka/ffmpeg-rockchip.git /opt/ffmpeg-rockchip \
     && git -C /opt/ffmpeg-rockchip checkout "${FFMPEG_ROCKCHIP_REF}"
+
+# Build user matching furnace's --user uid:gid, with passwordless sudo.
+RUN (getent group "${BUILD_GID}" || groupadd -g "${BUILD_GID}" builder) \
+    && useradd -o -u "${BUILD_UID}" -g "${BUILD_GID}" -m -s /bin/bash builder \
+    && echo 'builder ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/builder \
+    && chmod 0440 /etc/sudoers.d/builder \
+    && chown -R "${BUILD_UID}:${BUILD_GID}" /opt/ffmpeg-rockchip
 
 WORKDIR /work

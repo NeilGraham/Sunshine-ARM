@@ -75,6 +75,40 @@ namespace rkmpp {
     linear,
   };
 
+  enum class line_blend_e {
+    automatic,
+    disabled,
+    enabled,
+  };
+
+  struct view_region_t {
+    float left {};
+    float top {};
+    float right {1.0f};
+    float bottom {1.0f};
+    bool enabled {};
+  };
+
+  struct direct_frame_t {
+    const std::uint8_t *data {};
+    std::uint32_t fourcc {};
+    int width {};
+    int height {};
+    int stride {};
+    bool nv12 {};
+  };
+
+  struct scale_region_t {
+    int src_left {};
+    int src_top {};
+    int src_w {};
+    int src_h {};
+    int off_x {};
+    int off_y {};
+    int out_w {};
+    int out_h {};
+  };
+
   class v4l2_nv12_source_t {
   public:
     ~v4l2_nv12_source_t() {
@@ -91,6 +125,8 @@ namespace rkmpp {
 
       forced_aspect_ratio = parse_aspect_ratio(std::getenv("SUNSHINE_RKMPP_ASPECT_RATIO"));
       scale_filter = parse_scale_filter(std::getenv("SUNSHINE_RKMPP_SCALE_FILTER"));
+      line_blend = parse_line_blend(std::getenv("SUNSHINE_RKMPP_LINE_BLEND"));
+      view_region = parse_view_region(std::getenv("SUNSHINE_RKMPP_VIEW_REGION"));
       if (!negotiate_format(width, height)) {
         return false;
       }
@@ -152,7 +188,7 @@ namespace rkmpp {
       return true;
     }
 
-    bool copy_latest_to(AVFrame *mapped_frame, int dst_width, int dst_height) {
+    bool update_latest_frame() {
       v4l2_buffer latest {};
       bool have_latest = false;
 
@@ -184,11 +220,13 @@ namespace rkmpp {
         if (is_mjpeg) {
           decode_mjpeg_to_nv12(src, latest.bytesused);
         } else if (is_raw_convert) {
-          if (convert_raw_to_nv12(src, convert_buf) && !is_zeroed_nv12(convert_buf.data())) {
-            latest_frame = convert_buf;
-          }
+          latest_frame.assign(src, src + latest.bytesused);
         } else if (!is_zeroed_nv12(src)) {
-          latest_frame.assign(src, src + width * height * 3 / 2);
+          auto size = (std::size_t) capture_stride * height * 3 / 2;
+          if (latest.bytesused > 0) {
+            size = std::min<std::size_t>(size, latest.bytesused);
+          }
+          latest_frame.assign(src, src + size);
         }
         xioctl(fd, VIDIOC_QBUF, &latest);
       }
@@ -198,6 +236,62 @@ namespace rkmpp {
       }
 
       missing_frame_logged = false;
+      return true;
+    }
+
+    direct_frame_t latest_direct_frame() const {
+      direct_frame_t frame;
+      frame.data = latest_frame.data();
+      frame.fourcc = capture_fourcc;
+      frame.width = width;
+      frame.height = height;
+      frame.stride = capture_stride;
+      frame.nv12 = !is_raw_convert || is_mjpeg;
+      if (is_mjpeg) {
+        frame.fourcc = V4L2_PIX_FMT_NV12;
+        frame.stride = width;
+      }
+      return frame;
+    }
+
+    scale_region_t scale_region(int dst_width, int dst_height) const {
+      scale_region_t region;
+      region.src_w = width;
+      region.src_h = height;
+
+      if (view_region.enabled) {
+        region.src_left = std::clamp((int) (view_region.left * width), 0, width - 2) & ~1;
+        region.src_top = std::clamp((int) (view_region.top * height), 0, height - 2) & ~1;
+        auto src_right = std::clamp((int) (view_region.right * width), region.src_left + 2, width) & ~1;
+        auto src_bottom = std::clamp((int) (view_region.bottom * height), region.src_top + 2, height) & ~1;
+        region.src_w = std::max(2, src_right - region.src_left);
+        region.src_h = std::max(2, src_bottom - region.src_top);
+      }
+
+      if (dst_width == region.src_w && dst_height == region.src_h) {
+        region.out_w = region.src_w;
+        region.out_h = region.src_h;
+        return region;
+      }
+
+      auto output_aspect = forced_aspect_ratio > 0.0f ? forced_aspect_ratio : (float) region.src_w / region.src_h;
+      region.out_w = dst_width;
+      region.out_h = (int) (dst_width / output_aspect);
+      if (region.out_h > dst_height) {
+        region.out_h = dst_height;
+        region.out_w = (int) (dst_height * output_aspect);
+      }
+      region.out_w = std::max(2, region.out_w & ~1);
+      region.out_h = std::max(2, region.out_h & ~1);
+      region.off_x = ((dst_width - region.out_w) / 2) & ~1;
+      region.off_y = ((dst_height - region.out_h) / 2) & ~1;
+      return region;
+    }
+
+    bool copy_latest_to(AVFrame *mapped_frame, int dst_width, int dst_height) {
+      if (!update_latest_frame()) {
+        return false;
+      }
       copy_nv12(latest_frame.data(), mapped_frame, dst_width, dst_height);
       return true;
     }
@@ -274,16 +368,34 @@ namespace rkmpp {
     }
 
     void copy_nv12(const std::uint8_t *src, AVFrame *dst, int dst_width, int dst_height) {
-      const auto *src_y = src;
-      const auto *src_uv = src + width * height;
+      int src_left = 0;
+      int src_top = 0;
+      int src_w = width;
+      int src_h = height;
 
-      if (dst_width == width && dst_height == height) {
-        for (int y = 0; y < height; ++y) {
-          std::memcpy(dst->data[0] + (std::size_t) y * dst->linesize[0], src_y + (std::size_t) y * width, width);
+      if (view_region.enabled) {
+        src_left = std::clamp((int) (view_region.left * width), 0, width - 2) & ~1;
+        src_top = std::clamp((int) (view_region.top * height), 0, height - 2) & ~1;
+        auto src_right = std::clamp((int) (view_region.right * width), src_left + 2, width) & ~1;
+        auto src_bottom = std::clamp((int) (view_region.bottom * height), src_top + 2, height) & ~1;
+        src_w = std::max(2, src_right - src_left);
+        src_h = std::max(2, src_bottom - src_top);
+      }
+
+      const auto *src_y = src + (std::size_t) src_top * width + src_left;
+      const auto *src_uv = src + (std::size_t) width * height + (std::size_t) (src_top / 2) * width + src_left;
+
+      if (dst_width == src_w && dst_height == src_h) {
+        for (int y = 0; y < src_h; ++y) {
+          std::memcpy(dst->data[0] + (std::size_t) y * dst->linesize[0], src_y + (std::size_t) y * width, src_w);
         }
 
-        for (int y = 0; y < height / 2; ++y) {
-          std::memcpy(dst->data[1] + (std::size_t) y * dst->linesize[1], src_uv + (std::size_t) y * width, width);
+        for (int y = 0; y < src_h / 2; ++y) {
+          std::memcpy(dst->data[1] + (std::size_t) y * dst->linesize[1], src_uv + (std::size_t) y * width, src_w);
+        }
+
+        if (should_line_blend(src_h, dst_height, src_h)) {
+          blend_nv12_lines(dst, 0, 0, src_w, src_h);
         }
 
         return;
@@ -292,7 +404,7 @@ namespace rkmpp {
       std::fill_n(dst->data[0], (std::size_t) dst->linesize[0] * dst_height, 16);
       std::fill_n(dst->data[1], (std::size_t) dst->linesize[1] * (dst_height / 2), 128);
 
-      auto output_aspect = forced_aspect_ratio > 0.0f ? forced_aspect_ratio : (float) width / height;
+      auto output_aspect = forced_aspect_ratio > 0.0f ? forced_aspect_ratio : (float) src_w / src_h;
       auto out_w = dst_width;
       auto out_h = (int) (dst_width / output_aspect);
       if (out_h > dst_height) {
@@ -305,31 +417,35 @@ namespace rkmpp {
       auto off_y = ((dst_height - out_h) / 2) & ~1;
 
       const bool linear_scale = scale_filter == scale_filter_e::linear ||
-                                (scale_filter == scale_filter_e::automatic && (out_w != width || out_h != height));
+                                (scale_filter == scale_filter_e::automatic && (out_w != src_w || out_h != src_h));
       if (linear_scale) {
-        scale_nv12_linear(src_y, src_uv, dst, off_x, off_y, out_w, out_h);
+        scale_nv12_linear(src_y, src_uv, width, src_w, src_h, dst, off_x, off_y, out_w, out_h);
       } else {
-        scale_nv12_nearest(src_y, src_uv, dst, off_x, off_y, out_w, out_h);
+        scale_nv12_nearest(src_y, src_uv, width, src_w, src_h, dst, off_x, off_y, out_w, out_h);
+      }
+
+      if (should_line_blend(src_h, out_h, dst_height)) {
+        blend_nv12_lines(dst, off_x, off_y, out_w, out_h);
       }
     }
 
-    void scale_nv12_nearest(const std::uint8_t *src_y, const std::uint8_t *src_uv, AVFrame *dst, int off_x, int off_y, int out_w, int out_h) {
+    void scale_nv12_nearest(const std::uint8_t *src_y, const std::uint8_t *src_uv, int src_stride, int src_w, int src_h, AVFrame *dst, int off_x, int off_y, int out_w, int out_h) {
       for (int y = 0; y < out_h; ++y) {
-        auto sy = std::min(height - 1, (int) ((std::int64_t) y * height / out_h));
+        auto sy = std::min(src_h - 1, (int) ((std::int64_t) y * src_h / out_h));
         auto *dst_row = dst->data[0] + (std::size_t) (off_y + y) * dst->linesize[0] + off_x;
-        const auto *src_row = src_y + (std::size_t) sy * width;
+        const auto *src_row = src_y + (std::size_t) sy * src_stride;
         for (int x = 0; x < out_w; ++x) {
-          auto sx = std::min(width - 1, (int) ((std::int64_t) x * width / out_w));
+          auto sx = std::min(src_w - 1, (int) ((std::int64_t) x * src_w / out_w));
           dst_row[x] = src_row[sx];
         }
       }
 
       for (int y = 0; y < out_h / 2; ++y) {
-        auto sy = std::min(height / 2 - 1, (int) ((std::int64_t) y * (height / 2) / (out_h / 2)));
+        auto sy = std::min(src_h / 2 - 1, (int) ((std::int64_t) y * (src_h / 2) / (out_h / 2)));
         auto *dst_row = dst->data[1] + (std::size_t) (off_y / 2 + y) * dst->linesize[1] + off_x;
-        const auto *src_row = src_uv + (std::size_t) sy * width;
+        const auto *src_row = src_uv + (std::size_t) sy * src_stride;
         for (int x = 0; x < out_w; x += 2) {
-          auto sx = std::min(width - 2, ((int) ((std::int64_t) x * width / out_w)) & ~1);
+          auto sx = std::min(src_w - 2, ((int) ((std::int64_t) x * src_w / out_w)) & ~1);
           dst_row[x] = src_row[sx];
           dst_row[x + 1] = src_row[sx + 1];
         }
@@ -337,6 +453,11 @@ namespace rkmpp {
     }
 
     void scale_plane_linear(const std::uint8_t *src, int src_stride, int src_w, int src_h, std::uint8_t *dst, int dst_stride, int dst_w, int dst_h, int channels) {
+      if (src_h == dst_h) {
+        scale_plane_linear_horizontal(src, src_stride, src_w, src_h, dst, dst_stride, dst_w, channels);
+        return;
+      }
+
       for (int y = 0; y < dst_h; ++y) {
         float src_y_f = ((y + 0.5f) * src_h / dst_h) - 0.5f;
         if (src_y_f < 0.0f) {
@@ -372,12 +493,93 @@ namespace rkmpp {
       }
     }
 
-    void scale_nv12_linear(const std::uint8_t *src_y, const std::uint8_t *src_uv, AVFrame *dst, int off_x, int off_y, int out_w, int out_h) {
+    void scale_plane_linear_horizontal(const std::uint8_t *src, int src_stride, int src_w, int src_h, std::uint8_t *dst, int dst_stride, int dst_w, int channels) {
+      if (src_w == dst_w) {
+        for (int y = 0; y < src_h; ++y) {
+          std::memcpy(dst + (std::size_t) y * dst_stride, src + (std::size_t) y * src_stride, (std::size_t) src_w * channels);
+        }
+        return;
+      }
+
+      std::vector<std::pair<int, int>> xmap(dst_w);
+      for (int x = 0; x < dst_w; ++x) {
+        auto pos = (((std::int64_t) (x * 2 + 1) * src_w * 256) / (dst_w * 2)) - 128;
+        if (pos < 0) {
+          pos = 0;
+        }
+        auto x0 = std::min(src_w - 1, (int) (pos >> 8));
+        auto x1 = std::min(src_w - 1, x0 + 1);
+        auto frac = x1 == x0 ? 0 : (int) (pos & 0xff);
+        xmap[x] = {x0, frac};
+      }
+
+      for (int y = 0; y < src_h; ++y) {
+        auto *dst_row = dst + (std::size_t) y * dst_stride;
+        const auto *src_row = src + (std::size_t) y * src_stride;
+        for (int x = 0; x < dst_w; ++x) {
+          auto [x0, frac] = xmap[x];
+          const auto *p0 = src_row + (std::size_t) x0 * channels;
+          const auto *p1 = src_row + (std::size_t) std::min(src_w - 1, x0 + 1) * channels;
+          auto *out = dst_row + (std::size_t) x * channels;
+          for (int c = 0; c < channels; ++c) {
+            out[c] = (std::uint8_t) (((int) p0[c] * (256 - frac) + (int) p1[c] * frac + 128) >> 8);
+          }
+        }
+      }
+    }
+
+    void scale_nv12_linear(const std::uint8_t *src_y, const std::uint8_t *src_uv, int src_stride, int src_w, int src_h, AVFrame *dst, int off_x, int off_y, int out_w, int out_h) {
       auto *dst_y = dst->data[0] + (std::size_t) off_y * dst->linesize[0] + off_x;
       auto *dst_uv = dst->data[1] + (std::size_t) (off_y / 2) * dst->linesize[1] + off_x;
 
-      scale_plane_linear(src_y, width, width, height, dst_y, dst->linesize[0], out_w, out_h, 1);
-      scale_plane_linear(src_uv, width, width / 2, height / 2, dst_uv, dst->linesize[1], out_w / 2, out_h / 2, 2);
+      scale_plane_linear(src_y, src_stride, src_w, src_h, dst_y, dst->linesize[0], out_w, out_h, 1);
+      scale_plane_linear(src_uv, src_stride, src_w / 2, src_h / 2, dst_uv, dst->linesize[1], out_w / 2, out_h / 2, 2);
+    }
+
+    bool should_line_blend(int src_h, int out_h, int dst_h) const {
+      if (line_blend == line_blend_e::disabled) {
+        return false;
+      }
+      if (line_blend == line_blend_e::enabled) {
+        return out_h >= 4;
+      }
+
+      // 240p/480i-era sources often arrive through HDMI capture hardware as
+      // alternating-line SD frames. When 720x480 is widened to 16:9 the height is
+      // unchanged, so normal scaling preserves those horizontal lines exactly.
+      return src_h <= 576 && out_h == src_h && out_h <= dst_h && out_h >= 4;
+    }
+
+    void blend_plane_lines(std::uint8_t *plane, int stride, int off_x, int off_y, int width, int height, int channels) {
+      if (height < 3 || width <= 0) {
+        return;
+      }
+
+      const auto row_bytes = (std::size_t) width * channels;
+      std::vector<std::uint8_t> prev(row_bytes);
+      std::vector<std::uint8_t> cur(row_bytes);
+      std::vector<std::uint8_t> next(row_bytes);
+
+      auto *row0 = plane + (std::size_t) off_y * stride + off_x * channels;
+      auto *row1 = plane + (std::size_t) (off_y + 1) * stride + off_x * channels;
+      std::memcpy(prev.data(), row0, row_bytes);
+      std::memcpy(cur.data(), row1, row_bytes);
+
+      for (int y = 1; y < height - 1; ++y) {
+        auto *next_row = plane + (std::size_t) (off_y + y + 1) * stride + off_x * channels;
+        std::memcpy(next.data(), next_row, row_bytes);
+        auto *dst_row = plane + (std::size_t) (off_y + y) * stride + off_x * channels;
+        for (std::size_t x = 0; x < row_bytes; ++x) {
+          dst_row[x] = (std::uint8_t) (((int) prev[x] + cur[x] + next[x] + 1) / 3);
+        }
+        prev.swap(cur);
+        cur.swap(next);
+      }
+    }
+
+    void blend_nv12_lines(AVFrame *dst, int off_x, int off_y, int out_w, int out_h) {
+      blend_plane_lines(dst->data[0], dst->linesize[0], off_x, off_y, out_w, out_h, 1);
+      blend_plane_lines(dst->data[1], dst->linesize[1], off_x / 2, off_y / 2, out_w / 2, out_h / 2, 2);
     }
 
     struct forced_format_t {
@@ -397,9 +599,7 @@ namespace rkmpp {
         AVPixelFormat av;  // AV_PIX_FMT_NONE: NV12 (native) or MJPEG (decoded)
       } candidates[] = {
         {V4L2_PIX_FMT_NV12, AV_PIX_FMT_NONE},    // native, zero conversion
-        {V4L2_PIX_FMT_YUYV, AV_PIX_FMT_YUYV422}, // raw, libswscale convert
-        {V4L2_PIX_FMT_YUV420, AV_PIX_FMT_YUV420P},
-        {V4L2_PIX_FMT_BGR24, AV_PIX_FMT_BGR24},
+        {V4L2_PIX_FMT_YUYV, AV_PIX_FMT_YUYV422}, // raw, GPU converts to NV12
         {V4L2_PIX_FMT_MJPEG, AV_PIX_FMT_NONE}, // JPEG decode
       };
 
@@ -408,14 +608,14 @@ namespace rkmpp {
       // explicitly pinned.
       auto forced = parse_forced_format(std::getenv("SUNSHINE_RKMPP_V4L2_FORMAT"));
       std::array<std::size_t, sizeof(candidates) / sizeof(candidates[0])> order {
-        0, 1, 2, 3, 4
+        0, 1, 2
       };
       const bool mjpeg_prefers_fallback = forced.is_forced && forced.v4l2 == V4L2_PIX_FMT_MJPEG;
 
       if (mjpeg_prefers_fallback) {
         BOOST_LOG(info) << "RKMPP direct V4L2: format preference "sv << fourcc_str(forced.v4l2)
                         << (forced.mjpeg_hw ? " with hardware MJPEG decode"sv : ""sv);
-        order = std::array<std::size_t, sizeof(candidates) / sizeof(candidates[0])> {4, 0, 1, 2, 3};
+        order = std::array<std::size_t, sizeof(candidates) / sizeof(candidates[0])> {2, 0, 1};
       } else if (forced.is_forced) {
         BOOST_LOG(info) << "RKMPP direct V4L2: format pinned to "sv << fourcc_str(forced.v4l2)
                         << (forced.mjpeg_hw ? " with hardware MJPEG decode"sv : ""sv);
@@ -442,7 +642,7 @@ namespace rkmpp {
             continue;
           }
 
-          if (!activate_format(candidate.v4l2, candidate.av, size.first, size.second, forced.mjpeg_hw)) {
+          if (!activate_format(candidate.v4l2, candidate.av, size.first, size.second, fmt.fmt.pix.bytesperline, forced.mjpeg_hw)) {
             return false;
           }
           if (size.first != requested_width || size.second != requested_height) {
@@ -487,10 +687,11 @@ namespace rkmpp {
       return sizes;
     }
 
-    bool activate_format(std::uint32_t v4l2, AVPixelFormat av, int width, int height, bool mjpeg_hw) {
+    bool activate_format(std::uint32_t v4l2, AVPixelFormat av, int width, int height, int bytes_per_line, bool mjpeg_hw) {
       capture_fourcc = v4l2;
       this->width = width;
       this->height = height;
+      capture_stride = std::max(width, bytes_per_line);
       is_mjpeg = false;
       is_raw_convert = false;
       raw_av_fmt = AV_PIX_FMT_NONE;
@@ -577,6 +778,84 @@ namespace rkmpp {
 
       BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_SCALE_FILTER '"sv << env << "'; using nearest"sv;
       return scale_filter_e::nearest;
+    }
+
+    static line_blend_e parse_line_blend(const char *env) {
+      if (!env || !*env) {
+        return line_blend_e::disabled;
+      }
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c) || c == '-' || c == '_'; }), v.end());
+
+      if (v.empty() || v == "auto" || v == "automatic") {
+        return line_blend_e::disabled;
+      }
+      if (v == "on" || v == "true" || v == "1" || v == "enabled" || v == "blend") {
+        return line_blend_e::enabled;
+      }
+      if (v == "off" || v == "false" || v == "0" || v == "disabled" || v == "none") {
+        return line_blend_e::disabled;
+      }
+
+      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_LINE_BLEND '"sv << env << "'; using auto"sv;
+      return line_blend_e::disabled;
+    }
+
+    static view_region_t parse_view_region(const char *env) {
+      view_region_t region;
+      if (!env || !*env) {
+        return region;
+      }
+
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      if (v == "auto" || v == "none" || v == "clear") {
+        return region;
+      }
+
+      for (auto &c : v) {
+        if (c == ',' || c == ';' || c == ':' || std::isspace((unsigned char) c)) {
+          c = ' ';
+        }
+      }
+
+      std::vector<float> parts;
+      std::size_t pos = 0;
+      while (pos < v.size()) {
+        auto next = v.find(' ', pos);
+        auto token = v.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        if (!token.empty()) {
+          try {
+            parts.push_back(std::stof(token));
+          } catch (...) {
+            parts.clear();
+            break;
+          }
+        }
+        if (next == std::string::npos) {
+          break;
+        }
+        pos = next + 1;
+      }
+
+      if (parts.size() == 4) {
+        auto left = std::clamp(parts[0], 0.0f, 1.0f);
+        auto top = std::clamp(parts[1], 0.0f, 1.0f);
+        auto right = std::clamp(parts[2], 0.0f, 1.0f);
+        auto bottom = std::clamp(parts[3], 0.0f, 1.0f);
+        if (right - left >= 0.01f && bottom - top >= 0.01f) {
+          region.left = left;
+          region.top = top;
+          region.right = right;
+          region.bottom = bottom;
+          region.enabled = !(left == 0.0f && top == 0.0f && right == 1.0f && bottom == 1.0f);
+          return region;
+        }
+      }
+
+      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_VIEW_REGION '"sv << env << "'; using full frame"sv;
+      return {};
     }
 
     // Map a SUNSHINE_RKMPP_V4L2_FORMAT token to a V4L2 fourcc. Plain "mjpeg"
@@ -678,6 +957,9 @@ namespace rkmpp {
       int src_stride[4] = {};
       if (av_image_fill_arrays(planes, src_stride, src, raw_av_fmt, width, height, 1) < 0) {
         return false;
+      }
+      if (capture_stride > src_stride[0]) {
+        src_stride[0] = capture_stride;
       }
       const std::uint8_t *src_data[4] = {planes[0], planes[1], planes[2], planes[3]};
 
@@ -880,7 +1162,10 @@ namespace rkmpp {
     bool is_raw_convert {};
     float forced_aspect_ratio {};
     scale_filter_e scale_filter {scale_filter_e::nearest};
+    line_blend_e line_blend {line_blend_e::disabled};
+    view_region_t view_region;
     std::uint32_t capture_fourcc {V4L2_PIX_FMT_NV12};
+    int capture_stride {};
     AVPixelFormat raw_av_fmt {AV_PIX_FMT_NONE};
     AVCodecContext *mjpeg_ctx {};
     SwsContext *sws_ctx {};
@@ -969,6 +1254,16 @@ namespace rkmpp {
 
       if (direct_v4l2) {
         BOOST_LOG(info) << "Using RKMPP direct V4L2 encode path"sv;
+        auto nv12_opt = egl::create_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
+        if (!nv12_opt) {
+          return -1;
+        }
+        this->nv12 = std::move(*nv12_opt);
+        if (init_direct_v4l2_gpu()) {
+          BOOST_LOG(info) << "RKMPP direct V4L2: GPU scaling/conversion enabled"sv;
+        } else {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: GPU scaling unavailable; falling back to CPU scaling"sv;
+        }
       } else {
         BOOST_LOG(info) << "Using RKMPP GPU-convert + read-back encode path"sv;
 
@@ -1021,10 +1316,15 @@ namespace rkmpp {
       }
 
       if (direct_v4l2) {
-        if (!direct_v4l2->copy_latest_to(mapped_frame.get(), frame->width, frame->height)) {
+        if (!direct_v4l2->update_latest_frame()) {
           if (direct_v4l2->should_log_missing_frame()) {
             BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available; sending black frames until capture resumes"sv;
           }
+          direct_v4l2->copy_black_to(mapped_frame.get(), frame->width, frame->height);
+        } else if (direct_gpu_ready && convert_direct_v4l2_gpu(direct_v4l2->latest_direct_frame(), direct_v4l2->scale_region(frame->width, frame->height), mapped_frame.get())) {
+          return 0;
+        } else {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: GPU conversion failed; sending black frame"sv;
           direct_v4l2->copy_black_to(mapped_frame.get(), frame->width, frame->height);
         }
         return 0;
@@ -1106,8 +1406,307 @@ namespace rkmpp {
     std::uint64_t sequence {};
     std::string direct_v4l2_device;
     std::unique_ptr<v4l2_nv12_source_t> direct_v4l2;
+    gl::tex_t direct_v4l2_tex;
+    gl::program_t direct_v4l2_program[3];
+    bool direct_gpu_ready {};
+    int direct_tex_width {};
+    int direct_tex_height {};
+    std::uint32_t direct_tex_fourcc {};
 
   private:
+    util::Either<gl::program_t, std::string> make_direct_program(const std::string_view &fragment_source) {
+      static constexpr std::string_view vertex_source = R"glsl(
+#version 300 es
+
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+out vec2 tex;
+
+void main()
+{
+  float idHigh = float(gl_VertexID >> 1);
+  float idLow = float(gl_VertexID & int(1));
+
+  float x = idHigh * 4.0 - 1.0;
+  float y = idLow * 4.0 - 1.0;
+
+  float u = idHigh * 2.0;
+  float v = idLow * 2.0;
+
+  gl_Position = vec4(x, y, 0.0, 1.0);
+  tex = vec2(u, v);
+}
+)glsl";
+
+      auto vertex = gl::shader_t::compile(vertex_source, GL_VERTEX_SHADER);
+      if (vertex.has_right()) {
+        return vertex.right();
+      }
+
+      auto fragment = gl::shader_t::compile(fragment_source, GL_FRAGMENT_SHADER);
+      if (fragment.has_right()) {
+        return fragment.right();
+      }
+
+      return gl::program_t::link(vertex.left(), fragment.left());
+    }
+
+    bool init_direct_v4l2_gpu() {
+      static constexpr std::string_view nv12_fragment = R"glsl(
+#version 300 es
+
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform sampler2D image;
+uniform vec4 src_rect;
+
+in vec2 tex;
+layout(location = 0) out vec4 color;
+
+void main()
+{
+  color = texture(image, mix(src_rect.xy, src_rect.zw, tex));
+}
+)glsl";
+
+      static constexpr std::string_view yuyv_y_fragment = R"glsl(
+#version 300 es
+
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform sampler2D image;
+uniform vec4 src_rect;
+uniform float src_width;
+
+in vec2 tex;
+layout(location = 0) out float color;
+
+void main()
+{
+  vec2 st = mix(src_rect.xy, src_rect.zw, tex);
+  float x = max(0.0, st.x * src_width - 0.5);
+  float pair_x = floor(x * 0.5);
+  vec4 yuyv = texture(image, vec2((pair_x + 0.5) / (src_width * 0.5), st.y));
+  color = mod(floor(x + 0.5), 2.0) < 1.0 ? yuyv.r : yuyv.b;
+}
+)glsl";
+
+      static constexpr std::string_view yuyv_uv_fragment = R"glsl(
+#version 300 es
+
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform sampler2D image;
+uniform vec4 src_rect;
+uniform float src_width;
+
+in vec2 tex;
+layout(location = 0) out vec2 color;
+
+void main()
+{
+  vec2 st = mix(src_rect.xy, src_rect.zw, tex);
+  float x = max(0.0, st.x * src_width - 0.5);
+  float pair_x = floor(x * 0.5);
+  vec4 yuyv = texture(image, vec2((pair_x + 0.5) / (src_width * 0.5), st.y));
+  color = yuyv.ga;
+}
+)glsl";
+
+      auto nv12 = make_direct_program(nv12_fragment);
+      if (nv12.has_right()) {
+        BOOST_LOG(error) << "RKMPP direct V4L2: NV12 GPU shader failed: "sv << nv12.right();
+        return false;
+      }
+      direct_v4l2_program[0] = std::move(nv12.left());
+
+      auto yuyv_y = make_direct_program(yuyv_y_fragment);
+      if (yuyv_y.has_right()) {
+        BOOST_LOG(error) << "RKMPP direct V4L2: YUYV luma GPU shader failed: "sv << yuyv_y.right();
+        return false;
+      }
+      direct_v4l2_program[1] = std::move(yuyv_y.left());
+
+      auto yuyv_uv = make_direct_program(yuyv_uv_fragment);
+      if (yuyv_uv.has_right()) {
+        BOOST_LOG(error) << "RKMPP direct V4L2: YUYV chroma GPU shader failed: "sv << yuyv_uv.right();
+        return false;
+      }
+      direct_v4l2_program[2] = std::move(yuyv_uv.left());
+
+      direct_v4l2_tex = gl::tex_t::make(2);
+      direct_gpu_ready = true;
+      gl_drain_errors;
+      return true;
+    }
+
+    void set_direct_sampler(gl::program_t &program, int texture_index, const scale_region_t &region, const direct_frame_t &src, bool uv_plane) {
+      gl::ctx.UseProgram(program.handle());
+
+      auto image_loc = gl::ctx.GetUniformLocation(program.handle(), "image");
+      if (image_loc >= 0) {
+        gl::ctx.Uniform1i(image_loc, texture_index);
+      }
+
+      auto rect_loc = gl::ctx.GetUniformLocation(program.handle(), "src_rect");
+      if (rect_loc >= 0) {
+        float src_w = (float) src.width;
+        float src_h = (float) src.height;
+        float left = region.src_left / src_w;
+        float top = region.src_top / src_h;
+        float right = (region.src_left + region.src_w) / src_w;
+        float bottom = (region.src_top + region.src_h) / src_h;
+        if (uv_plane && src.nv12) {
+          left = (region.src_left / 2) / (src_w / 2.0f);
+          top = (region.src_top / 2) / (src_h / 2.0f);
+          right = ((region.src_left + region.src_w) / 2) / (src_w / 2.0f);
+          bottom = ((region.src_top + region.src_h) / 2) / (src_h / 2.0f);
+        }
+        gl::ctx.Uniform4f(rect_loc, left, top, right, bottom);
+      }
+
+      auto width_loc = gl::ctx.GetUniformLocation(program.handle(), "src_width");
+      if (width_loc >= 0) {
+        gl::ctx.Uniform1f(width_loc, (float) src.width);
+      }
+    }
+
+    void set_direct_texture_params(bool linear_filter) {
+      auto filter = linear_filter ? GL_LINEAR : GL_NEAREST;
+      for (auto texture : direct_v4l2_tex) {
+        gl::ctx.BindTexture(GL_TEXTURE_2D, texture);
+        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+      }
+      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    bool direct_texture_shape_changed(const direct_frame_t &src) const {
+      return direct_tex_width != src.width || direct_tex_height != src.height || direct_tex_fourcc != src.fourcc;
+    }
+
+    bool upload_direct_frame(const direct_frame_t &src, bool linear_filter) {
+      if (!src.data || (!src.nv12 && src.fourcc != V4L2_PIX_FMT_YUYV)) {
+        return false;
+      }
+
+      const bool allocate = direct_texture_shape_changed(src);
+      if (allocate) {
+        direct_tex_width = src.width;
+        direct_tex_height = src.height;
+        direct_tex_fourcc = src.fourcc;
+      }
+      set_direct_texture_params(linear_filter && src.nv12);
+
+      gl::ctx.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+      if (src.nv12) {
+        gl::ctx.ActiveTexture(GL_TEXTURE0);
+        gl::ctx.BindTexture(GL_TEXTURE_2D, direct_v4l2_tex[0]);
+        gl::ctx.PixelStorei(GL_UNPACK_ROW_LENGTH, src.stride);
+        if (allocate) {
+          gl::ctx.TexImage2D(GL_TEXTURE_2D, 0, GL_R8, src.width, src.height, 0, GL_RED, GL_UNSIGNED_BYTE, src.data);
+        } else {
+          gl::ctx.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, src.width, src.height, GL_RED, GL_UNSIGNED_BYTE, src.data);
+        }
+
+        gl::ctx.ActiveTexture(GL_TEXTURE1);
+        gl::ctx.BindTexture(GL_TEXTURE_2D, direct_v4l2_tex[1]);
+        gl::ctx.PixelStorei(GL_UNPACK_ROW_LENGTH, src.stride / 2);
+        if (allocate) {
+          gl::ctx.TexImage2D(GL_TEXTURE_2D, 0, GL_RG8, src.width / 2, src.height / 2, 0, GL_RG, GL_UNSIGNED_BYTE, src.data + (std::size_t) src.stride * src.height);
+        } else {
+          gl::ctx.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, src.width / 2, src.height / 2, GL_RG, GL_UNSIGNED_BYTE, src.data + (std::size_t) src.stride * src.height);
+        }
+      } else {
+        gl::ctx.ActiveTexture(GL_TEXTURE0);
+        gl::ctx.BindTexture(GL_TEXTURE_2D, direct_v4l2_tex[0]);
+        gl::ctx.PixelStorei(GL_UNPACK_ROW_LENGTH, src.stride / 4);
+        if (allocate) {
+          gl::ctx.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, src.width / 2, src.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, src.data);
+        } else {
+          gl::ctx.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, src.width / 2, src.height, GL_RGBA, GL_UNSIGNED_BYTE, src.data);
+        }
+      }
+
+      gl::ctx.PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+      return true;
+    }
+
+    bool convert_direct_v4l2_gpu(const direct_frame_t &src, const scale_region_t &region, AVFrame *mapped_frame) {
+      const bool linear_filter = false;
+      if (!upload_direct_frame(src, linear_filter)) {
+        return false;
+      }
+
+      const float y_black[] = {16.0f / 255.0f, 0.0f, 0.0f, 0.0f};
+      const float uv_black[] = {128.0f / 255.0f, 128.0f / 255.0f, 0.0f, 0.0f};
+      for (int plane = 0; plane < 2; ++plane) {
+        gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[plane]);
+        gl::ctx.ClearBufferfv(GL_COLOR, 0, plane == 0 ? y_black : uv_black);
+      }
+
+      if (src.nv12) {
+        for (int plane = 0; plane < 2; ++plane) {
+          auto &program = direct_v4l2_program[0];
+          gl::ctx.ActiveTexture(plane == 0 ? GL_TEXTURE0 : GL_TEXTURE1);
+          gl::ctx.BindTexture(GL_TEXTURE_2D, direct_v4l2_tex[plane]);
+          set_direct_sampler(program, plane, region, src, plane == 1);
+          gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[plane]);
+          gl::ctx.Viewport(region.off_x / (plane + 1), region.off_y / (plane + 1), region.out_w / (plane + 1), region.out_h / (plane + 1));
+          gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
+        }
+      } else if (src.fourcc == V4L2_PIX_FMT_YUYV) {
+        gl::ctx.ActiveTexture(GL_TEXTURE0);
+        gl::ctx.BindTexture(GL_TEXTURE_2D, direct_v4l2_tex[0]);
+
+        set_direct_sampler(direct_v4l2_program[1], 0, region, src, false);
+        gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[0]);
+        gl::ctx.Viewport(region.off_x, region.off_y, region.out_w, region.out_h);
+        gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
+
+        set_direct_sampler(direct_v4l2_program[2], 0, region, src, true);
+        gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[1]);
+        gl::ctx.Viewport(region.off_x / 2, region.off_y / 2, region.out_w / 2, region.out_h / 2);
+        gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
+      } else {
+        return false;
+      }
+
+      gl::ctx.Flush();
+
+      gl::ctx.PixelStorei(GL_PACK_ALIGNMENT, 1);
+      gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, mapped_frame->linesize[0]);
+      gl::ctx.GetTextureSubImage(
+        nv12->tex[0], 0, 0, 0, 0,
+        frame->width, frame->height, 1,
+        GL_RED, GL_UNSIGNED_BYTE,
+        mapped_frame->linesize[0] * frame->height, mapped_frame->data[0]
+      );
+
+      gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, mapped_frame->linesize[1] / 2);
+      gl::ctx.GetTextureSubImage(
+        nv12->tex[1], 0, 0, 0, 0,
+        frame->width / 2, frame->height / 2, 1,
+        GL_RG, GL_UNSIGNED_BYTE,
+        mapped_frame->linesize[1] * (frame->height / 2), mapped_frame->data[1]
+      );
+      gl::ctx.PixelStorei(GL_PACK_ROW_LENGTH, 0);
+      gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
+      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+      gl_drain_errors;
+      return true;
+    }
+
     void make_current() {
       eglMakeCurrent(display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, std::get<1>(ctx.el));
     }

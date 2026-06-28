@@ -20,6 +20,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # ffmpeg-rockchip commit baked into the image (github.com/nyanmisaka/ffmpeg-rockchip).
 ARG FFMPEG_ROCKCHIP_REF=40c412dacc
 
+# furnace runs the container as the build host's uid:gid (mbp grahamneiln =
+# 501:20). linux_build.sh needs root (apt + writes to /usr/local), so create a
+# matching user with passwordless sudo and run the build with sudo (no
+# --sudo-off). Override BUILD_UID/BUILD_GID if building from a different host.
+ARG BUILD_UID=501
+ARG BUILD_GID=20
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
@@ -47,5 +54,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # points here. (A shallow fetch of the exact commit keeps the image small.)
 RUN git clone --filter=blob:none https://github.com/nyanmisaka/ffmpeg-rockchip.git /opt/ffmpeg-rockchip \
     && git -C /opt/ffmpeg-rockchip checkout "${FFMPEG_ROCKCHIP_REF}"
+
+# Build user matching furnace's --user uid:gid, with passwordless sudo so the
+# (non-root) furnace container can still apt-install and write to /usr/local.
+RUN (getent group "${BUILD_GID}" || groupadd -g "${BUILD_GID}" builder) \
+    && useradd -o -u "${BUILD_UID}" -g "${BUILD_GID}" -m -s /bin/bash builder \
+    && echo 'builder ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/builder \
+    && chmod 0440 /etc/sudoers.d/builder \
+    && chown -R "${BUILD_UID}:${BUILD_GID}" /opt/ffmpeg-rockchip
 
 WORKDIR /work

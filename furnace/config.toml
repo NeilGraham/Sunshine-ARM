@@ -19,6 +19,11 @@
 ssh = "mbp"
 docker = true
 include_pull = ["build/cpack_artifacts/Sunshine.deb"]
+# No --sudo-off: furnace runs the container as a non-root uid, and linux_build.sh
+# needs root for apt and /usr/local. The image gives that uid passwordless sudo
+# (see the Dockerfiles), so the build sudo's the steps that need it.
+# HOME is repointed at the build user's home (furnace sets HOME=/tmp, which has
+# no .bashrc; linux_build.sh does `source ~/.bashrc`).
 commands = [
-    "./scripts/linux_build.sh --sudo-off --skip-cuda --num-processors=4 --rkmpp=/opt/ffmpeg-rockchip",
+    "export HOME=/home/builder && ./scripts/linux_build.sh --skip-cuda --num-processors=4 --rkmpp=/opt/ffmpeg-rockchip",
 ]

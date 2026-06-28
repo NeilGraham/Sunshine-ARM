@@ -45,3 +45,10 @@ furnace run --image furnace/debian-13-trixie.Dockerfile
   and run `furnace run --clean` once to rebuild the image and the ffmpeg cache.
 - The remaining build deps (boost, cmake, ninja, openssl, …) are installed by
   `scripts/linux_build.sh` at build time, not by the Dockerfile.
+- **Non-root build user.** furnace runs the container as the build host's
+  `uid:gid` (mbp `grahamneiln` = `501:20`), but `linux_build.sh` needs root for
+  apt and `/usr/local`. So the images create a matching user (`ARG BUILD_UID` /
+  `BUILD_GID`) with passwordless sudo, the build runs *without* `--sudo-off`, and
+  the command sets `HOME=/home/builder` (furnace's `HOME=/tmp` has no `.bashrc`,
+  which `linux_build.sh` sources). If you ever build from a host with a different
+  uid, override `--build-arg BUILD_UID=…` (or just rebuild on mbp where it's 501).

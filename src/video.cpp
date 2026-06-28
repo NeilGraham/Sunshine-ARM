@@ -1753,6 +1753,14 @@ namespace video {
     for (int retries = 0; retries < 2; retries++) {
       ctx.reset(avcodec_alloc_context3(codec));
       ctx->width = config.width;
+#ifdef SUNSHINE_BUILD_RKMPP
+      if (encoder.name == "rkmpp"sv && ctx->width % 4) {
+        auto aligned_width = (ctx->width + 3) & ~3;
+        BOOST_LOG(warning) << "RKMPP: aligning encoder width from "sv << ctx->width
+                           << " to "sv << aligned_width << " to avoid unaligned 4:2:0 chroma width"sv;
+        ctx->width = aligned_width;
+      }
+#endif
       ctx->height = config.height;
       ctx->time_base = AVRational {1, config.framerate};
       ctx->framerate = AVRational {config.framerate, 1};
