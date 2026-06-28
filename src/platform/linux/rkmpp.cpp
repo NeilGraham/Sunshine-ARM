@@ -198,6 +198,16 @@ namespace rkmpp {
       return true;
     }
 
+    // Requeue a buffer back to the driver by index (used for the held zero-copy
+    // buffer, which we keep dequeued across frames).
+    void requeue_buffer(std::uint32_t index) {
+      v4l2_buffer buf {};
+      buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index = index;
+      xioctl(fd, VIDIOC_QBUF, &buf);
+    }
+
     bool update_latest_frame() {
       v4l2_buffer latest {};
       bool have_latest = false;
@@ -210,7 +220,7 @@ namespace rkmpp {
         if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
           if (errno == EAGAIN && !have_latest) {
             pollfd pfd {fd, POLLIN, 0};
-            auto timeout_ms = latest_frame.empty() ? 250 : 8;
+            auto timeout_ms = ever_produced ? 8 : 250;
             if (poll(&pfd, 1, timeout_ms) > 0) {
               continue;
             }
@@ -219,7 +229,7 @@ namespace rkmpp {
         }
 
         if (have_latest) {
-          xioctl(fd, VIDIOC_QBUF, &latest);
+          requeue_buffer(latest.index);
         }
         latest = buf;
         have_latest = true;
@@ -228,20 +238,31 @@ namespace rkmpp {
       if (have_latest) {
         auto *src = (const std::uint8_t *) buffers[latest.index].start;
         if (is_mjpeg) {
+          // Decoded into the CPU latest_frame; the capture buffer is free now.
           decode_mjpeg_to_nv12(src, latest.bytesused);
-        } else if (is_raw_convert) {
-          latest_frame.assign(src, src + latest.bytesused);
-        } else if (!is_zeroed_nv12(src)) {
-          auto size = (std::size_t) capture_stride * height * 3 / 2;
-          if (latest.bytesused > 0) {
-            size = std::min<std::size_t>(size, latest.bytesused);
+          requeue_buffer(latest.index);
+          if (!latest_frame.empty()) {
+            latest_ptr = latest_frame.data();
+            ever_produced = true;
           }
-          latest_frame.assign(src, src + size);
+        } else if (is_raw_convert || !is_zeroed_nv12(src)) {
+          // Zero-copy: hand the GPU upload the mmap'd buffer directly instead of
+          // memcpying it. Keep this buffer dequeued and release the previously
+          // held one; the upload (glTexSubImage2D) consumes the pointer
+          // synchronously, so requeuing one frame later is safe.
+          if (held_index >= 0) {
+            requeue_buffer((std::uint32_t) held_index);
+          }
+          held_index = (int) latest.index;
+          latest_ptr = src;
+          ever_produced = true;
+        } else {
+          // Zeroed NV12 frame: discard it and keep showing the last good frame.
+          requeue_buffer(latest.index);
         }
-        xioctl(fd, VIDIOC_QBUF, &latest);
       }
 
-      if (latest_frame.empty()) {
+      if (!ever_produced) {
         return false;
       }
 
@@ -251,7 +272,7 @@ namespace rkmpp {
 
     direct_frame_t latest_direct_frame() const {
       direct_frame_t frame;
-      frame.data = latest_frame.data();
+      frame.data = latest_ptr;
       frame.fourcc = capture_fourcc;
       frame.width = width;
       frame.height = height;
@@ -302,7 +323,7 @@ namespace rkmpp {
       if (!update_latest_frame()) {
         return false;
       }
-      copy_nv12(latest_frame.data(), mapped_frame, dst_width, dst_height);
+      copy_nv12(latest_ptr, mapped_frame, dst_width, dst_height);
       return true;
     }
 
@@ -1181,6 +1202,14 @@ namespace rkmpp {
     SwsContext *sws_ctx {};
     std::vector<std::uint8_t> latest_frame;
     std::vector<std::uint8_t> convert_buf;
+    // Zero-copy capture state: latest_ptr points at the current frame's pixels,
+    // which for NV12/raw formats is the mmap'd V4L2 buffer kept dequeued in
+    // held_index (requeued only once a newer good frame replaces it). For MJPEG
+    // it points into the decoded latest_frame. ever_produced gates the first
+    // valid frame.
+    const std::uint8_t *latest_ptr {};
+    int held_index {-1};
+    bool ever_produced {};
     std::vector<buffer_t> buffers;
   };
 
@@ -1798,7 +1827,14 @@ void main()
     }
 
     void make_current() {
-      eglMakeCurrent(display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, std::get<1>(ctx.el));
+      // The capture path may leave its own context current on this thread, but
+      // for the direct V4L2 path it usually doesn't, so skip the redundant
+      // driver call when our context is already current.
+      auto context = std::get<1>(ctx.el);
+      if (eglGetCurrentContext() == context) {
+        return;
+      }
+      eglMakeCurrent(display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, context);
     }
   };
 
