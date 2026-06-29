@@ -80,6 +80,8 @@ namespace rkmpp {
     automatic,
     nearest,
     linear,
+    cubic,
+    average,
   };
 
   enum class line_blend_e {
@@ -358,6 +360,12 @@ namespace rkmpp {
     void copy_black_to(AVFrame *mapped_frame, int dst_width, int dst_height) {
       std::fill_n(mapped_frame->data[0], (std::size_t) mapped_frame->linesize[0] * dst_height, 16);
       std::fill_n(mapped_frame->data[1], (std::size_t) mapped_frame->linesize[1] * (dst_height / 2), 128);
+    }
+
+    // The encode device reads the parsed filter to pick a scaling backend
+    // (nearest -> GPU; the rest -> RGA) and the RGA interpolation mode.
+    scale_filter_e get_scale_filter() const {
+      return scale_filter;
     }
 
     int width {};
@@ -813,6 +821,12 @@ namespace rkmpp {
       if (v == "linear" || v == "bilinear") {
         return scale_filter_e::linear;
       }
+      if (v == "cubic" || v == "bicubic") {
+        return scale_filter_e::cubic;
+      }
+      if (v == "average" || v == "avg") {
+        return scale_filter_e::average;
+      }
 
       BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_SCALE_FILTER '"sv << env << "'; using nearest"sv;
       return scale_filter_e::nearest;
@@ -1239,10 +1253,15 @@ namespace rkmpp {
       }
     }
 
-    bool init(int dst_w, int dst_h) {
+    bool init(int dst_w, int dst_h, scale_filter_e filter) {
       const char *heap_env = std::getenv("SUNSHINE_RKMPP_RGA_HEAP");
       heap_name = (heap_env && *heap_env) ? heap_env : "/dev/dma_heap/reserved";
-      interp = parse_interp(std::getenv("SUNSHINE_RKMPP_RGA_INTERP"));
+      // The shared scaling-method setting drives the interpolation; an explicit
+      // SUNSHINE_RKMPP_RGA_INTERP still overrides it for experimentation.
+      interp = interp_from_filter(filter);
+      if (auto override_env = std::getenv("SUNSHINE_RKMPP_RGA_INTERP")) {
+        interp = parse_interp(override_env);
+      }
 
       heap_fd = open(heap_name.c_str(), O_RDWR | O_CLOEXEC);
       if (heap_fd < 0) {
@@ -1331,6 +1350,23 @@ namespace rkmpp {
       int h {};
       rga_buffer_handle_t handle {};
     };
+
+    // Map the shared scale-filter setting to an RGA interpolation mode. nearest
+    // never reaches RGA (it is routed to the GPU path), so it falls to default.
+    static int interp_from_filter(scale_filter_e filter) {
+      switch (filter) {
+        case scale_filter_e::linear:
+          return IM_INTERP_LINEAR;
+        case scale_filter_e::cubic:
+          return IM_INTERP_CUBIC;
+        case scale_filter_e::average:
+          return IM_INTERP_AVERAGE;
+        case scale_filter_e::automatic:
+        case scale_filter_e::nearest:
+        default:
+          return IM_INTERP_DEFAULT;
+      }
+    }
 
     static int parse_interp(const char *env) {
       if (!env || !*env) {
@@ -1503,13 +1539,15 @@ namespace rkmpp {
       }
 
 #ifdef SUNSHINE_BUILD_RGA
-      // SUNSHINE_RKMPP_SCALER=rga selects the RGA 2D engine for capture scaling
-      // instead of the Mali GPU (default). Falls back to GPU if RGA is
-      // unavailable at runtime (e.g. CMA too small).
+      // The RGA 2D engine is the default capture scaler (much lower latency than
+      // the Mali GPU on Rockchip). SUNSHINE_RKMPP_SCALER=gpu forces the GPU
+      // path; RGA also falls back to GPU automatically when it is unavailable
+      // (e.g. CMA too small) or when the nearest filter is requested.
+      use_rga = true;
       if (auto scaler = std::getenv("SUNSHINE_RKMPP_SCALER")) {
         std::string v(scaler);
         std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
-        use_rga = (v == "rga" || v == "rga2" || v == "rga3");
+        use_rga = !(v == "gpu" || v == "egl" || v == "opengl" || v == "off" || v == "none");
       }
 #endif
 
@@ -1555,8 +1593,13 @@ namespace rkmpp {
         }
         this->nv12 = std::move(*nv12_opt);
 #ifdef SUNSHINE_BUILD_RGA
-        if (use_rga) {
-          if (rga.init(frame->width, frame->height)) {
+        // RGA handles every filter except nearest-neighbour, which it lacks; the
+        // nearest filter therefore routes to the GPU path (which does nearest).
+        const auto filter = direct_v4l2->get_scale_filter();
+        if (use_rga && filter == scale_filter_e::nearest) {
+          BOOST_LOG(info) << "RKMPP direct V4L2: nearest filter selected; using GPU scaler (RGA has no nearest)"sv;
+        } else if (use_rga) {
+          if (rga.init(frame->width, frame->height, filter)) {
             rga_ready = true;
             BOOST_LOG(info) << "RKMPP direct V4L2: RGA 2D scaler enabled"sv;
           } else {
