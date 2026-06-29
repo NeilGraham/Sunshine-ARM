@@ -50,6 +50,7 @@ extern "C" {
 }
 
 #ifdef SUNSHINE_BUILD_RGA
+#include <drm_fourcc.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 #include <rga/rga.h>
@@ -1246,8 +1247,10 @@ namespace rkmpp {
   class rga_scaler_t {
   public:
     ~rga_scaler_t() {
+      free_enc_frame();
       release(src_buf);
       release(dst_buf);
+      release(enc_buf);
       if (heap_fd >= 0) {
         close(heap_fd);
       }
@@ -1339,6 +1342,64 @@ namespace rkmpp {
       copy_nv12_out(dst_buf, dst, dst_w, dst_h);
       sync(dst_buf.fd, false, DMA_BUF_SYNC_READ);
       return true;
+    }
+
+    // Direct-encode path (SUNSHINE_RKMPP_RGA_DIRECT): RGA scales into a CMA
+    // buffer that the encoder imports as a DRM_PRIME frame, removing the output
+    // copy. Returns a DRM_PRIME AVFrame to hand to the encoder, or nullptr on a
+    // hard allocation failure. The encoder buffer itself is not RGA-addressable
+    // on this SoC, hence the import-our-own-buffer approach.
+    AVFrame *scale_direct(const direct_frame_t &src, const scale_region_t &region, int dst_w, int dst_h, AVBufferRef *hw_frames_ctx) {
+      if (!src.nv12 || !ensure(src_buf, src.width, src.height) || !ensure_enc(dst_w, dst_h)) {
+        return nullptr;
+      }
+
+      sync(src_buf.fd, true, DMA_BUF_SYNC_WRITE);
+      copy_nv12_in(src, src_buf);
+      sync(src_buf.fd, false, DMA_BUF_SYNC_WRITE);
+
+      // Clear letterbox bars when the output geometry changes (the encoder frame
+      // is OVERWRITE-mapped, so bars are not preserved across a geometry change).
+      const bool letterboxed = region.out_w != dst_w || region.out_h != dst_h;
+      if (letterboxed && geometry_changed(region, dst_w, dst_h)) {
+        sync(enc_buf.fd, true, DMA_BUF_SYNC_WRITE);
+        fill_black_strided(enc_buf, enc_wstride, enc_hstride);
+        sync(enc_buf.fd, false, DMA_BUF_SYNC_WRITE);
+      }
+      last_region = region;
+      last_dst_w = dst_w;
+      last_dst_h = dst_h;
+
+      rga_buffer_t s = wrapbuffer_handle(src_buf.handle, src.width, src.height, RK_FORMAT_YCbCr_420_SP);
+      rga_buffer_t d = wrapbuffer_handle(enc_buf.handle, dst_w, dst_h, RK_FORMAT_YCbCr_420_SP, enc_wstride, enc_hstride);
+      im_rect srect {region.src_left, region.src_top, region.src_w, region.src_h};
+      im_rect drect {region.off_x, region.off_y, region.out_w, region.out_h};
+      im_rect prect {};
+      im_opt_t opt {};
+      opt.interp = interp;
+      rga_buffer_t pat {};
+      auto status = improcess(s, d, pat, srect, drect, prect, -1, nullptr, &opt, IM_SYNC);
+      if (status != IM_STATUS_SUCCESS) {
+        if (!fail_logged) {
+          BOOST_LOG(warning) << "RGA: direct improcess failed: "sv << imStrError_t(status);
+          fail_logged = true;
+        }
+      } else {
+        fail_logged = false;
+      }
+      return enc_frame(hw_frames_ctx, dst_w, dst_h);
+    }
+
+    // Produce a black DRM_PRIME frame for the direct-encode path (no capture).
+    AVFrame *black_direct(int dst_w, int dst_h, AVBufferRef *hw_frames_ctx) {
+      if (!ensure_enc(dst_w, dst_h)) {
+        return nullptr;
+      }
+      sync(enc_buf.fd, true, DMA_BUF_SYNC_WRITE);
+      fill_black_strided(enc_buf, enc_wstride, enc_hstride);
+      sync(enc_buf.fd, false, DMA_BUF_SYNC_WRITE);
+      last_dst_w = -1;  // force bar re-clear on the next real frame
+      return enc_frame(hw_frames_ctx, dst_w, dst_h);
     }
 
   private:
@@ -1476,10 +1537,95 @@ namespace rkmpp {
       std::memset(p + (std::size_t) w * h, 128, (std::size_t) w * h / 2);
     }
 
+    // Black-fill the whole strided encoder buffer (Y=16, UV=128).
+    void fill_black_strided(buffer_t &b, int ws, int hs) {
+      auto *p = (std::uint8_t *) b.map;
+      std::memset(p, 16, (std::size_t) ws * hs);
+      std::memset(p + (std::size_t) ws * hs, 128, (std::size_t) ws * hs / 2);
+    }
+
     bool geometry_changed(const scale_region_t &r, int dst_w, int dst_h) const {
       return dst_w != last_dst_w || dst_h != last_dst_h ||
              r.off_x != last_region.off_x || r.off_y != last_region.off_y ||
              r.out_w != last_region.out_w || r.out_h != last_region.out_h;
+    }
+
+    // The encoder buffer uses 16-aligned strides (MPP encode requirement). Y is
+    // packed at stride enc_wstride; UV starts at enc_wstride*enc_hstride.
+    bool ensure_enc(int w, int h) {
+      const int ws = (w + 15) & ~15;
+      const int hs = (h + 15) & ~15;
+      if (enc_buf.fd >= 0 && enc_wstride == ws && enc_hstride == hs) {
+        return true;
+      }
+      free_enc_frame();
+      release(enc_buf);
+      if (!alloc(enc_buf, (std::size_t) ws * hs * 3 / 2)) {
+        return false;
+      }
+      enc_buf.handle = importbuffer_fd(enc_buf.fd, (int) enc_buf.len);
+      if (enc_buf.handle <= 0) {
+        release(enc_buf);
+        return false;
+      }
+      enc_buf.w = w;
+      enc_buf.h = h;
+      enc_wstride = ws;
+      enc_hstride = hs;
+      // Clear once so the stride padding (read as edge macroblocks by the
+      // encoder) is black; RGA overwrites the visible region each frame.
+      sync(enc_buf.fd, true, DMA_BUF_SYNC_WRITE);
+      fill_black_strided(enc_buf, ws, hs);
+      sync(enc_buf.fd, false, DMA_BUF_SYNC_WRITE);
+      return true;
+    }
+
+    // Build (once per encoder buffer) and return a DRM_PRIME AVFrame wrapping
+    // enc_buf as NV12, for the rkmpp encoder to import.
+    AVFrame *enc_frame(AVBufferRef *hw_frames_ctx, int dst_w, int dst_h) {
+      if (enc_frame_ptr) {
+        return enc_frame_ptr;
+      }
+      auto *desc = (AVDRMFrameDescriptor *) av_mallocz(sizeof(AVDRMFrameDescriptor));
+      if (!desc) {
+        return nullptr;
+      }
+      desc->nb_objects = 1;
+      desc->objects[0].fd = enc_buf.fd;
+      desc->objects[0].size = enc_buf.len;
+      desc->objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
+      desc->nb_layers = 1;
+      desc->layers[0].format = DRM_FORMAT_NV12;
+      desc->layers[0].nb_planes = 2;
+      desc->layers[0].planes[0].object_index = 0;
+      desc->layers[0].planes[0].offset = 0;
+      desc->layers[0].planes[0].pitch = enc_wstride;
+      desc->layers[0].planes[1].object_index = 0;
+      desc->layers[0].planes[1].offset = (std::ptrdiff_t) enc_wstride * enc_hstride;
+      desc->layers[0].planes[1].pitch = enc_wstride;
+
+      AVFrame *f = av_frame_alloc();
+      if (!f) {
+        av_free(desc);
+        return nullptr;
+      }
+      f->format = AV_PIX_FMT_DRM_PRIME;
+      f->width = dst_w;
+      f->height = dst_h;
+      f->data[0] = (std::uint8_t *) desc;
+      f->buf[0] = av_buffer_create((std::uint8_t *) desc, sizeof(*desc),
+                                   [](void *, std::uint8_t *d) { av_free(d); }, nullptr, 0);
+      if (hw_frames_ctx) {
+        f->hw_frames_ctx = av_buffer_ref(hw_frames_ctx);
+      }
+      enc_frame_ptr = f;
+      return enc_frame_ptr;
+    }
+
+    void free_enc_frame() {
+      if (enc_frame_ptr) {
+        av_frame_free(&enc_frame_ptr);
+      }
     }
 
     int heap_fd {-1};
@@ -1487,6 +1633,10 @@ namespace rkmpp {
     int interp {IM_INTERP_DEFAULT};
     buffer_t src_buf;
     buffer_t dst_buf;
+    buffer_t enc_buf;
+    int enc_wstride {};
+    int enc_hstride {};
+    AVFrame *enc_frame_ptr {};
     scale_region_t last_region;
     int last_dst_w {-1};
     int last_dst_h {-1};
@@ -1497,6 +1647,11 @@ namespace rkmpp {
   class rkmpp_t: public platf::avcodec_encode_device_t {
   public:
     ~rkmpp_t() override {
+#ifdef SUNSHINE_BUILD_RGA
+      if (enc_hw_frames_ctx) {
+        av_buffer_unref(&enc_hw_frames_ctx);
+      }
+#endif
     }
 
     int init(int in_width, int in_height, file_t &&render_device, int offset_x, int offset_y) {
@@ -1548,6 +1703,15 @@ namespace rkmpp {
         std::string v(scaler);
         std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
         use_rga = !(v == "gpu" || v == "egl" || v == "opengl" || v == "off" || v == "none");
+      }
+      // RGA writes a CMA buffer the encoder imports as DRM_PRIME, removing the
+      // output copy (lower latency, less CPU). Default on; SUNSHINE_RKMPP_RGA_DIRECT=0
+      // falls back to the copy path if a board's encoder rejects imported frames.
+      rga_direct = true;
+      if (auto direct = std::getenv("SUNSHINE_RKMPP_RGA_DIRECT")) {
+        std::string v(direct);
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        rga_direct = !(v == "0" || v == "off" || v == "false" || v == "no");
       }
 #endif
 
@@ -1601,7 +1765,11 @@ namespace rkmpp {
         } else if (use_rga) {
           if (rga.init(frame->width, frame->height, filter)) {
             rga_ready = true;
-            BOOST_LOG(info) << "RKMPP direct V4L2: RGA 2D scaler enabled"sv;
+            if (rga_direct) {
+              enc_hw_frames_ctx = av_buffer_ref(hw_frames_ctx_buf);
+            }
+            BOOST_LOG(info) << "RKMPP direct V4L2: RGA 2D scaler enabled"sv
+                            << (rga_direct ? " (direct dma-buf encode)"sv : ""sv);
           } else {
             BOOST_LOG(warning) << "RKMPP direct V4L2: RGA scaler unavailable; falling back to GPU scaling"sv;
           }
@@ -1643,6 +1811,31 @@ namespace rkmpp {
       // Our GL objects only exist in our context; make it current (the capture
       // display may have left its own context current on this thread).
       make_current();
+
+#ifdef SUNSHINE_BUILD_RGA
+      // Direct-encode RGA path: scale into a CMA buffer and hand the encoder a
+      // DRM_PRIME frame wrapping it (no map, no copy). Replaces 'frame' with the
+      // wrapper so encode_avcodec sends it.
+      if (direct_v4l2 && rga_ready && rga_direct) {
+        const int w = frame->width;
+        const int h = frame->height;
+        AVFrame *enc;
+        if (!direct_v4l2->update_latest_frame()) {
+          if (direct_v4l2->should_log_missing_frame()) {
+            BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available; sending black frames until capture resumes"sv;
+          }
+          enc = rga.black_direct(w, h, enc_hw_frames_ctx);
+        } else {
+          enc = rga.scale_direct(direct_v4l2->latest_direct_frame(), direct_v4l2->scale_region(w, h), w, h, enc_hw_frames_ctx);
+        }
+        if (!enc) {
+          BOOST_LOG(error) << "RKMPP direct V4L2: RGA direct-encode buffer unavailable"sv;
+          return -1;
+        }
+        this->frame = enc;
+        return 0;
+      }
+#endif
 
       video::avcodec_frame_t mapped_frame {av_frame_alloc()};
       if (!mapped_frame) {
@@ -1809,7 +2002,9 @@ namespace rkmpp {
     bool rga_ready {};
 #ifdef SUNSHINE_BUILD_RGA
     bool use_rga {};
+    bool rga_direct {};
     rga_scaler_t rga;
+    AVBufferRef *enc_hw_frames_ctx {};
 #endif
 
   private:
