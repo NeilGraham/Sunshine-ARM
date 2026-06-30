@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
@@ -334,6 +335,29 @@ namespace rkmpp {
         return false;
       }
       copy_nv12(latest_ptr, mapped_frame, dst_width, dst_height);
+      return true;
+    }
+
+    // True when the configured scaling settings are a no-op for this stream size,
+    // so the captured frame can be handed to the encoder unscaled (direct stream):
+    //  - the capture is already NV12 (native NV12 or MJPEG-decoded to NV12),
+    //  - no view-region crop is set,
+    //  - the stream size equals the capture size (no resize), and
+    //  - no forced aspect ratio, or one that matches the capture (no letterbox).
+    bool passthrough_ok(int dst_width, int dst_height) const {
+      const bool nv12 = !is_raw_convert || is_mjpeg;
+      if (!nv12 || view_region.enabled) {
+        return false;
+      }
+      if (width != dst_width || height != dst_height) {
+        return false;
+      }
+      if (forced_aspect_ratio > 0.0f) {
+        const float src_aspect = (float) width / height;
+        if (std::fabs(forced_aspect_ratio - src_aspect) > 0.01f) {
+          return false;
+        }
+      }
       return true;
     }
 
@@ -1390,6 +1414,29 @@ namespace rkmpp {
       return enc_frame(hw_frames_ctx, dst_w, dst_h);
     }
 
+    // Direct stream: copy the (already-NV12, same-size) capture straight into the
+    // encoder buffer and wrap it as DRM_PRIME — no RGA scaling pass. Used when the
+    // stream settings exactly match the capture so no scale/crop/letterbox is
+    // needed; the 2D engine round-trip is skipped entirely.
+    AVFrame *passthrough_direct(const direct_frame_t &src, int dst_w, int dst_h, AVBufferRef *hw_frames_ctx) {
+      if (!src.nv12 || src.width != dst_w || src.height != dst_h || !ensure_enc(dst_w, dst_h)) {
+        return nullptr;
+      }
+      sync(enc_buf.fd, true, DMA_BUF_SYNC_WRITE);
+      auto *dstp = (std::uint8_t *) enc_buf.map;
+      for (int row = 0; row < src.height; ++row) {
+        std::memcpy(dstp + (std::size_t) row * enc_wstride, src.data + (std::size_t) row * src.stride, src.width);
+      }
+      const auto *uv = src.data + (std::size_t) src.stride * src.height;
+      auto *dstuv = dstp + (std::size_t) enc_wstride * enc_hstride;
+      for (int row = 0; row < src.height / 2; ++row) {
+        std::memcpy(dstuv + (std::size_t) row * enc_wstride, uv + (std::size_t) row * src.stride, src.width);
+      }
+      sync(enc_buf.fd, false, DMA_BUF_SYNC_WRITE);
+      last_dst_w = -1;  // not a scaled frame; force bar re-clear if scaling resumes
+      return enc_frame(hw_frames_ctx, dst_w, dst_h);
+    }
+
     // Produce a black DRM_PRIME frame for the direct-encode path (no capture).
     AVFrame *black_direct(int dst_w, int dst_h, AVBufferRef *hw_frames_ctx) {
       if (!ensure_enc(dst_w, dst_h)) {
@@ -1693,6 +1740,9 @@ namespace rkmpp {
         direct_v4l2_device = v4l2_device;
       }
 
+      parse_capture_resolution(std::getenv("SUNSHINE_RKMPP_CAPTURE_RESOLUTION"), capture_width, capture_height);
+      passthrough_enabled = parse_pipeline_enabled(std::getenv("SUNSHINE_RKMPP_PASSTHROUGH"));
+
 #ifdef SUNSHINE_BUILD_RGA
       // The RGA 2D engine is the default capture scaler (much lower latency than
       // the Mali GPU on Rockchip). SUNSHINE_RKMPP_SCALER=gpu forces the GPU
@@ -1741,8 +1791,19 @@ namespace rkmpp {
       }
 
       if (!direct_v4l2_device.empty() && !direct_v4l2) {
+        // Capture at the forced resolution when set, otherwise at the stream
+        // resolution. The scaler (RGA/GPU/CPU) handles the size difference before
+        // encode. A smaller capture can cut capture-card/USB and conversion work
+        // on SD sources, but the encode still runs at the client-requested stream
+        // resolution.
+        const int cap_w = capture_width ? capture_width : frame->width;
+        const int cap_h = capture_height ? capture_height : frame->height;
+        if (capture_width || capture_height) {
+          BOOST_LOG(info) << "RKMPP direct V4L2: forcing capture "sv << cap_w << 'x' << cap_h
+                          << " -> stream "sv << frame->width << 'x' << frame->height;
+        }
         auto source = std::make_unique<v4l2_nv12_source_t>();
-        if (source->init(direct_v4l2_device.c_str(), frame->width, frame->height, 60)) {
+        if (source->init(direct_v4l2_device.c_str(), cap_w, cap_h, 60)) {
           direct_v4l2 = std::move(source);
         } else {
           BOOST_LOG(warning) << "RKMPP direct V4L2 unavailable; falling back to KMS GPU-convert path"sv;
@@ -1819,12 +1880,17 @@ namespace rkmpp {
       if (direct_v4l2 && rga_ready && rga_direct) {
         const int w = frame->width;
         const int h = frame->height;
+        const bool passthrough = passthrough_enabled && direct_v4l2->passthrough_ok(w, h);
         AVFrame *enc;
         if (!direct_v4l2->update_latest_frame()) {
           if (direct_v4l2->should_log_missing_frame()) {
             BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available; sending black frames until capture resumes"sv;
           }
           enc = rga.black_direct(w, h, enc_hw_frames_ctx);
+        } else if (passthrough) {
+          // Stream settings match the capture exactly: copy straight to the
+          // encoder buffer, no RGA scaling pass.
+          enc = rga.passthrough_direct(direct_v4l2->latest_direct_frame(), w, h, enc_hw_frames_ctx);
         } else {
           enc = rga.scale_direct(direct_v4l2->latest_direct_frame(), direct_v4l2->scale_region(w, h), w, h, enc_hw_frames_ctx);
         }
@@ -1857,6 +1923,18 @@ namespace rkmpp {
       }
 
       if (direct_v4l2) {
+        // Direct stream: when the stream settings match the capture exactly, copy
+        // the captured NV12 straight into the encoder frame, skipping the RGA/GPU
+        // scaling pass entirely.
+        if (passthrough_enabled && direct_v4l2->passthrough_ok(frame->width, frame->height)) {
+          if (!direct_v4l2->copy_latest_to(mapped_frame.get(), frame->width, frame->height)) {
+            if (direct_v4l2->should_log_missing_frame()) {
+              BOOST_LOG(warning) << "RKMPP direct V4L2: no capture frame available; sending black frames until capture resumes"sv;
+            }
+            direct_v4l2->copy_black_to(mapped_frame.get(), frame->width, frame->height);
+          }
+          return 0;
+        }
 #ifdef SUNSHINE_BUILD_RGA
         if (rga_ready) {
           // RGA 2D engine path: scale/convert on the dedicated 2D block instead
@@ -1990,6 +2068,17 @@ namespace rkmpp {
     int offset_x {}, offset_y {};
     std::uint64_t sequence {};
     std::string direct_v4l2_device;
+    // Forced V4L2 capture resolution (SUNSHINE_RKMPP_CAPTURE_RESOLUTION). 0 = auto,
+    // i.e. capture at the client-requested stream resolution (the default). When
+    // set, the device captures at this size and the scaler upscales/downscales to
+    // the stream resolution before encode. This can save capture-side work on SD
+    // sources, but not encoder resolution.
+    int capture_width {};
+    int capture_height {};
+    // Direct-stream fast path: when the stream settings already match the capture
+    // (no scale/crop/letterbox), feed the captured frame to the encoder unscaled.
+    // SUNSHINE_RKMPP_PASSTHROUGH=0 disables it for comparison.
+    bool passthrough_enabled {true};
     std::unique_ptr<v4l2_nv12_source_t> direct_v4l2;
     gl::tex_t direct_v4l2_tex;
     direct_program_t direct_v4l2_program[3];
@@ -2021,6 +2110,41 @@ namespace rkmpp {
         return false;
       }
       return true;
+    }
+
+    // SUNSHINE_RKMPP_CAPTURE_RESOLUTION forces the V4L2 capture size as
+    // "WIDTHxHEIGHT" (e.g. "720x480"). Empty/"auto" leaves capture at the
+    // client-requested stream resolution. Parsed values are written to out_w/out_h
+    // (left at 0 on auto/invalid input).
+    static void parse_capture_resolution(const char *env, int &out_w, int &out_h) {
+      out_w = 0;
+      out_h = 0;
+      if (!env || !*env) {
+        return;
+      }
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c); }), v.end());
+      if (v.empty() || v == "auto" || v == "0" || v == "native" || v == "match" || v == "stream") {
+        return;
+      }
+      auto x = v.find('x');
+      if (x == std::string::npos) {
+        x = v.find('*');
+      }
+      if (x != std::string::npos) {
+        try {
+          auto w = std::stoi(v.substr(0, x));
+          auto h = std::stoi(v.substr(x + 1));
+          if (w >= 2 && h >= 2) {
+            out_w = w & ~1;
+            out_h = h & ~1;
+            return;
+          }
+        } catch (...) {
+        }
+      }
+      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_CAPTURE_RESOLUTION '"sv << env << "'; using stream resolution"sv;
     }
 
     util::Either<gl::program_t, std::string> make_direct_program(const std::string_view &fragment_source) {
