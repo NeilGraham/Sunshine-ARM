@@ -23,6 +23,7 @@
 // standard includes
 #include <array>
 #include <algorithm>
+#include <limits>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -92,6 +93,14 @@ namespace rkmpp {
     enabled,
   };
 
+  // Post-process effect applied by the GPU scaler while it scales/converts.
+  // The RGA 2D engine is fixed-function (no programmable stage), so any effect
+  // forces the GPU scaler path and disables the capture passthrough fast path.
+  enum class shader_effect_e {
+    disabled,
+    crt_basic,
+  };
+
   struct view_region_t {
     float left {};
     float top {};
@@ -128,6 +137,7 @@ namespace rkmpp {
     GLint image_loc {-1};
     GLint rect_loc {-1};
     GLint width_loc {-1};
+    GLint crt_loc {-1};
   };
 
   class v4l2_nv12_source_t {
@@ -1743,6 +1753,18 @@ namespace rkmpp {
       parse_capture_resolution(std::getenv("SUNSHINE_RKMPP_CAPTURE_RESOLUTION"), capture_width, capture_height);
       passthrough_enabled = parse_pipeline_enabled(std::getenv("SUNSHINE_RKMPP_PASSTHROUGH"));
 
+      shader_effect = parse_shader_effect(std::getenv("SUNSHINE_RKMPP_SHADER"));
+      if (shader_effect == shader_effect_e::crt_basic) {
+        parse_crt_strength(std::getenv("SUNSHINE_RKMPP_CRT_STRENGTH"), crt_scan_strength, crt_mask_strength);
+        if (passthrough_enabled) {
+          // Passthrough hands captured frames straight to the encoder; the
+          // effect only exists in the GPU scale pass, so it must always run.
+          passthrough_enabled = false;
+        }
+        BOOST_LOG(info) << "RKMPP direct V4L2: CRT shader enabled (scan="sv << crt_scan_strength
+                        << ", mask="sv << crt_mask_strength << "); using GPU scaler"sv;
+      }
+
 #ifdef SUNSHINE_BUILD_RGA
       // The RGA 2D engine is the default capture scaler (much lower latency than
       // the Mali GPU on Rockchip). SUNSHINE_RKMPP_SCALER=gpu forces the GPU
@@ -1820,8 +1842,11 @@ namespace rkmpp {
 #ifdef SUNSHINE_BUILD_RGA
         // RGA handles every filter except nearest-neighbour, which it lacks; the
         // nearest filter therefore routes to the GPU path (which does nearest).
+        // Shader effects also require the GPU: RGA has no programmable stage.
         const auto filter = direct_v4l2->get_scale_filter();
-        if (use_rga && filter == scale_filter_e::nearest) {
+        if (use_rga && shader_effect != shader_effect_e::disabled) {
+          BOOST_LOG(info) << "RKMPP direct V4L2: shader effect selected; using GPU scaler (RGA has no programmable stage)"sv;
+        } else if (use_rga && filter == scale_filter_e::nearest) {
           BOOST_LOG(info) << "RKMPP direct V4L2: nearest filter selected; using GPU scaler (RGA has no nearest)"sv;
         } else if (use_rga) {
           if (rga.init(frame->width, frame->height, filter)) {
@@ -2081,7 +2106,17 @@ namespace rkmpp {
     bool passthrough_enabled {true};
     std::unique_ptr<v4l2_nv12_source_t> direct_v4l2;
     gl::tex_t direct_v4l2_tex;
-    direct_program_t direct_v4l2_program[3];
+    // 0 = NV12 (both planes), 1 = YUYV luma, 2 = YUYV chroma,
+    // 3 = NV12 luma with CRT effect, 4 = YUYV luma with CRT effect (3/4 are
+    // only linked when SUNSHINE_RKMPP_SHADER selects an effect).
+    direct_program_t direct_v4l2_program[5];
+    // GPU post-process effect (SUNSHINE_RKMPP_SHADER). Applied to the luma
+    // plane only: scaling chroma samples would shift colors, since U/V are
+    // biased around 128 rather than 0.
+    shader_effect_e shader_effect {shader_effect_e::disabled};
+    bool crt_programs_ready {};
+    float crt_scan_strength {0.35f};
+    float crt_mask_strength {0.12f};
     bool direct_gpu_ready {};
     bool pipeline_enabled {true};
     bool gpu_render_pending {};
@@ -2110,6 +2145,46 @@ namespace rkmpp {
         return false;
       }
       return true;
+    }
+
+    // SUNSHINE_RKMPP_SHADER selects a GPU post-process effect applied during
+    // the scale/convert pass. Effects need the programmable GPU path, so
+    // enabling one routes scaling away from RGA and disables passthrough.
+    static shader_effect_e parse_shader_effect(const char *env) {
+      if (!env || !*env) {
+        return shader_effect_e::disabled;
+      }
+      std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+      v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c) || c == '-' || c == '_'; }), v.end());
+      if (v.empty() || v == "disabled" || v == "off" || v == "none" || v == "0") {
+        return shader_effect_e::disabled;
+      }
+      if (v == "crtbasic" || v == "crt") {
+        return shader_effect_e::crt_basic;
+      }
+      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_SHADER '"sv << env << "'; shader disabled"sv;
+      return shader_effect_e::disabled;
+    }
+
+    // SUNSHINE_RKMPP_CRT_STRENGTH tunes the CRT effect as "SCAN,MASK" (both
+    // 0..1, e.g. "0.35,0.12"). Left at the defaults on empty/invalid input.
+    static void parse_crt_strength(const char *env, float &scan, float &mask) {
+      if (!env || !*env) {
+        return;
+      }
+      std::string v(env);
+      v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c); }), v.end());
+      auto comma = v.find(',');
+      try {
+        auto s = std::stof(v.substr(0, comma));
+        auto m = comma == std::string::npos ? mask : std::stof(v.substr(comma + 1));
+        scan = std::clamp(s, 0.0f, 1.0f);
+        mask = std::clamp(m, 0.0f, 1.0f);
+        return;
+      } catch (...) {
+      }
+      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_CRT_STRENGTH '"sv << env << "'; using defaults"sv;
     }
 
     // SUNSHINE_RKMPP_CAPTURE_RESOLUTION forces the V4L2 capture size as
@@ -2254,6 +2329,69 @@ void main()
 }
 )glsl";
 
+      // CRT variants of the luma shaders: scanlines follow the *source* lines
+      // (recovered from the sample coordinate) and an aperture grille darkens
+      // every third output column. Both modulate luma above video black so
+      // black bars/letterboxing stay untouched. highp is required: fract() of
+      // source-line coordinates up to ~1080 is meaningless in fp16.
+      static constexpr std::string_view nv12_y_crt_fragment = R"glsl(
+#version 300 es
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+uniform sampler2D image;
+uniform vec4 src_rect;
+uniform vec2 crt_params;
+
+in vec2 tex;
+layout(location = 0) out float color;
+
+void main()
+{
+  vec2 st = mix(src_rect.xy, src_rect.zw, tex);
+  float luma = texture(image, st).r;
+  float src_line = st.y * float(textureSize(image, 0).y);
+  float beam = 0.5 + 0.5 * cos(6.28318530718 * (fract(src_line) - 0.5));
+  float scan = 1.0 - crt_params.x * (1.0 - beam);
+  float grille = 1.0 - crt_params.y * step(2.0, mod(gl_FragCoord.x, 3.0));
+  const float black = 16.0 / 255.0;
+  color = black + max(luma - black, 0.0) * scan * grille;
+}
+)glsl";
+
+      static constexpr std::string_view yuyv_y_crt_fragment = R"glsl(
+#version 300 es
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+uniform sampler2D image;
+uniform vec4 src_rect;
+uniform float src_width;
+uniform vec2 crt_params;
+
+in vec2 tex;
+layout(location = 0) out float color;
+
+void main()
+{
+  vec2 st = mix(src_rect.xy, src_rect.zw, tex);
+  float x = max(0.0, st.x * src_width - 0.5);
+  float pair_x = floor(x * 0.5);
+  vec4 yuyv = texture(image, vec2((pair_x + 0.5) / (src_width * 0.5), st.y));
+  float luma = mod(floor(x + 0.5), 2.0) < 1.0 ? yuyv.r : yuyv.b;
+  float src_line = st.y * float(textureSize(image, 0).y);
+  float beam = 0.5 + 0.5 * cos(6.28318530718 * (fract(src_line) - 0.5));
+  float scan = 1.0 - crt_params.x * (1.0 - beam);
+  float grille = 1.0 - crt_params.y * step(2.0, mod(gl_FragCoord.x, 3.0));
+  const float black = 16.0 / 255.0;
+  color = black + max(luma - black, 0.0) * scan * grille;
+}
+)glsl";
+
       auto nv12 = make_direct_program(nv12_fragment);
       if (nv12.has_right()) {
         BOOST_LOG(error) << "RKMPP direct V4L2: NV12 GPU shader failed: "sv << nv12.right();
@@ -2275,11 +2413,31 @@ void main()
       }
       direct_v4l2_program[2].program = std::move(yuyv_uv.left());
 
+      // The CRT programs are optional: a failure logs and drops back to the
+      // plain shaders rather than losing the whole GPU path.
+      if (shader_effect == shader_effect_e::crt_basic) {
+        auto nv12_y_crt = make_direct_program(nv12_y_crt_fragment);
+        auto yuyv_y_crt = make_direct_program(yuyv_y_crt_fragment);
+        if (nv12_y_crt.has_right() || yuyv_y_crt.has_right()) {
+          BOOST_LOG(error) << "RKMPP direct V4L2: CRT shader failed; effect disabled: "sv
+                           << (nv12_y_crt.has_right() ? nv12_y_crt.right() : yuyv_y_crt.right());
+          shader_effect = shader_effect_e::disabled;
+        } else {
+          direct_v4l2_program[3].program = std::move(nv12_y_crt.left());
+          direct_v4l2_program[4].program = std::move(yuyv_y_crt.left());
+          crt_programs_ready = true;
+        }
+      }
+
       for (auto &entry : direct_v4l2_program) {
         auto handle = entry.program.handle();
+        if (handle == std::numeric_limits<GLuint>::max()) {
+          continue;
+        }
         entry.image_loc = gl::ctx.GetUniformLocation(handle, "image");
         entry.rect_loc = gl::ctx.GetUniformLocation(handle, "src_rect");
         entry.width_loc = gl::ctx.GetUniformLocation(handle, "src_width");
+        entry.crt_loc = gl::ctx.GetUniformLocation(handle, "crt_params");
       }
 
       direct_v4l2_tex = gl::tex_t::make(2);
@@ -2317,6 +2475,15 @@ void main()
 
       if (program.width_loc >= 0) {
         gl::ctx.Uniform1f(program.width_loc, (float) src.width);
+      }
+
+      if (program.crt_loc >= 0) {
+        // Fade scanlines out as the vertical scale factor approaches 1:1;
+        // below ~2x the line pattern can't resolve cleanly and turns into
+        // moiré. The grille is keyed to output pixels, so it never aliases.
+        float vscale = region.src_h > 0 ? (float) region.out_h / (float) region.src_h : 1.0f;
+        float fade = std::clamp(vscale - 1.0f, 0.0f, 1.0f);
+        gl::ctx.Uniform2f(program.crt_loc, crt_scan_strength * fade, crt_mask_strength);
       }
     }
 
@@ -2402,9 +2569,13 @@ void main()
       const float y_black[] = {16.0f / 255.0f, 0.0f, 0.0f, 0.0f};
       const float uv_black[] = {128.0f / 255.0f, 128.0f / 255.0f, 0.0f, 0.0f};
 
+      // CRT (or any future effect) applies to the luma plane only; chroma
+      // keeps the plain scale shader.
+      const bool crt = crt_programs_ready && shader_effect == shader_effect_e::crt_basic;
+
       if (src.nv12) {
         for (int plane = 0; plane < 2; ++plane) {
-          auto &program = direct_v4l2_program[0];
+          auto &program = direct_v4l2_program[(plane == 0 && crt) ? 3 : 0];
           gl::ctx.ActiveTexture(plane == 0 ? GL_TEXTURE0 : GL_TEXTURE1);
           gl::ctx.BindTexture(GL_TEXTURE_2D, direct_v4l2_tex[plane]);
           set_direct_sampler(program, plane, region, src, plane == 1);
@@ -2417,7 +2588,7 @@ void main()
         gl::ctx.ActiveTexture(GL_TEXTURE0);
         gl::ctx.BindTexture(GL_TEXTURE_2D, direct_v4l2_tex[0]);
 
-        set_direct_sampler(direct_v4l2_program[1], 0, region, src, false);
+        set_direct_sampler(direct_v4l2_program[crt ? 4 : 1], 0, region, src, false);
         gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, nv12->buf[0]);
         gl::ctx.ClearBufferfv(GL_COLOR, 0, y_black);
         gl::ctx.Viewport(region.off_x, region.off_y, region.out_w, region.out_h);
