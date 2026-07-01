@@ -57,3 +57,6 @@ node_modules/
 *.pyc
 .venv/
 venv/
+
+# Local agent instructions
+AGENTS.md
