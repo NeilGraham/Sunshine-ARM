@@ -101,6 +101,18 @@ namespace rkmpp {
     crt_basic,
   };
 
+  // CRT effect tuning (SUNSHINE_RKMPP_CRT_PARAMS). Ranges are clamped at parse
+  // time; the retro-stream web UI produces the same token format.
+  struct crt_params_t {
+    float scan {0.35f};  // scanline strength, 0..1
+    float sharp {0.4f};  // beam sharpness, 0..1 (maps to a pow() exponent)
+    float mask {0.12f};  // aperture-grille strength, 0..1
+    float bright {0.15f};  // brightness gain compensating scanline/mask loss, 0..0.5
+    float soft {0.0f};  // horizontal softness, 0..1
+    float pitch {3.0f};  // grille period in output pixels, 2..4
+    bool fade {true};  // fade scanlines out near 1:1 vertical scale (moiré guard)
+  };
+
   struct view_region_t {
     float left {};
     float top {};
@@ -138,6 +150,7 @@ namespace rkmpp {
     GLint rect_loc {-1};
     GLint width_loc {-1};
     GLint crt_loc {-1};
+    GLint crt2_loc {-1};
   };
 
   class v4l2_nv12_source_t {
@@ -1755,14 +1768,17 @@ namespace rkmpp {
 
       shader_effect = parse_shader_effect(std::getenv("SUNSHINE_RKMPP_SHADER"));
       if (shader_effect == shader_effect_e::crt_basic) {
-        parse_crt_strength(std::getenv("SUNSHINE_RKMPP_CRT_STRENGTH"), crt_scan_strength, crt_mask_strength);
+        crt = parse_crt_params(std::getenv("SUNSHINE_RKMPP_CRT_PARAMS"));
         if (passthrough_enabled) {
           // Passthrough hands captured frames straight to the encoder; the
           // effect only exists in the GPU scale pass, so it must always run.
           passthrough_enabled = false;
         }
-        BOOST_LOG(info) << "RKMPP direct V4L2: CRT shader enabled (scan="sv << crt_scan_strength
-                        << ", mask="sv << crt_mask_strength << "); using GPU scaler"sv;
+        BOOST_LOG(info) << "RKMPP direct V4L2: CRT shader enabled (scan="sv << crt.scan
+                        << ", sharp="sv << crt.sharp << ", mask="sv << crt.mask
+                        << ", bright="sv << crt.bright << ", soft="sv << crt.soft
+                        << ", pitch="sv << crt.pitch << ", fade="sv << crt.fade
+                        << "); using GPU scaler"sv;
       }
 
 #ifdef SUNSHINE_BUILD_RGA
@@ -2115,8 +2131,7 @@ namespace rkmpp {
     // biased around 128 rather than 0.
     shader_effect_e shader_effect {shader_effect_e::disabled};
     bool crt_programs_ready {};
-    float crt_scan_strength {0.35f};
-    float crt_mask_strength {0.12f};
+    crt_params_t crt;
     bool direct_gpu_ready {};
     bool pipeline_enabled {true};
     bool gpu_render_pending {};
@@ -2167,24 +2182,57 @@ namespace rkmpp {
       return shader_effect_e::disabled;
     }
 
-    // SUNSHINE_RKMPP_CRT_STRENGTH tunes the CRT effect as "SCAN,MASK" (both
-    // 0..1, e.g. "0.35,0.12"). Left at the defaults on empty/invalid input.
-    static void parse_crt_strength(const char *env, float &scan, float &mask) {
+    // SUNSHINE_RKMPP_CRT_PARAMS tunes the CRT effect as a comma-separated
+    // "key=value" list, e.g. "scan=0.35,sharp=0.4,mask=0.12,bright=0.15,
+    // soft=0,pitch=3,fade=1". Unknown keys warn; missing keys keep defaults;
+    // values are clamped to their supported ranges.
+    static crt_params_t parse_crt_params(const char *env) {
+      crt_params_t out;
       if (!env || !*env) {
-        return;
+        return out;
       }
       std::string v(env);
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char) std::tolower(c); });
       v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c); }), v.end());
-      auto comma = v.find(',');
-      try {
-        auto s = std::stof(v.substr(0, comma));
-        auto m = comma == std::string::npos ? mask : std::stof(v.substr(comma + 1));
-        scan = std::clamp(s, 0.0f, 1.0f);
-        mask = std::clamp(m, 0.0f, 1.0f);
-        return;
-      } catch (...) {
+
+      std::size_t pos = 0;
+      while (pos < v.size()) {
+        auto comma = v.find(',', pos);
+        auto token = v.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        pos = comma == std::string::npos ? v.size() : comma + 1;
+        auto eq = token.find('=');
+        if (token.empty()) {
+          continue;
+        }
+        if (eq == std::string::npos) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: ignoring SUNSHINE_RKMPP_CRT_PARAMS token '"sv << token << "'"sv;
+          continue;
+        }
+        auto key = token.substr(0, eq);
+        auto val = token.substr(eq + 1);
+        try {
+          if (key == "scan") {
+            out.scan = std::clamp(std::stof(val), 0.0f, 1.0f);
+          } else if (key == "sharp") {
+            out.sharp = std::clamp(std::stof(val), 0.0f, 1.0f);
+          } else if (key == "mask") {
+            out.mask = std::clamp(std::stof(val), 0.0f, 1.0f);
+          } else if (key == "bright") {
+            out.bright = std::clamp(std::stof(val), 0.0f, 0.5f);
+          } else if (key == "soft") {
+            out.soft = std::clamp(std::stof(val), 0.0f, 1.0f);
+          } else if (key == "pitch") {
+            out.pitch = std::clamp(std::stof(val), 2.0f, 4.0f);
+          } else if (key == "fade") {
+            out.fade = !(val == "0" || val == "off" || val == "false" || val == "no");
+          } else {
+            BOOST_LOG(warning) << "RKMPP direct V4L2: unknown SUNSHINE_RKMPP_CRT_PARAMS key '"sv << key << "'"sv;
+          }
+        } catch (...) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_CRT_PARAMS value '"sv << token << "'"sv;
+        }
       }
-      BOOST_LOG(warning) << "RKMPP direct V4L2: invalid SUNSHINE_RKMPP_CRT_STRENGTH '"sv << env << "'; using defaults"sv;
+      return out;
     }
 
     // SUNSHINE_RKMPP_CAPTURE_RESOLUTION forces the V4L2 capture size as
@@ -2331,9 +2379,14 @@ void main()
 
       // CRT variants of the luma shaders: scanlines follow the *source* lines
       // (recovered from the sample coordinate) and an aperture grille darkens
-      // every third output column. Both modulate luma above video black so
-      // black bars/letterboxing stay untouched. highp is required: fract() of
-      // source-line coordinates up to ~1080 is meaningless in fp16.
+      // one output column per pitch period. Both modulate luma above video
+      // black so black bars/letterboxing stay untouched. highp is required:
+      // fract() of source-line coordinates up to ~1080 is meaningless in fp16.
+      //
+      // crt_params:  x = scanline strength (pre-faded on the CPU against the
+      //              vertical scale factor), y = beam pow() exponent,
+      //              z = grille strength, w = brightness gain.
+      // crt_params2: x = horizontal softness, y = grille pitch in pixels.
       static constexpr std::string_view nv12_y_crt_fragment = R"glsl(
 #version 300 es
 
@@ -2343,7 +2396,8 @@ precision highp float;
 
 uniform sampler2D image;
 uniform vec4 src_rect;
-uniform vec2 crt_params;
+uniform vec4 crt_params;
+uniform vec2 crt_params2;
 
 in vec2 tex;
 layout(location = 0) out float color;
@@ -2351,13 +2405,17 @@ layout(location = 0) out float color;
 void main()
 {
   vec2 st = mix(src_rect.xy, src_rect.zw, tex);
+  vec2 texel = 1.0 / vec2(textureSize(image, 0));
   float luma = texture(image, st).r;
-  float src_line = st.y * float(textureSize(image, 0).y);
+  float side = 0.5 * (texture(image, st - vec2(texel.x, 0.0)).r + texture(image, st + vec2(texel.x, 0.0)).r);
+  luma = mix(luma, side, crt_params2.x * 0.5);
+  float src_line = st.y / texel.y;
   float beam = 0.5 + 0.5 * cos(6.28318530718 * (fract(src_line) - 0.5));
+  beam = pow(beam, crt_params.y);
   float scan = 1.0 - crt_params.x * (1.0 - beam);
-  float grille = 1.0 - crt_params.y * step(2.0, mod(gl_FragCoord.x, 3.0));
+  float grille = 1.0 - crt_params.z * step(crt_params2.y - 1.0, mod(gl_FragCoord.x, crt_params2.y));
   const float black = 16.0 / 255.0;
-  color = black + max(luma - black, 0.0) * scan * grille;
+  color = black + max(luma - black, 0.0) * scan * grille * (1.0 + crt_params.w);
 }
 )glsl";
 
@@ -2371,24 +2429,33 @@ precision highp float;
 uniform sampler2D image;
 uniform vec4 src_rect;
 uniform float src_width;
-uniform vec2 crt_params;
+uniform vec4 crt_params;
+uniform vec2 crt_params2;
 
 in vec2 tex;
 layout(location = 0) out float color;
+
+float luma_at(float x, float y)
+{
+  float pair_x = floor(x * 0.5);
+  vec4 yuyv = texture(image, vec2((pair_x + 0.5) / (src_width * 0.5), y));
+  return mod(floor(x + 0.5), 2.0) < 1.0 ? yuyv.r : yuyv.b;
+}
 
 void main()
 {
   vec2 st = mix(src_rect.xy, src_rect.zw, tex);
   float x = max(0.0, st.x * src_width - 0.5);
-  float pair_x = floor(x * 0.5);
-  vec4 yuyv = texture(image, vec2((pair_x + 0.5) / (src_width * 0.5), st.y));
-  float luma = mod(floor(x + 0.5), 2.0) < 1.0 ? yuyv.r : yuyv.b;
+  float luma = luma_at(x, st.y);
+  float side = 0.5 * (luma_at(max(x - 1.0, 0.0), st.y) + luma_at(min(x + 1.0, src_width - 1.0), st.y));
+  luma = mix(luma, side, crt_params2.x * 0.5);
   float src_line = st.y * float(textureSize(image, 0).y);
   float beam = 0.5 + 0.5 * cos(6.28318530718 * (fract(src_line) - 0.5));
+  beam = pow(beam, crt_params.y);
   float scan = 1.0 - crt_params.x * (1.0 - beam);
-  float grille = 1.0 - crt_params.y * step(2.0, mod(gl_FragCoord.x, 3.0));
+  float grille = 1.0 - crt_params.z * step(crt_params2.y - 1.0, mod(gl_FragCoord.x, crt_params2.y));
   const float black = 16.0 / 255.0;
-  color = black + max(luma - black, 0.0) * scan * grille;
+  color = black + max(luma - black, 0.0) * scan * grille * (1.0 + crt_params.w);
 }
 )glsl";
 
@@ -2438,6 +2505,7 @@ void main()
         entry.rect_loc = gl::ctx.GetUniformLocation(handle, "src_rect");
         entry.width_loc = gl::ctx.GetUniformLocation(handle, "src_width");
         entry.crt_loc = gl::ctx.GetUniformLocation(handle, "crt_params");
+        entry.crt2_loc = gl::ctx.GetUniformLocation(handle, "crt_params2");
       }
 
       direct_v4l2_tex = gl::tex_t::make(2);
@@ -2481,9 +2549,19 @@ void main()
         // Fade scanlines out as the vertical scale factor approaches 1:1;
         // below ~2x the line pattern can't resolve cleanly and turns into
         // moiré. The grille is keyed to output pixels, so it never aliases.
-        float vscale = region.src_h > 0 ? (float) region.out_h / (float) region.src_h : 1.0f;
-        float fade = std::clamp(vscale - 1.0f, 0.0f, 1.0f);
-        gl::ctx.Uniform2f(program.crt_loc, crt_scan_strength * fade, crt_mask_strength);
+        float fade = 1.0f;
+        if (crt.fade) {
+          float vscale = region.src_h > 0 ? (float) region.out_h / (float) region.src_h : 1.0f;
+          fade = std::clamp(vscale - 1.0f, 0.0f, 1.0f);
+        }
+        // sharp 0..1 maps to a beam pow() exponent of 0.5 (soft, wide lines)
+        // through 3.0 (thin, hard lines).
+        float beam_exponent = 0.5f + 2.5f * crt.sharp;
+        gl::ctx.Uniform4f(program.crt_loc, crt.scan * fade, beam_exponent, crt.mask, crt.bright);
+      }
+
+      if (program.crt2_loc >= 0) {
+        gl::ctx.Uniform2f(program.crt2_loc, crt.soft, crt.pitch);
       }
     }
 
@@ -2493,6 +2571,10 @@ void main()
         gl::ctx.BindTexture(GL_TEXTURE_2D, texture);
         gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
         gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        // The CRT softness taps sample one texel past the edge; the ES default
+        // wrap is GL_REPEAT, which would bleed the opposite border in.
+        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
       }
       gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
     }
