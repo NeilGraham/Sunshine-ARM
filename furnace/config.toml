@@ -5,9 +5,10 @@
 # furnace/<platform>.Dockerfile next to this file — debian-12-bookworm by
 # default), then pulls the packaged .deb back to build/cpack_artifacts/.
 #
-# The image bakes in ffmpeg-rockchip at /opt; the first build compiles it into
-# build/ffmpeg-rkmpp and furnace's persistent (gitignore-protected) build/ keeps
-# it cached, so later builds only recompile Sunshine.
+# The image bakes in ffmpeg-rockchip at /opt plus the Debian build dependencies.
+# The first build compiles ffmpeg-rockchip into build/ffmpeg-rkmpp and seeds
+# build/.ccache / build/npm-cache; furnace's persistent remote workspace keeps
+# those caches, so later builds mostly recompile changed Sunshine files.
 #
 # Deploy the pulled package with scripts/copy_build_to_rock_3c.sh (or scp +
 # `sudo apt install`), then `sudo systemctl restart sunshine`.
@@ -25,5 +26,5 @@ include_pull = ["build/cpack_artifacts/Sunshine.deb"]
 # HOME is repointed at the build user's home (furnace sets HOME=/tmp, which has
 # no .bashrc; linux_build.sh does `source ~/.bashrc`).
 commands = [
-    "export HOME=/home/builder && ./scripts/linux_build.sh --skip-cuda --num-processors=4 --rkmpp=/opt/ffmpeg-rockchip",
+    "rm -rf node_modules; export HOME=/home/builder CCACHE_DIR=$PWD/build/.ccache NPM_CONFIG_CACHE=$PWD/build/npm-cache; (ccache --zero-stats || true); ./scripts/linux_build.sh --skip-deps --skip-cuda --num-processors=4 --rkmpp=/opt/ffmpeg-rockchip; status=$?; (ccache --show-stats || true); rm -rf node_modules; exit \"$status\"",
 ]

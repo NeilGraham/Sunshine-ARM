@@ -24,6 +24,7 @@ publisher_website=""
 publisher_issue_url="https://app.lizardbyte.dev/support"
 skip_cleanup=0
 skip_cuda=0
+skip_deps=0
 skip_libva=0
 skip_package=0
 rkmpp_source=""
@@ -192,6 +193,7 @@ Options:
   --rkmpp=PATH             Build and link against a Rockchip MPP-enabled ffmpeg-rockchip checkout.
   --skip-cleanup           Do not restore the original gcc alternatives, or the math-vector.h file.
   --skip-cuda              Skip CUDA installation.
+  --skip-deps              Skip dependency installation. Intended for pre-provisioned build images.
   --skip-libva             Skip libva installation. This will automatically be enabled if passing --appimage-build.
   --skip-package           Skip creating DEB, or RPM package.
   --ubuntu-test-repo       Install ppa:ubuntu-toolchain-r/test repo on Ubuntu.
@@ -248,6 +250,7 @@ while getopts ":hs-:" opt; do
           ;;
         skip-cleanup) skip_cleanup=1 ;;
         skip-cuda) skip_cuda=1 ;;
+        skip-deps) skip_deps=1 ;;
         skip-libva) skip_libva=1 ;;
         skip-package) skip_package=1 ;;
         sudo-off) sudo_cmd="" ;;
@@ -728,6 +731,11 @@ function run_step_cmake() {
     "-DSUNSHINE_ENABLE_X11=ON"
   )
 
+  if command -v ccache >/dev/null 2>&1; then
+    cmake_args+=("-DCMAKE_C_COMPILER_LAUNCHER=ccache")
+    cmake_args+=("-DCMAKE_CXX_COMPILER_LAUNCHER=ccache")
+  fi
+
   if [[ "$appimage_build" == 1 ]]; then
     cmake_args+=("-DSUNSHINE_BUILD_APPIMAGE=ON")
   fi
@@ -846,7 +854,11 @@ function run_install() {
       run_step_cleanup
       ;;
     all)
-      run_step_deps
+      if [[ "$skip_deps" == 0 ]]; then
+        run_step_deps
+      else
+        echo "Skipping step: Install dependencies"
+      fi
       run_step_cmake
       run_step_validation
       run_step_build

@@ -30,7 +30,8 @@ furnace run --image furnace/debian-13-trixie.Dockerfile
 - `debian-12-bookworm.Dockerfile` / `debian-13-trixie.Dockerfile` — build images.
   furnace auto-selects the one matching the inferred platform; override with
   `--image`. Each sets up the Radxa apt repo and bakes `ffmpeg-rockchip` (pinned
-  to `ARG FFMPEG_ROCKCHIP_REF`) into `/opt/ffmpeg-rockchip`.
+  to `ARG FFMPEG_ROCKCHIP_REF`) into `/opt/ffmpeg-rockchip`, plus the package
+  dependencies needed by `scripts/linux_build.sh`.
 - `radxa-apt/` — Radxa apt sources + keyring, copied into the image so
   `librockchip-mpp-dev` / `librga` resolve.
 
@@ -38,13 +39,15 @@ furnace run --image furnace/debian-13-trixie.Dockerfile
 
 - **Architecture must match.** furnace requires the source (Rock 3C, arm64) and
   builder (`mbp`, Apple-silicon arm64) to share an architecture — they do.
-- **ffmpeg caching.** The first build compiles `ffmpeg-rockchip` into
-  `build/ffmpeg-rkmpp`; furnace protects the gitignored `build/` on the remote,
-  so subsequent runs skip it and only recompile Sunshine.
+- **Caching.** The first build compiles `ffmpeg-rockchip` into
+  `build/ffmpeg-rkmpp`, seeds `build/.ccache`, and fills `build/npm-cache`.
+  furnace protects the gitignored `build/` on the remote, so subsequent runs
+  skip unchanged RKMPP FFmpeg work and use compiler/npm caches.
 - **Bumping ffmpeg-rockchip.** Change `FFMPEG_ROCKCHIP_REF` in both Dockerfiles
   and run `furnace run --clean` once to rebuild the image and the ffmpeg cache.
-- The remaining build deps (boost, cmake, ninja, openssl, …) are installed by
-  `scripts/linux_build.sh` at build time, not by the Dockerfile.
+- The build deps (boost, cmake, ninja, openssl, …) are installed in the Docker
+  image. The furnace command passes `--skip-deps` to avoid repeating `apt-get`
+  work on every run.
 - **Non-root build user.** furnace runs the container as the build host's
   `uid:gid` (mbp `grahamneiln` = `501:20`), but `linux_build.sh` needs root for
   apt and `/usr/local`. So the images create a matching user (`ARG BUILD_UID` /

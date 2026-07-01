@@ -31,11 +31,57 @@ COPY furnace/radxa-apt/radxa-archive-keyring.gpg /usr/share/keyrings/radxa-archi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libcap-dev \
+      appstream \
+      appstream-util \
+      bison \
+      build-essential \
+      ccache \
+      cmake \
+      desktop-file-utils \
+      doxygen \
+      file \
+      flex \
+      g++-14 \
+      gcc-14 \
+      glslang-tools \
+      graphviz \
+      libcurl4-openssl-dev \
       libdrm-dev \
       libgbm-dev \
+      libevdev-dev \
+      libfmt-dev \
+      libminiupnpc-dev \
+      libnotify-dev \
+      libnuma-dev \
+      libopus-dev \
+      libpipewire-0.3-dev \
+      libpulse-dev \
       librockchip-mpp-dev \
       librga-dev \
       librga2 \
+      libssl-dev \
+      libsystemd-dev \
+      libudev-dev \
+      libva-dev \
+      libvulkan-dev \
+      libwayland-dev \
+      libx11-dev \
+      libxcb-shm0-dev \
+      libxcb-xfixes0-dev \
+      libxcb1-dev \
+      libxfixes-dev \
+      libxrandr-dev \
+      libxtst-dev \
+      ninja-build \
+      python3-jinja2 \
+      python3-setuptools \
+      qt6-base-dev \
+      qt6-svg-dev \
+      systemd \
+      systemd-dev \
+      udev \
+      wget \
+      xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --filter=blob:none https://github.com/nyanmisaka/ffmpeg-rockchip.git /opt/ffmpeg-rockchip \
