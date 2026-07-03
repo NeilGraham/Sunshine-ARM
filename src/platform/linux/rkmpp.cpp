@@ -167,6 +167,18 @@ namespace rkmpp {
         return false;
       }
 
+      // Platform capture blocks like the Rockchip HDMI-RX are multiplanar-only
+      // devices; USB capture cards are single-planar. Pick the buffer type once
+      // so every ioctl below can share it.
+      v4l2_capability cap {};
+      if (xioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+        auto caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+        mplane = !(caps & V4L2_CAP_VIDEO_CAPTURE) && (caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE);
+        if (mplane) {
+          BOOST_LOG(info) << "RKMPP direct V4L2: multiplanar capture device"sv;
+        }
+      }
+
       forced_aspect_ratio = parse_aspect_ratio(std::getenv("SUNSHINE_RKMPP_ASPECT_RATIO"));
       scale_filter = parse_scale_filter(std::getenv("SUNSHINE_RKMPP_SCALE_FILTER"));
       line_blend = parse_line_blend(std::getenv("SUNSHINE_RKMPP_LINE_BLEND"));
@@ -176,14 +188,14 @@ namespace rkmpp {
       }
 
       v4l2_streamparm parm {};
-      parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      parm.type = buf_type();
       parm.parm.capture.timeperframe.numerator = 1;
       parm.parm.capture.timeperframe.denominator = fps;
       xioctl(fd, VIDIOC_S_PARM, &parm);
 
       v4l2_requestbuffers req {};
       req.count = 4;
-      req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      req.type = buf_type();
       req.memory = V4L2_MEMORY_MMAP;
       if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 2) {
         char string[1024];
@@ -193,16 +205,25 @@ namespace rkmpp {
 
       buffers.resize(req.count);
       for (std::uint32_t x = 0; x < req.count; ++x) {
+        v4l2_plane planes[VIDEO_MAX_PLANES] {};
         v4l2_buffer buf {};
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.type = buf_type();
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = x;
+        if (mplane) {
+          buf.m.planes = planes;
+          buf.length = VIDEO_MAX_PLANES;
+        }
         if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
           return false;
         }
 
-        buffers[x].length = buf.length;
-        buffers[x].start = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        // negotiate_format only accepts contiguous single-memory-plane layouts,
+        // so plane 0 carries the whole frame in both APIs.
+        auto length = mplane ? planes[0].length : buf.length;
+        auto offset = mplane ? planes[0].m.mem_offset : buf.m.offset;
+        buffers[x].length = length;
+        buffers[x].start = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
         if (buffers[x].start == MAP_FAILED) {
           buffers[x].start = nullptr;
           return false;
@@ -213,7 +234,7 @@ namespace rkmpp {
         }
       }
 
-      int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      int type = buf_type();
       if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
         return false;
       }
@@ -235,21 +256,32 @@ namespace rkmpp {
     // Requeue a buffer back to the driver by index (used for the held zero-copy
     // buffer, which we keep dequeued across frames).
     void requeue_buffer(std::uint32_t index) {
+      v4l2_plane planes[VIDEO_MAX_PLANES] {};
       v4l2_buffer buf {};
-      buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.type = buf_type();
       buf.memory = V4L2_MEMORY_MMAP;
       buf.index = index;
+      if (mplane) {
+        buf.m.planes = planes;
+        buf.length = VIDEO_MAX_PLANES;
+      }
       xioctl(fd, VIDIOC_QBUF, &buf);
     }
 
     bool update_latest_frame() {
       v4l2_buffer latest {};
+      std::uint32_t latest_used = 0;
       bool have_latest = false;
 
       for (;;) {
+        v4l2_plane planes[VIDEO_MAX_PLANES] {};
         v4l2_buffer buf {};
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.type = buf_type();
         buf.memory = V4L2_MEMORY_MMAP;
+        if (mplane) {
+          buf.m.planes = planes;
+          buf.length = VIDEO_MAX_PLANES;
+        }
 
         if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
           if (errno == EAGAIN && !have_latest) {
@@ -266,6 +298,8 @@ namespace rkmpp {
           requeue_buffer(latest.index);
         }
         latest = buf;
+        latest.m.planes = nullptr;  // stack plane array; only .index/.bytesused are read below
+        latest_used = mplane ? planes[0].bytesused : buf.bytesused;
         have_latest = true;
       }
 
@@ -273,7 +307,7 @@ namespace rkmpp {
         auto *src = (const std::uint8_t *) buffers[latest.index].start;
         if (is_mjpeg) {
           // Decoded into the CPU latest_frame; the capture buffer is free now.
-          decode_mjpeg_to_nv12(src, latest.bytesused);
+          decode_mjpeg_to_nv12(src, latest_used);
           requeue_buffer(latest.index);
           if (!latest_frame.empty()) {
             latest_ptr = latest_frame.data();
@@ -425,6 +459,14 @@ namespace rkmpp {
       std::size_t length {};
     };
 
+    // Single-planar for USB capture cards, multiplanar for platform blocks
+    // like the Rockchip HDMI-RX (see the VIDIOC_QUERYCAP probe in init).
+    v4l2_buf_type buf_type() const {
+      return mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    }
+
+    bool mplane {};
+
     void stop() {
       if (mjpeg_ctx) {
         avcodec_free_context(&mjpeg_ctx);
@@ -435,7 +477,7 @@ namespace rkmpp {
         sws_ctx = nullptr;
       }
       if (fd >= 0 && streaming) {
-        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        int type = buf_type();
         xioctl(fd, VIDIOC_STREAMOFF, &type);
       }
       streaming = false;
@@ -450,7 +492,7 @@ namespace rkmpp {
       if (fd >= 0) {
         v4l2_requestbuffers req {};
         req.count = 0;
-        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.type = buf_type();
         req.memory = V4L2_MEMORY_MMAP;
         xioctl(fd, VIDIOC_REQBUFS, &req);
       }
@@ -694,6 +736,7 @@ namespace rkmpp {
       } candidates[] = {
         {V4L2_PIX_FMT_NV12, AV_PIX_FMT_NONE},    // native, zero conversion
         {V4L2_PIX_FMT_YUYV, AV_PIX_FMT_YUYV422}, // raw, GPU converts to NV12
+        {V4L2_PIX_FMT_BGR24, AV_PIX_FMT_BGR24},  // raw, RGA converts to NV12 (HDMI-RX RGB sources)
         {V4L2_PIX_FMT_MJPEG, AV_PIX_FMT_NONE}, // JPEG decode
       };
 
@@ -702,60 +745,107 @@ namespace rkmpp {
       // explicitly pinned.
       auto forced = parse_forced_format(std::getenv("SUNSHINE_RKMPP_V4L2_FORMAT"));
       std::array<std::size_t, sizeof(candidates) / sizeof(candidates[0])> order {
-        0, 1, 2
+        0, 1, 2, 3
       };
       const bool mjpeg_prefers_fallback = forced.is_forced && forced.v4l2 == V4L2_PIX_FMT_MJPEG;
 
       if (mjpeg_prefers_fallback) {
         BOOST_LOG(info) << "RKMPP direct V4L2: format preference "sv << fourcc_str(forced.v4l2)
                         << (forced.mjpeg_hw ? " with hardware MJPEG decode"sv : ""sv);
-        order = std::array<std::size_t, sizeof(candidates) / sizeof(candidates[0])> {2, 0, 1};
+        order = std::array<std::size_t, sizeof(candidates) / sizeof(candidates[0])> {3, 0, 1, 2};
       } else if (forced.is_forced) {
         BOOST_LOG(info) << "RKMPP direct V4L2: format pinned to "sv << fourcc_str(forced.v4l2)
                         << (forced.mjpeg_hw ? " with hardware MJPEG decode"sv : ""sv);
       }
 
-      const auto sizes = capture_size_fallbacks(requested_width, requested_height);
-      for (auto size : sizes) {
-        for (auto idx : order) {
-          auto candidate = candidates[idx];
-          if (forced.is_forced && !mjpeg_prefers_fallback && candidate.v4l2 != forced.v4l2) {
-            continue;
-          }
-          v4l2_format fmt {};
-          fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-          fmt.fmt.pix.width = size.first;
-          fmt.fmt.pix.height = size.second;
-          fmt.fmt.pix.pixelformat = candidate.v4l2;
-          fmt.fmt.pix.field = V4L2_FIELD_NONE;
-          if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-            continue;
-          }
-          if (fmt.fmt.pix.pixelformat != candidate.v4l2 ||
-              (int) fmt.fmt.pix.width != size.first || (int) fmt.fmt.pix.height != size.second) {
-            continue;
-          }
+      auto sizes = capture_size_fallbacks(requested_width, requested_height);
 
-          if (!activate_format(candidate.v4l2, candidate.av, size.first, size.second, fmt.fmt.pix.bytesperline, forced.mjpeg_hw)) {
-            return false;
+      // Scaler-less devices (e.g. the Rockchip on-board HDMI-RX) only accept
+      // the incoming signal's timing, whatever the requested stream size is.
+      // Append the driver's current format size as a last resort; the
+      // capture->stream scaler handles the difference.
+      {
+        v4l2_format cur {};
+        cur.type = buf_type();
+        if (xioctl(fd, VIDIOC_G_FMT, &cur) == 0) {
+          int native_w = mplane ? (int) cur.fmt.pix_mp.width : (int) cur.fmt.pix.width;
+          int native_h = mplane ? (int) cur.fmt.pix_mp.height : (int) cur.fmt.pix.height;
+          if (native_w > 0 && native_h > 0 &&
+              std::find(sizes.begin(), sizes.end(), std::make_pair(native_w, native_h)) == sizes.end()) {
+            sizes.emplace_back(native_w, native_h);
           }
-          if (size.first != requested_width || size.second != requested_height) {
-            BOOST_LOG(info) << "RKMPP direct V4L2: requested "sv << requested_width << 'x' << requested_height
-                            << " unavailable; capturing "sv << size.first << 'x' << size.second
-                            << " and scaling to encoder frame"sv;
-          }
-          if (mjpeg_prefers_fallback && candidate.v4l2 != V4L2_PIX_FMT_MJPEG) {
-            BOOST_LOG(info) << "RKMPP direct V4L2: MJPG unsupported at "sv << size.first << 'x' << size.second
-                            << "; falling back to "sv << fourcc_str(candidate.v4l2);
-          }
-          return true;
         }
       }
 
-      if (forced.is_forced) {
+      // 1 = success, 0 = no candidate matched, -1 = fatal activate failure.
+      auto try_candidates = [&](bool ignore_pin) -> int {
+        for (auto size : sizes) {
+          for (auto idx : order) {
+            auto candidate = candidates[idx];
+            if (!ignore_pin && forced.is_forced && !mjpeg_prefers_fallback && candidate.v4l2 != forced.v4l2) {
+              continue;
+            }
+            v4l2_format fmt {};
+            fmt.type = buf_type();
+            if (mplane) {
+              fmt.fmt.pix_mp.width = size.first;
+              fmt.fmt.pix_mp.height = size.second;
+              fmt.fmt.pix_mp.pixelformat = candidate.v4l2;
+              fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+              fmt.fmt.pix_mp.num_planes = 1;
+            } else {
+              fmt.fmt.pix.width = size.first;
+              fmt.fmt.pix.height = size.second;
+              fmt.fmt.pix.pixelformat = candidate.v4l2;
+              fmt.fmt.pix.field = V4L2_FIELD_NONE;
+            }
+            if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+              continue;
+            }
+            auto got_format = mplane ? fmt.fmt.pix_mp.pixelformat : fmt.fmt.pix.pixelformat;
+            auto got_width = (int) (mplane ? fmt.fmt.pix_mp.width : fmt.fmt.pix.width);
+            auto got_height = (int) (mplane ? fmt.fmt.pix_mp.height : fmt.fmt.pix.height);
+            if (got_format != candidate.v4l2 || got_width != size.first || got_height != size.second) {
+              continue;
+            }
+            // The mmap/upload paths assume one contiguous memory plane per frame
+            // (NV12/YUYV/BGR24/MJPEG all have contiguous fourccs); reject others.
+            if (mplane && fmt.fmt.pix_mp.num_planes != 1) {
+              continue;
+            }
+            auto stride = (int) (mplane ? fmt.fmt.pix_mp.plane_fmt[0].bytesperline : fmt.fmt.pix.bytesperline);
+
+            if (!activate_format(candidate.v4l2, candidate.av, size.first, size.second, stride, forced.mjpeg_hw)) {
+              return -1;
+            }
+            if (size.first != requested_width || size.second != requested_height) {
+              BOOST_LOG(info) << "RKMPP direct V4L2: requested "sv << requested_width << 'x' << requested_height
+                              << " unavailable; capturing "sv << size.first << 'x' << size.second
+                              << " and scaling to encoder frame"sv;
+            }
+            if (mjpeg_prefers_fallback && candidate.v4l2 != V4L2_PIX_FMT_MJPEG) {
+              BOOST_LOG(info) << "RKMPP direct V4L2: MJPG unsupported at "sv << size.first << 'x' << size.second
+                              << "; falling back to "sv << fourcc_str(candidate.v4l2);
+            }
+            return 1;
+          }
+        }
+        return 0;
+      };
+
+      auto result = try_candidates(false);
+      if (result == 0 && forced.is_forced && !mjpeg_prefers_fallback) {
+        // A pin the device cannot honor (e.g. the Rockchip HDMI-RX only accepts
+        // the pixel format matching the incoming signal's color format) should
+        // degrade to automatic selection, not lose the direct path entirely.
         BOOST_LOG(warning) << "RKMPP direct V4L2: pinned format "sv << fourcc_str(forced.v4l2)
-                           << " not supported by device at "sv << requested_width << 'x' << requested_height;
-      } else {
+                           << " not accepted by device; retrying with automatic format selection"sv;
+        result = try_candidates(true);
+      }
+      if (result > 0) {
+        return true;
+      }
+      if (result == 0) {
         BOOST_LOG(warning) << "RKMPP direct V4L2: device offers no supported pixel format at "sv
                            << requested_width << 'x' << requested_height;
       }
@@ -1341,17 +1431,19 @@ namespace rkmpp {
     }
 
     bool scale(const direct_frame_t &src, const scale_region_t &region, AVFrame *dst, int dst_w, int dst_h) {
-      // Only NV12 capture is handled on the RGA path; other formats fall back.
-      if (!src.nv12) {
+      // NV12 and BGR24 capture are handled on the RGA path (RGA converts BGR
+      // to NV12 during the scale); other formats fall back.
+      if (!rga_src_supported(src)) {
         return false;
       }
-      if (!ensure(src_buf, src.width, src.height) || !ensure(dst_buf, dst_w, dst_h)) {
+      if (!ensure(src_buf, src.width, src.height, src_frame_bytes(src)) ||
+          !ensure(dst_buf, dst_w, dst_h, (std::size_t) dst_w * dst_h * 3 / 2)) {
         return false;
       }
 
       // Copy the (possibly strided) capture into the packed src dma-buf.
       sync(src_buf.fd, true, DMA_BUF_SYNC_WRITE);
-      copy_nv12_in(src, src_buf);
+      copy_src_in(src, src_buf);
       sync(src_buf.fd, false, DMA_BUF_SYNC_WRITE);
 
       // Pre-clear letterbox bars; only needed when the output geometry changes
@@ -1366,7 +1458,7 @@ namespace rkmpp {
       last_dst_w = dst_w;
       last_dst_h = dst_h;
 
-      rga_buffer_t s = wrapbuffer_handle(src_buf.handle, src.width, src.height, RK_FORMAT_YCbCr_420_SP);
+      rga_buffer_t s = wrapbuffer_handle(src_buf.handle, src.width, src.height, rga_src_format(src));
       rga_buffer_t d = wrapbuffer_handle(dst_buf.handle, dst_w, dst_h, RK_FORMAT_YCbCr_420_SP);
       im_rect srect {region.src_left, region.src_top, region.src_w, region.src_h};
       im_rect drect {region.off_x, region.off_y, region.out_w, region.out_h};
@@ -1397,12 +1489,14 @@ namespace rkmpp {
     // hard allocation failure. The encoder buffer itself is not RGA-addressable
     // on this SoC, hence the import-our-own-buffer approach.
     AVFrame *scale_direct(const direct_frame_t &src, const scale_region_t &region, int dst_w, int dst_h, AVBufferRef *hw_frames_ctx) {
-      if (!src.nv12 || !ensure(src_buf, src.width, src.height) || !ensure_enc(dst_w, dst_h)) {
+      if (!rga_src_supported(src) ||
+          !ensure(src_buf, src.width, src.height, src_frame_bytes(src)) ||
+          !ensure_enc(dst_w, dst_h)) {
         return nullptr;
       }
 
       sync(src_buf.fd, true, DMA_BUF_SYNC_WRITE);
-      copy_nv12_in(src, src_buf);
+      copy_src_in(src, src_buf);
       sync(src_buf.fd, false, DMA_BUF_SYNC_WRITE);
 
       // Clear letterbox bars when the output geometry changes (the encoder frame
@@ -1417,7 +1511,7 @@ namespace rkmpp {
       last_dst_w = dst_w;
       last_dst_h = dst_h;
 
-      rga_buffer_t s = wrapbuffer_handle(src_buf.handle, src.width, src.height, RK_FORMAT_YCbCr_420_SP);
+      rga_buffer_t s = wrapbuffer_handle(src_buf.handle, src.width, src.height, rga_src_format(src));
       rga_buffer_t d = wrapbuffer_handle(enc_buf.handle, dst_w, dst_h, RK_FORMAT_YCbCr_420_SP, enc_wstride, enc_hstride);
       im_rect srect {region.src_left, region.src_top, region.src_w, region.src_h};
       im_rect drect {region.off_x, region.off_y, region.out_w, region.out_h};
@@ -1554,12 +1648,12 @@ namespace rkmpp {
       b.len = 0;
     }
 
-    bool ensure(buffer_t &b, int w, int h) {
-      if (b.fd >= 0 && b.w == w && b.h == h) {
+    bool ensure(buffer_t &b, int w, int h, std::size_t bytes) {
+      if (b.fd >= 0 && b.w == w && b.h == h && b.len >= bytes) {
         return true;
       }
       release(b);
-      if (!alloc(b, (std::size_t) w * h * 3 / 2)) {
+      if (!alloc(b, bytes)) {
         return false;
       }
       b.handle = importbuffer_fd(b.fd, (int) b.len);
@@ -1570,6 +1664,24 @@ namespace rkmpp {
       b.w = w;
       b.h = h;
       return true;
+    }
+
+    // Frame byte size of a direct capture frame in the packed src dma-buf
+    // (NV12 or BGR24 — the two formats the RGA source path accepts).
+    static std::size_t src_frame_bytes(const direct_frame_t &src) {
+      const std::size_t px = (std::size_t) src.width * src.height;
+      return src.fourcc == V4L2_PIX_FMT_BGR24 ? px * 3 : px * 3 / 2;
+    }
+
+    // Whether the RGA source path can consume this capture frame directly.
+    static bool rga_src_supported(const direct_frame_t &src) {
+      return src.nv12 || src.fourcc == V4L2_PIX_FMT_BGR24;
+    }
+
+    // librga source descriptor format for a supported capture frame. RGA does
+    // the BGR888 -> NV12 color-space conversion in the same pass as the scale.
+    static int rga_src_format(const direct_frame_t &src) {
+      return src.fourcc == V4L2_PIX_FMT_BGR24 ? RK_FORMAT_BGR_888 : RK_FORMAT_YCbCr_420_SP;
     }
 
     void sync(int fd, bool start, std::uint64_t rw) {
@@ -1587,6 +1699,23 @@ namespace rkmpp {
       auto *dstuv = dstp + (std::size_t) src.width * src.height;
       for (int row = 0; row < src.height / 2; ++row) {
         std::memcpy(dstuv + (std::size_t) row * src.width, uv + (std::size_t) row * src.stride, src.width);
+      }
+    }
+
+    // Copy a (possibly strided) BGR24 capture into the packed src dma-buf.
+    void copy_bgr_in(const direct_frame_t &src, buffer_t &b) {
+      auto *dstp = (std::uint8_t *) b.map;
+      const auto row_bytes = (std::size_t) src.width * 3;
+      for (int row = 0; row < src.height; ++row) {
+        std::memcpy(dstp + (std::size_t) row * row_bytes, src.data + (std::size_t) row * src.stride, row_bytes);
+      }
+    }
+
+    void copy_src_in(const direct_frame_t &src, buffer_t &b) {
+      if (src.fourcc == V4L2_PIX_FMT_BGR24) {
+        copy_bgr_in(src, b);
+      } else {
+        copy_nv12_in(src, b);
       }
     }
 
