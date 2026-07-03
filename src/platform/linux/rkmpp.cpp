@@ -35,6 +35,7 @@
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <thread>
 #include <tuple>
 #include <unistd.h>
 #include <utility>
@@ -241,6 +242,15 @@ namespace rkmpp {
       }
 
       streaming = true;
+
+      // Session marker for retro-web: while this exists (and the PID inside is
+      // alive), the capture device belongs to the live stream and screenshots
+      // must go through the request-file handshake, never the device.
+      if (auto *marker = std::fopen(streaming_marker_path().c_str(), "wb")) {
+        std::fprintf(marker, "%d\n", (int) getpid());
+        std::fclose(marker);
+      }
+
       std::string format_label;
       if (is_mjpeg) {
         format_label = mjpeg_hw ? "MJPEG(HW-decode)->NV12" : "MJPEG(SW-decode)->NV12";
@@ -340,26 +350,31 @@ namespace rkmpp {
       return true;
     }
 
-    // Serve on-demand raw-frame snapshots for the retro-web view-region UI.
-    // A second V4L2 consumer would renegotiate the HDMI-RX timings and kill the
-    // live stream, so the web UI instead drops a request file and this capture
-    // loop writes out the latest frame it already holds. No VPU involvement:
-    // the web server JPEG-encodes the raw frame itself.
-    void maybe_serve_screenshot() {
-      if (!latest_ptr) {
-        return;
-      }
-      // A stat every frame is cheap but pointless; ~4 checks/second at 60 fps.
-      if (++screenshot_poll < 15) {
-        return;
-      }
-      screenshot_poll = 0;
-
+    static std::string runtime_dir() {
       const char *dir = std::getenv("XDG_RUNTIME_DIR");
       if (!dir || !*dir) {
         dir = "/run/retro-stream";
       }
-      const auto request = std::string(dir) + "/sunshine-screenshot.request";
+      return dir;
+    }
+
+    static std::string streaming_marker_path() {
+      return runtime_dir() + "/sunshine-streaming";
+    }
+
+    // Serve on-demand raw-frame snapshots for the retro-web view-region UI.
+    // A second V4L2 consumer would renegotiate the HDMI-RX timings and kill the
+    // live stream, so the web UI instead drops a request file and this capture
+    // loop writes out the latest frame it already holds. No VPU involvement:
+    // the web server JPEG-encodes the raw frame itself. The request check is a
+    // single access() per frame; the 1 MB file write happens on a detached
+    // thread so it can never stall frame pacing.
+    void maybe_serve_screenshot() {
+      if (!latest_ptr) {
+        return;
+      }
+      const auto dir = runtime_dir();
+      const auto request = dir + "/sunshine-screenshot.request";
       if (access(request.c_str(), F_OK) != 0) {
         return;
       }
@@ -377,36 +392,41 @@ namespace rkmpp {
         return;
       }
 
-      // raw first, then meta — the reader treats the meta file's appearance as
-      // "raw is complete", so both are written to temp names and renamed.
-      const auto raw_path = std::string(dir) + "/sunshine-screenshot.raw";
-      const auto meta_path = std::string(dir) + "/sunshine-screenshot.meta";
-      const auto raw_tmp = raw_path + ".tmp";
-      const auto meta_tmp = meta_path + ".tmp";
+      // Copy the frame now (latest_ptr is only stable on this thread) and let a
+      // detached thread do the tmpfs writes.
+      std::vector<std::uint8_t> frame_copy(latest_ptr, latest_ptr + bytes);
+      std::thread([dir, frame_copy = std::move(frame_copy), out_fourcc, out_stride, w = width, h = height]() {
+        // raw first, then meta — the reader treats the meta file's appearance
+        // as "raw is complete", so both are written to temp names and renamed.
+        const auto raw_path = dir + "/sunshine-screenshot.raw";
+        const auto meta_path = dir + "/sunshine-screenshot.meta";
+        const auto raw_tmp = raw_path + ".tmp";
+        const auto meta_tmp = meta_path + ".tmp";
 
-      auto *raw_file = std::fopen(raw_tmp.c_str(), "wb");
-      if (!raw_file) {
-        return;
-      }
-      const auto written = std::fwrite(latest_ptr, 1, bytes, raw_file);
-      std::fclose(raw_file);
-      if (written != bytes || std::rename(raw_tmp.c_str(), raw_path.c_str()) != 0) {
-        unlink(raw_tmp.c_str());
-        return;
-      }
+        auto *raw_file = std::fopen(raw_tmp.c_str(), "wb");
+        if (!raw_file) {
+          return;
+        }
+        const auto written = std::fwrite(frame_copy.data(), 1, frame_copy.size(), raw_file);
+        std::fclose(raw_file);
+        if (written != frame_copy.size() || std::rename(raw_tmp.c_str(), raw_path.c_str()) != 0) {
+          unlink(raw_tmp.c_str());
+          return;
+        }
 
-      auto *meta_file = std::fopen(meta_tmp.c_str(), "wb");
-      if (!meta_file) {
-        return;
-      }
-      std::fprintf(meta_file, "%s %d %d %d\n", fourcc_str(out_fourcc).c_str(), width, height, out_stride);
-      std::fclose(meta_file);
-      if (std::rename(meta_tmp.c_str(), meta_path.c_str()) != 0) {
-        unlink(meta_tmp.c_str());
-        return;
-      }
-      BOOST_LOG(info) << "RKMPP direct V4L2: served view-region screenshot frame ("sv
-                      << fourcc_str(out_fourcc) << ' ' << width << 'x' << height << ')';
+        auto *meta_file = std::fopen(meta_tmp.c_str(), "wb");
+        if (!meta_file) {
+          return;
+        }
+        std::fprintf(meta_file, "%s %d %d %d\n", fourcc_str(out_fourcc).c_str(), w, h, out_stride);
+        std::fclose(meta_file);
+        if (std::rename(meta_tmp.c_str(), meta_path.c_str()) != 0) {
+          unlink(meta_tmp.c_str());
+          return;
+        }
+        BOOST_LOG(info) << "RKMPP direct V4L2: served view-region screenshot frame ("sv
+                        << fourcc_str(out_fourcc) << ' ' << w << 'x' << h << ')';
+      }).detach();
     }
 
     // Total bytes of the capture buffer for a snapshot, per format. The stride
@@ -561,6 +581,7 @@ namespace rkmpp {
     bool mplane {};
 
     void stop() {
+      unlink(streaming_marker_path().c_str());
       if (mjpeg_ctx) {
         avcodec_free_context(&mjpeg_ctx);
         mjpeg_ctx = nullptr;
@@ -1462,7 +1483,6 @@ namespace rkmpp {
     const std::uint8_t *latest_ptr {};
     int held_index {-1};
     bool ever_produced {};
-    int screenshot_poll {};
     std::vector<buffer_t> buffers;
   };
 
