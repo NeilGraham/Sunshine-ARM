@@ -27,6 +27,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
@@ -334,8 +335,100 @@ namespace rkmpp {
         return false;
       }
 
+      maybe_serve_screenshot();
       missing_frame_logged = false;
       return true;
+    }
+
+    // Serve on-demand raw-frame snapshots for the retro-web view-region UI.
+    // A second V4L2 consumer would renegotiate the HDMI-RX timings and kill the
+    // live stream, so the web UI instead drops a request file and this capture
+    // loop writes out the latest frame it already holds. No VPU involvement:
+    // the web server JPEG-encodes the raw frame itself.
+    void maybe_serve_screenshot() {
+      if (!latest_ptr) {
+        return;
+      }
+      // A stat every frame is cheap but pointless; ~4 checks/second at 60 fps.
+      if (++screenshot_poll < 15) {
+        return;
+      }
+      screenshot_poll = 0;
+
+      const char *dir = std::getenv("XDG_RUNTIME_DIR");
+      if (!dir || !*dir) {
+        dir = "/run/retro-stream";
+      }
+      const auto request = std::string(dir) + "/sunshine-screenshot.request";
+      if (access(request.c_str(), F_OK) != 0) {
+        return;
+      }
+      unlink(request.c_str());
+
+      auto out_fourcc = capture_fourcc;
+      auto out_stride = capture_stride;
+      if (is_mjpeg) {
+        // latest_ptr points into the decoded packed-NV12 latest_frame.
+        out_fourcc = V4L2_PIX_FMT_NV12;
+        out_stride = width;
+      }
+      const auto bytes = snapshot_frame_bytes(out_fourcc, out_stride, height);
+      if (bytes == 0) {
+        return;
+      }
+
+      // raw first, then meta — the reader treats the meta file's appearance as
+      // "raw is complete", so both are written to temp names and renamed.
+      const auto raw_path = std::string(dir) + "/sunshine-screenshot.raw";
+      const auto meta_path = std::string(dir) + "/sunshine-screenshot.meta";
+      const auto raw_tmp = raw_path + ".tmp";
+      const auto meta_tmp = meta_path + ".tmp";
+
+      auto *raw_file = std::fopen(raw_tmp.c_str(), "wb");
+      if (!raw_file) {
+        return;
+      }
+      const auto written = std::fwrite(latest_ptr, 1, bytes, raw_file);
+      std::fclose(raw_file);
+      if (written != bytes || std::rename(raw_tmp.c_str(), raw_path.c_str()) != 0) {
+        unlink(raw_tmp.c_str());
+        return;
+      }
+
+      auto *meta_file = std::fopen(meta_tmp.c_str(), "wb");
+      if (!meta_file) {
+        return;
+      }
+      std::fprintf(meta_file, "%s %d %d %d\n", fourcc_str(out_fourcc).c_str(), width, height, out_stride);
+      std::fclose(meta_file);
+      if (std::rename(meta_tmp.c_str(), meta_path.c_str()) != 0) {
+        unlink(meta_tmp.c_str());
+        return;
+      }
+      BOOST_LOG(info) << "RKMPP direct V4L2: served view-region screenshot frame ("sv
+                      << fourcc_str(out_fourcc) << ' ' << width << 'x' << height << ')';
+    }
+
+    // Total bytes of the capture buffer for a snapshot, per format. The stride
+    // is the luma line stride; chroma layouts follow V4L2's contiguous
+    // single-memory-plane conventions.
+    static std::size_t snapshot_frame_bytes(std::uint32_t fourcc, int stride, int height) {
+      const auto s = (std::size_t) stride;
+      const auto h = (std::size_t) height;
+      switch (fourcc) {
+        case V4L2_PIX_FMT_NV12:
+          return s * h * 3 / 2;
+        case V4L2_PIX_FMT_NV16:
+          return s * h * 2;
+        case V4L2_PIX_FMT_NV24:
+          return s * h * 3;
+        case V4L2_PIX_FMT_YUYV:  // stride covers 2 bytes/px
+        case V4L2_PIX_FMT_BGR24: // stride covers 3 bytes/px
+        case V4L2_PIX_FMT_RGB24:
+          return s * h;
+        default:
+          return 0;
+      }
     }
 
     direct_frame_t latest_direct_frame() const {
@@ -1369,6 +1462,7 @@ namespace rkmpp {
     const std::uint8_t *latest_ptr {};
     int held_index {-1};
     bool ever_produced {};
+    int screenshot_poll {};
     std::vector<buffer_t> buffers;
   };
 
