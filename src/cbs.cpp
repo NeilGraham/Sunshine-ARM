@@ -238,13 +238,12 @@ namespace cbs {
     if (codec_id == AV_CODEC_ID_H264) {
       auto h264 = (CodedBitstreamH264Context *) ctx->priv_data;
 
-      if (!h264->active_sps->vui_parameters_present_flag) {
-        return false;
-      }
-
-      return true;
+      // The packet can parse cleanly yet activate no SPS (e.g. a non-IDR frame
+      // drained while the capture loop was busy serving a screenshot request).
+      return h264->active_sps && h264->active_sps->vui_parameters_present_flag;
     }
 
-    return ((CodedBitstreamH265Context *) ctx->priv_data)->active_sps->vui_parameters_present_flag;
+    auto h265 = (CodedBitstreamH265Context *) ctx->priv_data;
+    return h265->active_sps && h265->active_sps->vui_parameters_present_flag;
   }
 }  // namespace cbs
