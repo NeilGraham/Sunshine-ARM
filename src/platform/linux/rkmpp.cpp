@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <poll.h>
+#include <chrono>
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -251,12 +252,25 @@ namespace rkmpp {
     }
 
     bool init(const char *device, int width, int height, int fps) {
+      dev_path = device;
+      req_width = width;
+      req_height = height;
+      req_fps = fps;
+      last_frame_at = std::chrono::steady_clock::now();
+
       fd = open(device, O_RDWR | O_NONBLOCK);
       if (fd < 0) {
         char string[1024];
         BOOST_LOG(warning) << "RKMPP direct V4L2: couldn't open "sv << device << ": "sv << strerror_r(errno, string, sizeof(string));
         return false;
       }
+
+      // Ask the driver to tell us about in-band signal changes (an HDMI
+      // switch flipping inputs, a console changing video mode); stall
+      // detection in maybe_recover_source covers drivers that don't.
+      v4l2_event_subscription sub {};
+      sub.type = V4L2_EVENT_SOURCE_CHANGE;
+      source_events = xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) == 0;
 
       // Platform capture blocks like the Rockchip HDMI-RX are multiplanar-only
       // devices; USB capture cards are single-planar. Pick the buffer type once
@@ -372,7 +386,51 @@ namespace rkmpp {
       xioctl(fd, VIDIOC_QBUF, &buf);
     }
 
+    // A source change mid-session (HDMI switch input flip, console video-mode
+    // switch) invalidates the negotiated capture: the driver either stops
+    // delivering (frozen stream) or delivers a new geometry into buffers
+    // negotiated for the old one (stride garbage; unwritten NV12 renders as
+    // green bars). Detect it — the driver's SOURCE_CHANGE event when
+    // supported, a delivery stall otherwise — and replay the full init:
+    // DV-timings re-latch, format negotiation, buffer setup. Throttled so an
+    // absent source retries calmly until it appears (black frames meanwhile).
+    void maybe_recover_source() {
+      constexpr auto STALL_AFTER = std::chrono::milliseconds(1200);
+      constexpr auto RECOVER_BACKOFF = std::chrono::milliseconds(2500);
+
+      bool changed = false;
+      if (source_events && fd >= 0) {
+        v4l2_event ev {};
+        while (xioctl(fd, VIDIOC_DQEVENT, &ev) == 0) {
+          changed = changed || ev.type == V4L2_EVENT_SOURCE_CHANGE;
+        }
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (!changed && now - last_frame_at < STALL_AFTER) {
+        return;
+      }
+      if (now - last_recover_at < RECOVER_BACKOFF) {
+        return;
+      }
+      last_recover_at = now;
+
+      if (!recovery_logged) {
+        BOOST_LOG(info) << "RKMPP direct V4L2: "sv
+                        << (changed ? "source change reported"sv : "capture stalled"sv)
+                        << "; re-initializing capture"sv;
+        recovery_logged = true;
+      }
+      const auto device = dev_path;
+      stop();
+      if (!init(device.c_str(), req_width, req_height, req_fps)) {
+        stop();  // failed part-way: release the fd so the next attempt starts clean
+      }
+    }
+
     bool update_latest_frame() {
+      maybe_recover_source();
+
       v4l2_buffer latest {};
       std::uint32_t latest_used = 0;
       bool have_latest = false;
@@ -408,6 +466,8 @@ namespace rkmpp {
       }
 
       if (have_latest) {
+        last_frame_at = std::chrono::steady_clock::now();
+        recovery_logged = false;
         auto *src = (const std::uint8_t *) buffers[latest.index].start;
         if (is_mjpeg) {
           // Decoded into the CPU latest_frame; the capture buffer is free now.
@@ -708,6 +768,11 @@ namespace rkmpp {
         close(fd);
       }
       fd = -1;
+
+      // The zero-copy pointers referenced the buffers just unmapped.
+      latest_ptr = nullptr;
+      held_index = -1;
+      ever_produced = false;
     }
 
     void copy_nv12(const std::uint8_t *src, AVFrame *dst, int dst_width, int dst_height) {
@@ -1577,6 +1642,18 @@ namespace rkmpp {
     int held_index {-1};
     bool ever_produced {};
     std::vector<buffer_t> buffers;
+    // Mid-session source recovery (see maybe_recover_source): the init
+    // parameters to replay, whether the driver posts SOURCE_CHANGE events,
+    // and the delivery/attempt timestamps that drive stall detection and
+    // reinit throttling.
+    std::string dev_path;
+    int req_width {};
+    int req_height {};
+    int req_fps {};
+    bool source_events {};
+    std::chrono::steady_clock::time_point last_frame_at {};
+    std::chrono::steady_clock::time_point last_recover_at {};
+    bool recovery_logged {};
   };
 
 #ifdef SUNSHINE_BUILD_RGA
