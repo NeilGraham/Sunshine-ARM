@@ -161,6 +161,95 @@ namespace rkmpp {
       stop();
     }
 
+    // The Rockchip HDMI-RX follows the incoming signal, but the vendor driver
+    // only re-latches its DV timings reliably on a hotplug edge. Behind an
+    // HDMI switch there is none: a source sleeping or an input change swaps
+    // the signal in-band — often through an idle carrier without AVI
+    // InfoFrames, where the driver's own format-change path gives up
+    // (`avi_pkt_rcv failed`) — leaving the configured timings stale and the
+    // capture black even after the source returns. Re-latch here so every
+    // session starts against the live signal. No-op for devices without DV
+    // timings support (USB capture cards), when no stable signal is present,
+    // or when the timings already match.
+    void sync_dv_timings() {
+      v4l2_dv_timings live {};
+      if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) != 0 || live.type != V4L2_DV_BT_656_1120 ||
+          live.bt.width == 0 || live.bt.height == 0) {
+        return;  // no DV timings support, or no stable signal to latch onto
+      }
+
+      const auto clock_close = [](std::uint64_t a, std::uint64_t b) {  // within 1% (59.94 vs 60 nominal)
+        const auto diff = a > b ? a - b : b - a;
+        return diff * 100 <= b;
+      };
+      v4l2_dv_timings cur {};
+      const bool have_cur = xioctl(fd, VIDIOC_G_DV_TIMINGS, &cur) == 0;
+      if (have_cur &&
+          cur.bt.width == live.bt.width && cur.bt.height == live.bt.height &&
+          cur.bt.interlaced == live.bt.interlaced &&
+          (live.bt.pixelclock == 0 || clock_close(live.bt.pixelclock, cur.bt.pixelclock))) {
+        return;
+      }
+
+      // S_DV_TIMINGS validates strictly against the driver's mode table, and
+      // QUERY's measurement is not table-exact: mid-lock it can omit the
+      // pixelclock entirely, and 1000/1001-rate signals measure ~0.1% off the
+      // table's nominal clock. Resolve the measurement to a canonical table
+      // entry: match geometry (and totals/clock when measured), and prefer the
+      // highest clock among the remainder — a bare 2200x1125 measurement is
+      // 1080p60 far more often than 1080p30 on the sources behind the switch.
+      const auto totals = [](const v4l2_bt_timings &bt) {
+        return std::make_pair(
+          bt.width + bt.hfrontporch + bt.hsync + bt.hbackporch,
+          bt.height + bt.vfrontporch + bt.vsync + bt.vbackporch +
+            (bt.interlaced ? bt.il_vfrontporch + bt.il_vsync + bt.il_vbackporch : 0));
+      };
+      const auto live_totals = totals(live.bt);
+      const bool have_live_totals = live_totals.first > live.bt.width && live_totals.second > live.bt.height;
+
+      v4l2_dv_timings pick {};
+      bool picked = false;
+      v4l2_enum_dv_timings ent {};
+      for (ent.index = 0; xioctl(fd, VIDIOC_ENUM_DV_TIMINGS, &ent) == 0; ++ent.index) {
+        const auto &bt = ent.timings.bt;
+        if (bt.width != live.bt.width || bt.height != live.bt.height ||
+            bt.interlaced != live.bt.interlaced) {
+          continue;
+        }
+        if (have_live_totals && totals(bt) != live_totals) {
+          continue;
+        }
+        if (live.bt.pixelclock > 0 && !clock_close(live.bt.pixelclock, bt.pixelclock)) {
+          continue;  // >1% off: different mode
+        }
+        if (!picked || bt.pixelclock > pick.bt.pixelclock) {
+          pick = ent.timings;
+          picked = true;
+        }
+      }
+      if (!picked) {
+        if (live.bt.pixelclock == 0) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: live signal "sv << live.bt.width << 'x' << live.bt.height
+                             << " matches no driver timing entry and has no measured pixelclock; keeping current timings"sv;
+          return;
+        }
+        pick = live;  // complete measurement, just not in the table — try it raw
+      }
+
+      if (xioctl(fd, VIDIOC_S_DV_TIMINGS, &pick) != 0) {
+        char string[1024];
+        BOOST_LOG(warning) << "RKMPP direct V4L2: couldn't adopt live signal timings ("sv
+                           << pick.bt.width << 'x' << pick.bt.height << "): "sv
+                           << strerror_r(errno, string, sizeof(string));
+        return;
+      }
+      BOOST_LOG(info) << "RKMPP direct V4L2: adopted live signal timings "sv
+                      << pick.bt.width << 'x' << pick.bt.height
+                      << (pick.bt.interlaced ? 'i' : 'p')
+                      << " pixelclock "sv << pick.bt.pixelclock
+                      << (have_cur ? " (driver held stale timings)"sv : ""sv);
+    }
+
     bool init(const char *device, int width, int height, int fps) {
       fd = open(device, O_RDWR | O_NONBLOCK);
       if (fd < 0) {
@@ -180,6 +269,10 @@ namespace rkmpp {
           BOOST_LOG(info) << "RKMPP direct V4L2: multiplanar capture device"sv;
         }
       }
+
+      // Must run before negotiate_format: its G_FMT fallback reads a format
+      // derived from whatever timings the driver currently holds.
+      sync_dv_timings();
 
       forced_aspect_ratio = parse_aspect_ratio(std::getenv("SUNSHINE_RKMPP_ASPECT_RATIO"));
       scale_filter = parse_scale_filter(std::getenv("SUNSHINE_RKMPP_SCALE_FILTER"));
