@@ -4,22 +4,26 @@
 # inside the Debian image furnace infers for this host (overridden by the
 # furnace/<platform>.Dockerfile next to this file — debian-12-bookworm by
 # default), then pulls the packaged .deb back to build/cpack_artifacts/.
+# `workspace` shares that remote dir (ccache, ffmpeg-rkmpp, npm cache) across
+# every device that builds this repo — do not build from two devices at once.
 #
 # The image bakes in ffmpeg-rockchip at /opt plus the Debian build dependencies.
 # The first build compiles ffmpeg-rockchip into build/ffmpeg-rkmpp and seeds
 # build/.ccache / build/npm-cache; furnace's persistent remote workspace keeps
 # those caches, so later builds mostly recompile changed Sunshine files.
 #
-# Deploy the pulled package with scripts/copy_build_to_rock_3c.sh (or scp +
-# `sudo apt install`), then `sudo systemctl restart sunshine`.
+# `furnace run --job deploy` also installs the pulled deb and restarts the
+# service. Re-apply patches/ to the inputtino submodule first if `git submodule
+# update` has run — ~/bin/build-sunshine-arm does both.
 #
 # To build Debian 13 instead, force the trixie image:
 #   furnace run --image furnace/debian-13-trixie.Dockerfile
 
 [run]
-ssh = "mbp"
+builder = "mbp"
 docker = true
-include_pull = ["build/cpack_artifacts/Sunshine.deb"]
+workspace = "sunshine-arm"
+include_target = ["build/cpack_artifacts/Sunshine.deb"]
 # No --sudo-off: furnace runs the container as a non-root uid, and linux_build.sh
 # needs root for apt and /usr/local. The image gives that uid passwordless sudo
 # (see the Dockerfiles), so the build sudo's the steps that need it.
@@ -27,4 +31,12 @@ include_pull = ["build/cpack_artifacts/Sunshine.deb"]
 # no .bashrc; linux_build.sh does `source ~/.bashrc`).
 commands = [
     "rm -rf node_modules; export HOME=/home/builder CCACHE_DIR=$PWD/build/.ccache NPM_CONFIG_CACHE=$PWD/build/npm-cache; (ccache --zero-stats || true); ./scripts/linux_build.sh --skip-deps --skip-cuda --num-processors=4 --rkmpp=/opt/ffmpeg-rockchip; status=$?; (ccache --show-stats || true); rm -rf node_modules; exit \"$status\"",
+]
+
+# Full build (inherited from [run]) plus install + service restart on this
+# device. apt (not dpkg -i) so librockchip-mpp1/librga2 deps resolve.
+[job.deploy]
+then = [
+    "sudo -n apt-get install -y --reinstall ./build/cpack_artifacts/Sunshine.deb",
+    "sudo -n systemctl restart sunshine-retro 2>/dev/null || true",
 ]
