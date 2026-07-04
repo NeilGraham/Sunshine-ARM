@@ -131,6 +131,13 @@ namespace rkmpp {
     int height {};
     int stride {};
     bool nv12 {};
+    // dma-buf export of the V4L2 buffer holding this frame (-1 when the frame
+    // lives in CPU memory, e.g. decoded MJPEG, or EXPBUF is unsupported).
+    // Lets the RGA path read the capture without a CPU copy — V4L2 mmap
+    // memory is uncached, and memcpying a 1080p frame out of it per frame
+    // costs more CPU than the entire rest of the pipeline.
+    int dmabuf_fd {-1};
+    std::uint32_t dmabuf_size {};
   };
 
   struct scale_region_t {
@@ -336,6 +343,18 @@ namespace rkmpp {
         if (buffers[x].start == MAP_FAILED) {
           buffers[x].start = nullptr;
           return false;
+        }
+
+        // Export the buffer as a dma-buf so RGA can read the frame directly
+        // (see direct_frame_t::dmabuf_fd). Optional: drivers without EXPBUF
+        // (or non-contiguous buffers) simply leave the CPU-copy path in use.
+        v4l2_exportbuffer exp {};
+        exp.type = buf_type();
+        exp.index = x;
+        exp.plane = 0;
+        exp.flags = O_RDWR | O_CLOEXEC;
+        if (xioctl(fd, VIDIOC_EXPBUF, &exp) == 0) {
+          buffers[x].dmabuf_fd = exp.fd;
         }
 
         if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
@@ -739,6 +758,11 @@ namespace rkmpp {
       if (is_mjpeg) {
         frame.fourcc = V4L2_PIX_FMT_NV12;
         frame.stride = width;
+      } else if (held_index >= 0 && latest_ptr == buffers[held_index].start) {
+        // The zero-copy frame is the held V4L2 buffer itself; hand its dma-buf
+        // to consumers that can read it without a CPU copy (the RGA path).
+        frame.dmabuf_fd = buffers[held_index].dmabuf_fd;
+        frame.dmabuf_size = (std::uint32_t) buffers[held_index].length;
       }
       return frame;
     }
@@ -847,6 +871,7 @@ namespace rkmpp {
     struct buffer_t {
       void *start {};
       std::size_t length {};
+      int dmabuf_fd {-1};
     };
 
     // Single-planar for USB capture cards, multiplanar for platform blocks
@@ -876,6 +901,9 @@ namespace rkmpp {
       for (auto &buffer : buffers) {
         if (buffer.start) {
           munmap(buffer.start, buffer.length);
+        }
+        if (buffer.dmabuf_fd >= 0) {
+          close(buffer.dmabuf_fd);
         }
       }
       buffers.clear();
@@ -1902,15 +1930,31 @@ namespace rkmpp {
     // hard allocation failure. The encoder buffer itself is not RGA-addressable
     // on this SoC, hence the import-our-own-buffer approach.
     AVFrame *scale_direct(const direct_frame_t &src, const scale_region_t &region, int dst_w, int dst_h, AVBufferRef *hw_frames_ctx) {
-      if (!rga_src_supported(src) ||
-          !ensure(src_buf, src.width, src.height, src_frame_bytes(src)) ||
-          !ensure_enc(dst_w, dst_h)) {
+      if (!rga_src_supported(src) || !ensure_enc(dst_w, dst_h)) {
         return nullptr;
       }
 
-      sync(src_buf.fd, true, DMA_BUF_SYNC_WRITE);
-      copy_src_in(src, src_buf);
-      sync(src_buf.fd, false, DMA_BUF_SYNC_WRITE);
+      // Zero-copy source: import the capture buffer's dma-buf and let RGA read
+      // it in place. The CPU-copy staging buffer is only a fallback — V4L2
+      // mmap memory is uncached, so the per-frame memcpy out of it costs more
+      // CPU than everything else in the pipeline combined (a 1080p60 BGR24
+      // stream is ~370 MB/s of uncached reads).
+      rga_buffer_handle_t imported = 0;
+      if (src.dmabuf_fd >= 0 && src.dmabuf_size > 0) {
+        imported = importbuffer_fd(src.dmabuf_fd, (int) src.dmabuf_size);
+        if (!imported && !import_fail_logged) {
+          BOOST_LOG(warning) << "RGA: couldn't import capture dma-buf; falling back to CPU copy"sv;
+          import_fail_logged = true;
+        }
+      }
+      if (!imported) {
+        if (!ensure(src_buf, src.width, src.height, src_frame_bytes(src))) {
+          return nullptr;
+        }
+        sync(src_buf.fd, true, DMA_BUF_SYNC_WRITE);
+        copy_src_in(src, src_buf);
+        sync(src_buf.fd, false, DMA_BUF_SYNC_WRITE);
+      }
 
       // Clear letterbox bars when the output geometry changes (the encoder frame
       // is OVERWRITE-mapped, so bars are not preserved across a geometry change).
@@ -1924,7 +1968,14 @@ namespace rkmpp {
       last_dst_w = dst_w;
       last_dst_h = dst_h;
 
-      rga_buffer_t s = wrapbuffer_handle(src_buf.handle, src.width, src.height, rga_src_format(src));
+      rga_buffer_t s;
+      if (imported) {
+        // The V4L2 buffer can be strided; wrapbuffer strides are in pixels.
+        const int wstride_px = src.fourcc == V4L2_PIX_FMT_BGR24 ? src.stride / 3 : src.stride;
+        s = wrapbuffer_handle(imported, src.width, src.height, rga_src_format(src), wstride_px, src.height);
+      } else {
+        s = wrapbuffer_handle(src_buf.handle, src.width, src.height, rga_src_format(src));
+      }
       rga_buffer_t d = wrapbuffer_handle(enc_buf.handle, dst_w, dst_h, RK_FORMAT_YCbCr_420_SP, enc_wstride, enc_hstride);
       im_rect srect {region.src_left, region.src_top, region.src_w, region.src_h};
       im_rect drect {region.off_x, region.off_y, region.out_w, region.out_h};
@@ -1933,6 +1984,9 @@ namespace rkmpp {
       opt.interp = interp;
       rga_buffer_t pat {};
       auto status = improcess(s, d, pat, srect, drect, prect, -1, nullptr, &opt, IM_SYNC);
+      if (imported) {
+        releasebuffer_handle(imported);
+      }
       if (status != IM_STATUS_SUCCESS) {
         if (!fail_logged) {
           BOOST_LOG(warning) << "RGA: direct improcess failed: "sv << imStrError_t(status);
@@ -2253,6 +2307,7 @@ namespace rkmpp {
     int last_dst_w {-1};
     int last_dst_h {-1};
     bool fail_logged {};
+    bool import_fail_logged {};
   };
 #endif
 
@@ -2471,9 +2526,16 @@ namespace rkmpp {
           }
           enc = rga.black_direct(w, h, enc_hw_frames_ctx);
         } else if (passthrough) {
-          // Stream settings match the capture exactly: copy straight to the
-          // encoder buffer, no RGA scaling pass.
-          enc = rga.passthrough_direct(direct_v4l2->latest_direct_frame(), w, h, enc_hw_frames_ctx);
+          // Stream settings match the capture exactly: no scaling needed. With
+          // an exported capture dma-buf the identity blit still goes through
+          // RGA — a 2D-engine copy beats memcpying the frame out of uncached
+          // V4L2 mmap memory. The CPU passthrough copy remains the fallback.
+          const auto direct = direct_v4l2->latest_direct_frame();
+          if (direct.dmabuf_fd >= 0) {
+            enc = rga.scale_direct(direct, direct_v4l2->scale_region(w, h), w, h, enc_hw_frames_ctx);
+          } else {
+            enc = rga.passthrough_direct(direct, w, h, enc_hw_frames_ctx);
+          }
         } else {
           enc = rga.scale_direct(direct_v4l2->latest_direct_frame(), direct_v4l2->scale_region(w, h), w, h, enc_hw_frames_ctx);
         }
