@@ -393,37 +393,60 @@ namespace rkmpp {
     // green bars). Detect it — the driver's SOURCE_CHANGE event when
     // supported, a delivery stall otherwise — and replay the full init:
     // DV-timings re-latch, format negotiation, buffer setup. Throttled so an
-    // absent source retries calmly until it appears (black frames meanwhile).
+    // absent source retries calmly until it appears (the held last-good frame
+    // is shown meanwhile — see update_latest_frame's suppression).
     void maybe_recover_source() {
       constexpr auto STALL_AFTER = std::chrono::milliseconds(1200);
       constexpr auto RECOVER_BACKOFF = std::chrono::milliseconds(2500);
 
-      bool changed = false;
+      // A trigger latches recover_pending and stays latched until a replay
+      // runs or a probe proves the capture healthy. Consuming the trigger on
+      // a single held tick loses it: a console can change modes while frames
+      // are still flowing through the stale config (a PS3 boots at 480p and
+      // switches to 1080p at the menu — garbage frames keep the stall
+      // detector quiet, and the SOURCE_CHANGE event only fires once).
       if (source_events && fd >= 0) {
         v4l2_event ev {};
         while (xioctl(fd, VIDIOC_DQEVENT, &ev) == 0) {
-          changed = changed || ev.type == V4L2_EVENT_SOURCE_CHANGE;
+          recover_pending = recover_pending || ev.type == V4L2_EVENT_SOURCE_CHANGE;
         }
       }
 
       const auto now = std::chrono::steady_clock::now();
-      if (!changed && now - last_frame_at < STALL_AFTER) {
+      const bool stalled = now - last_frame_at >= STALL_AFTER;
+      const bool was_pending = recover_pending;
+      recover_pending = recover_pending || stalled;
+      if (!recover_pending) {
         return;
       }
-      if (now - last_recover_at < RECOVER_BACKOFF) {
+      if (!was_pending) {
+        pending_since = now;
+      }
+      // Probing (a couple of register-read ioctls) is much cheaper than a
+      // replay, so a fresh episode probes on a much shorter throttle: the
+      // replay then starts within ~250 ms of the new signal locking instead
+      // of waiting out the replay backoff — that wait was a visible second of
+      // limbo on every HDMI-switch flip. Real transitions settle within a few
+      // seconds; past that the hold is an absent source, so decay to the slow
+      // tick — the driver v4l2_err()s every no-link/no-lock query, and fast
+      // probes would flood the kernel log for as long as the source is gone.
+      constexpr auto PROBE_FAST = std::chrono::milliseconds(250);
+      constexpr auto PROBE_FAST_WINDOW = std::chrono::seconds(10);
+      const auto probe_backoff = now - pending_since <= PROBE_FAST_WINDOW ? PROBE_FAST : RECOVER_BACKOFF;
+      if (now - last_probe_at < probe_backoff) {
         return;
       }
-      last_recover_at = now;
+      last_probe_at = now;
 
       // A replay is pointless without a signal to renegotiate against, and it
       // is not free: every replay reallocates the buffer queue from CMA, and
       // on the vendor 6.1 kernel a sustained alloc/free loop can wedge
       // cma_alloc in an unkillable D-state (lru_cache_disable never returns),
       // taking /dev/video0 down with it until reboot. While the driver
-      // reports no locked signal, hold the current state (black frames) and
-      // just re-probe on the backoff tick. Devices without DV timings support
-      // (ENOTTY: USB capture cards) can't be probed — replay as before; same
-      // for a lost fd, which only init can reopen.
+      // reports no locked signal, hold the current state (the last good frame
+      // stays up) and just re-probe on the backoff tick. Devices without DV
+      // timings support (ENOTTY: USB capture cards) can't be probed — replay
+      // as before; same for a lost fd, which only init can reopen.
       if (fd >= 0) {
         v4l2_dv_timings live {};
         const int query_err = xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) == 0 ? 0 : errno;
@@ -433,20 +456,41 @@ namespace rkmpp {
         if (!locked && query_err != ENOTTY) {
           if (!recovery_logged) {
             BOOST_LOG(info) << "RKMPP direct V4L2: "sv
-                            << (changed ? "source change reported"sv : "capture stalled"sv)
-                            << " and no signal is locked; sending black frames until a source appears"sv;
+                            << (stalled ? "capture stalled"sv : "source change reported"sv)
+                            << " and no signal is locked; holding the last frame until a source appears"sv;
             recovery_logged = true;
           }
           return;
         }
+        // A benign trigger (brief stall that already resolved, event for a
+        // change the driver absorbed): frames are flowing and the locked
+        // signal matches what we're configured for — nothing to replay.
+        if (locked && !stalled) {
+          const auto clock_close = [](std::uint64_t a, std::uint64_t b) {
+            const auto diff = a > b ? a - b : b - a;
+            return diff * 100 <= b;
+          };
+          v4l2_dv_timings cur {};
+          if (xioctl(fd, VIDIOC_G_DV_TIMINGS, &cur) == 0 &&
+              cur.bt.width == live.bt.width && cur.bt.height == live.bt.height &&
+              cur.bt.interlaced == live.bt.interlaced &&
+              (live.bt.pixelclock == 0 || clock_close(live.bt.pixelclock, cur.bt.pixelclock))) {
+            recover_pending = false;
+            return;
+          }
+        }
       }
 
-      if (!recovery_logged) {
-        BOOST_LOG(info) << "RKMPP direct V4L2: "sv
-                        << (changed ? "source change reported"sv : "capture stalled"sv)
-                        << "; re-initializing capture"sv;
-        recovery_logged = true;
+      if (now - last_recover_at < RECOVER_BACKOFF) {
+        return;  // replays stay throttled even though probing is frequent
       }
+      last_recover_at = now;
+
+      recover_pending = false;
+      BOOST_LOG(info) << "RKMPP direct V4L2: "sv
+                      << (stalled ? "capture stalled"sv : "source change reported"sv)
+                      << "; re-initializing capture"sv;
+      recovery_logged = true;
       const auto device = dev_path;
       stop();
       if (!init(device.c_str(), req_width, req_height, req_fps)) {
@@ -489,6 +533,19 @@ namespace rkmpp {
         latest.m.planes = nullptr;  // stack plane array; only .index/.bytesused are read below
         latest_used = mplane ? planes[0].bytesused : buf.bytesused;
         have_latest = true;
+      }
+
+      // While a recovery is owed the config is stale, so whatever the driver
+      // delivers is the new signal squeezed through the old geometry — stride
+      // garbage and green half-frames. Requeue instead of presenting and keep
+      // showing the held last-good frame (the input-switch freeze a TV gives);
+      // the replay lands within a probe tick of the new signal locking. The
+      // deliveries deliberately don't touch last_frame_at: they are not
+      // evidence of health, and a benign trigger is cleared by the probe
+      // before this suppression is ever visible.
+      if (have_latest && recover_pending) {
+        requeue_buffer(latest.index);
+        have_latest = false;
       }
 
       if (have_latest) {
@@ -1678,7 +1735,10 @@ namespace rkmpp {
     int req_fps {};
     bool source_events {};
     std::chrono::steady_clock::time_point last_frame_at {};
+    std::chrono::steady_clock::time_point pending_since {};
+    std::chrono::steady_clock::time_point last_probe_at {};
     std::chrono::steady_clock::time_point last_recover_at {};
+    bool recover_pending {};
     bool recovery_logged {};
   };
 
