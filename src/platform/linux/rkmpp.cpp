@@ -447,12 +447,18 @@ namespace rkmpp {
       // stays up) and just re-probe on the backoff tick. Devices without DV
       // timings support (ENOTTY: USB capture cards) can't be probed — replay
       // as before; same for a lost fd, which only init can reopen.
+      bool probe_locked = false;
+      v4l2_bt_timings probe_bt {};
       if (fd >= 0) {
         v4l2_dv_timings live {};
         const int query_err = xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) == 0 ? 0 : errno;
         const bool locked = query_err == 0 &&
                             live.type == V4L2_DV_BT_656_1120 &&
                             live.bt.width > 0 && live.bt.height > 0;
+        probe_locked = locked;
+        if (locked) {
+          probe_bt = live.bt;
+        }
         if (!locked && query_err != ENOTTY) {
           if (!recovery_logged) {
             BOOST_LOG(info) << "RKMPP direct V4L2: "sv
@@ -484,7 +490,42 @@ namespace rkmpp {
       if (now - last_recover_at < RECOVER_BACKOFF) {
         return;  // replays stay throttled even though probing is frequent
       }
+
+      // A locked signal is not necessarily a usable one: an HDMI switch with
+      // every input asleep emits an idle carrier (1440x480, no AVI InfoFrame)
+      // that measures fine but is rejected by S_DV_TIMINGS, so a replay
+      // renegotiates against the stale config and delivers nothing. Replaying
+      // in a loop against such a signal is the CMA alloc/free churn the
+      // no-signal hold exists to prevent. If the last replay produced no
+      // frames and the live signal hasn't changed since, hold — probing stays
+      // cheap, and a console powering on changes the timings, which unblocks
+      // the replay immediately. A slow retry remains as a safety net so a
+      // transiently failed init against a real signal can't hold forever.
+      // "No frames since the replay" must be read from ever_produced (cleared
+      // by stop(), set on the first presented frame) — last_frame_at is reset
+      // by init() as a stall-detection grace period and always looks fresh.
+      constexpr auto SAME_SIGNAL_RETRY = std::chrono::seconds(30);
+      if (probe_locked && last_replay_valid && !ever_produced &&
+          now - last_recover_at < SAME_SIGNAL_RETRY) {
+        const auto clock_close = [](std::uint64_t a, std::uint64_t b) {
+          const auto diff = a > b ? a - b : b - a;
+          return diff * 100 <= b;
+        };
+        if (probe_bt.width == last_replay_bt.width && probe_bt.height == last_replay_bt.height &&
+            probe_bt.interlaced == last_replay_bt.interlaced &&
+            (probe_bt.pixelclock == 0 || last_replay_bt.pixelclock == 0 ||
+             clock_close(probe_bt.pixelclock, last_replay_bt.pixelclock))) {
+          if (!recovery_logged) {
+            BOOST_LOG(info) << "RKMPP direct V4L2: signal "sv << probe_bt.width << 'x' << probe_bt.height
+                            << " unchanged since the last fruitless re-init; holding until it changes"sv;
+            recovery_logged = true;
+          }
+          return;
+        }
+      }
       last_recover_at = now;
+      last_replay_bt = probe_bt;
+      last_replay_valid = probe_locked;
 
       recover_pending = false;
       BOOST_LOG(info) << "RKMPP direct V4L2: "sv
@@ -1738,6 +1779,8 @@ namespace rkmpp {
     std::chrono::steady_clock::time_point pending_since {};
     std::chrono::steady_clock::time_point last_probe_at {};
     std::chrono::steady_clock::time_point last_recover_at {};
+    v4l2_bt_timings last_replay_bt {};
+    bool last_replay_valid {};
     bool recover_pending {};
     bool recovery_logged {};
   };
