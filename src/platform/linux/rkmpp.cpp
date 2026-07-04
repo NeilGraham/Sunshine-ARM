@@ -415,6 +415,32 @@ namespace rkmpp {
       }
       last_recover_at = now;
 
+      // A replay is pointless without a signal to renegotiate against, and it
+      // is not free: every replay reallocates the buffer queue from CMA, and
+      // on the vendor 6.1 kernel a sustained alloc/free loop can wedge
+      // cma_alloc in an unkillable D-state (lru_cache_disable never returns),
+      // taking /dev/video0 down with it until reboot. While the driver
+      // reports no locked signal, hold the current state (black frames) and
+      // just re-probe on the backoff tick. Devices without DV timings support
+      // (ENOTTY: USB capture cards) can't be probed — replay as before; same
+      // for a lost fd, which only init can reopen.
+      if (fd >= 0) {
+        v4l2_dv_timings live {};
+        const int query_err = xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) == 0 ? 0 : errno;
+        const bool locked = query_err == 0 &&
+                            live.type == V4L2_DV_BT_656_1120 &&
+                            live.bt.width > 0 && live.bt.height > 0;
+        if (!locked && query_err != ENOTTY) {
+          if (!recovery_logged) {
+            BOOST_LOG(info) << "RKMPP direct V4L2: "sv
+                            << (changed ? "source change reported"sv : "capture stalled"sv)
+                            << " and no signal is locked; sending black frames until a source appears"sv;
+            recovery_logged = true;
+          }
+          return;
+        }
+      }
+
       if (!recovery_logged) {
         BOOST_LOG(info) << "RKMPP direct V4L2: "sv
                         << (changed ? "source change reported"sv : "capture stalled"sv)
