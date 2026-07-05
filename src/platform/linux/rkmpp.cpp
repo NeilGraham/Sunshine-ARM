@@ -506,6 +506,25 @@ namespace rkmpp {
                             << " and no signal is locked; holding the last frame until a source appears"sv;
             recovery_logged = true;
           }
+          // The RX PHY can wedge while the device sits open and powered
+          // through a no-signal hold: cr register writes fail in a storm and
+          // lock never returns even once the source is live (observed after
+          // a boot against the switch's idle carrier followed by a console
+          // power-on — minutes of failures, then instant lock on the first
+          // open after a close). Closing the last fd runtime-suspends the
+          // hdmirx block; the replay's fresh open powers it back up with a
+          // clean PHY. So when the hold outlives any real transition, stop
+          // holding the device open — the fd<0 replay path below reopens on
+          // the normal backoff, giving a gentle open/probe/close cycle
+          // (~20 s period) until a signal locks, instead of a permanently
+          // powered, permanently wedged receiver.
+          constexpr auto NO_LOCK_POWER_CYCLE = std::chrono::seconds(20);
+          if (fd >= 0 && now - pending_since >= NO_LOCK_POWER_CYCLE) {
+            BOOST_LOG(info) << "RKMPP direct V4L2: no lock after "sv
+                            << std::chrono::duration_cast<std::chrono::seconds>(now - pending_since).count()
+                            << " s; releasing the capture device to reset the RX PHY"sv;
+            stop();
+          }
           return;
         }
         // A benign trigger (brief stall that already resolved, event for a
