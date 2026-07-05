@@ -180,10 +180,31 @@ namespace rkmpp {
     // timings support (USB capture cards), when no stable signal is present,
     // or when the timings already match.
     void sync_dv_timings() {
+      // Right after a source appears the query can fail transiently: the PHY
+      // already has lock but the AVI InfoFrame hasn't been received yet, and
+      // the vendor driver then fails the whole query (`wait avi_pkt_rcv
+      // failed`). The InfoFrame repeats every video frame, so a couple of
+      // short retries ride out the race; without them this replay adopts
+      // nothing, delivers no frames, and the fruitless-replay hold in
+      // maybe_recover_source delays the next attempt.
       v4l2_dv_timings live {};
-      if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) != 0 || live.type != V4L2_DV_BT_656_1120 ||
-          live.bt.width == 0 || live.bt.height == 0) {
-        return;  // no DV timings support, or no stable signal to latch onto
+      bool measured = false;
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt > 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        const int query_err = xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) == 0 ? 0 : errno;
+        if (query_err == ENOTTY) {
+          return;  // no DV timings support (USB capture cards)
+        }
+        if (query_err == 0 && live.type == V4L2_DV_BT_656_1120 &&
+            live.bt.width > 0 && live.bt.height > 0) {
+          measured = true;
+          break;
+        }
+      }
+      if (!measured) {
+        return;  // no stable signal to latch onto
       }
 
       const auto clock_close = [](std::uint64_t a, std::uint64_t b) {  // within 1% (59.94 vs 60 nominal)
@@ -523,28 +544,38 @@ namespace rkmpp {
       // "No frames since the replay" must be read from ever_produced (cleared
       // by stop(), set on the first presented frame) — last_frame_at is reset
       // by init() as a stall-detection grace period and always looks fresh.
+      // A real signal can also fail a replay transiently (observed: a console
+      // powering on locks the PHY a beat before its InfoFrames flow, and the
+      // whole init lands in that window), so the first few fruitless replays
+      // retry on the normal backoff; only a signal that keeps producing
+      // nothing settles into the slow hold — that persistence is what marks
+      // the idle-carrier case whose replay churn is the CMA hazard.
       constexpr auto SAME_SIGNAL_RETRY = std::chrono::seconds(30);
-      if (probe_locked && last_replay_valid && !ever_produced &&
+      constexpr int QUICK_REPLAYS = 3;  // total attempts before the slow hold
+      const auto clock_close = [](std::uint64_t a, std::uint64_t b) {
+        const auto diff = a > b ? a - b : b - a;
+        return diff * 100 <= b;
+      };
+      const bool same_fruitless_signal =
+        probe_locked && last_replay_valid && !ever_produced &&
+        probe_bt.width == last_replay_bt.width && probe_bt.height == last_replay_bt.height &&
+        probe_bt.interlaced == last_replay_bt.interlaced &&
+        (probe_bt.pixelclock == 0 || last_replay_bt.pixelclock == 0 ||
+         clock_close(probe_bt.pixelclock, last_replay_bt.pixelclock));
+      if (same_fruitless_signal && fruitless_replays >= QUICK_REPLAYS &&
           now - last_recover_at < SAME_SIGNAL_RETRY) {
-        const auto clock_close = [](std::uint64_t a, std::uint64_t b) {
-          const auto diff = a > b ? a - b : b - a;
-          return diff * 100 <= b;
-        };
-        if (probe_bt.width == last_replay_bt.width && probe_bt.height == last_replay_bt.height &&
-            probe_bt.interlaced == last_replay_bt.interlaced &&
-            (probe_bt.pixelclock == 0 || last_replay_bt.pixelclock == 0 ||
-             clock_close(probe_bt.pixelclock, last_replay_bt.pixelclock))) {
-          if (!recovery_logged) {
-            BOOST_LOG(info) << "RKMPP direct V4L2: signal "sv << probe_bt.width << 'x' << probe_bt.height
-                            << " unchanged since the last fruitless re-init; holding until it changes"sv;
-            recovery_logged = true;
-          }
-          return;
+        if (!recovery_logged) {
+          BOOST_LOG(info) << "RKMPP direct V4L2: signal "sv << probe_bt.width << 'x' << probe_bt.height
+                          << " unchanged after "sv << fruitless_replays
+                          << " fruitless re-inits; holding until it changes"sv;
+          recovery_logged = true;
         }
+        return;
       }
       last_recover_at = now;
       last_replay_bt = probe_bt;
       last_replay_valid = probe_locked;
+      fruitless_replays = same_fruitless_signal ? fruitless_replays + 1 : 1;
 
       recover_pending = false;
       BOOST_LOG(info) << "RKMPP direct V4L2: "sv
@@ -1809,6 +1840,7 @@ namespace rkmpp {
     std::chrono::steady_clock::time_point last_recover_at {};
     v4l2_bt_timings last_replay_bt {};
     bool last_replay_valid {};
+    int fruitless_replays {};
     bool recover_pending {};
     bool recovery_logged {};
   };
