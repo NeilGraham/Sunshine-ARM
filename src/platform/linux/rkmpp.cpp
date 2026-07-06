@@ -2115,7 +2115,7 @@ namespace rkmpp {
       // CPU than everything else in the pipeline combined (a 1080p60 BGR24
       // stream is ~370 MB/s of uncached reads).
       rga_buffer_handle_t imported = 0;
-      if (src.dmabuf_fd >= 0 && src.dmabuf_size > 0) {
+      if (src.dmabuf_fd >= 0 && src.dmabuf_size > 0 && rga_can_import_stride(src)) {
         imported = importbuffer_fd(src.dmabuf_fd, (int) src.dmabuf_size);
         if (!imported && !import_fail_logged) {
           BOOST_LOG(warning) << "RGA: couldn't import capture dma-buf; falling back to CPU copy"sv;
@@ -2324,6 +2324,22 @@ namespace rkmpp {
     // the BGR888 -> NV12 color-space conversion in the same pass as the scale.
     static int rga_src_format(const direct_frame_t &src) {
       return src.fourcc == V4L2_PIX_FMT_BGR24 ? RK_FORMAT_BGR_888 : RK_FORMAT_YCbCr_420_SP;
+    }
+
+    // Can RGA read this capture buffer's dma-buf IN PLACE? RGA requires a
+    // 16-pixel-aligned source width-stride. The RK3588 HDMI-RX pads some lines
+    // to a byte boundary that isn't a clean pixel stride at all: a 720px BGR24
+    // line becomes 2176 bytes = 725.33 px, and RGA rejects it ("bgr888 width
+    // stride should be 16 aligned") — improcess fails and the encoder frame is
+    // left black (this is the Wii 720x480 black-screen; PS3 1080p/720p pad to
+    // 5760/3840 = 1920/1280 px, already 16-aligned, so they import fine). When
+    // the stride isn't cleanly addressable, skip the zero-copy import and let
+    // the CPU-staging copy below repack the frame to a tight, 16-aligned width.
+    static bool rga_can_import_stride(const direct_frame_t &src) {
+      if (src.fourcc == V4L2_PIX_FMT_BGR24) {
+        return src.stride % 3 == 0 && (src.stride / 3) % 16 == 0;
+      }
+      return src.stride % 16 == 0;  // NV12/other: luma stride must be 16-aligned
     }
 
     void sync(int fd, bool start, std::uint64_t rw) {
