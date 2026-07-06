@@ -436,24 +436,90 @@ namespace rkmpp {
     // absent source retries calmly until it appears (the held last-good frame
     // is shown meanwhile — see update_latest_frame's suppression).
     void maybe_recover_source() {
-      constexpr auto STALL_AFTER = std::chrono::milliseconds(1200);
+      // The vendor rk_hdmirx driver re-locks a changed source and resumes
+      // delivery on the SAME open stream — a game launch or a mode/HDCP/audio
+      // blip is ridden out with no disruption as long as we keep the stream
+      // open (verified with a standalone probe: one held-open stream survived
+      // the exact PS3 transition that wedges a re-initing capture — 4000+
+      // frames, zero new driver errors). Tearing the stream down to "recover"
+      // is the actual hazard: stop_streaming races the DMA IRQ, force-returns
+      // the buffers ("wait last irq timeout, return bufs"), and the late IRQ
+      // then completes an already-returned buffer (the vb2_set_plane_payload
+      // overflow / done-on-freed-buffer WARN) — that corrupts the vb2 queue
+      // and, repeated against a wedged signal, hangs the whole kernel (observed
+      // console-ramoops: a 30 s STREAMOFF/STREAMON loop running straight into a
+      // watchdog reset). So recovery here is a bounded last resort, never a
+      // reflex: ride out blips on the open stream, and re-init only when frames
+      // stay gone well past any real transition — capped (episode_reinits) so a
+      // wedged driver can never drive an unbounded teardown loop.
+      constexpr auto STALL_AFTER = std::chrono::milliseconds(3000);
       constexpr auto RECOVER_BACKOFF = std::chrono::milliseconds(2500);
 
-      // A trigger latches recover_pending and stays latched until a replay
-      // runs or a probe proves the capture healthy. Consuming the trigger on
-      // a single held tick loses it: a console can change modes while frames
-      // are still flowing through the stale config (a PS3 boots at 480p and
-      // switches to 1080p at the menu — garbage frames keep the stall
-      // detector quiet, and the SOURCE_CHANGE event only fires once).
+      // Drain SOURCE_CHANGE events so the event queue can't fill, but do NOT
+      // let them trigger a re-init: the driver absorbs the change on the
+      // running stream, and re-initing on the event is precisely what wedges
+      // it. A change that genuinely stops delivery is caught by the stall path.
       if (source_events && fd >= 0) {
         v4l2_event ev {};
         while (xioctl(fd, VIDIOC_DQEVENT, &ev) == 0) {
-          recover_pending = recover_pending || ev.type == V4L2_EVENT_SOURCE_CHANGE;
+          // consumed; recovery is driven by delivery stalls, not by events
         }
       }
 
       const auto now = std::chrono::steady_clock::now();
       const bool stalled = now - last_frame_at >= STALL_AFTER;
+
+      // Frames-flowing geometry backstop. The stall trigger above only catches a
+      // source change that *stops* delivery for STALL_AFTER. A live console mode
+      // switch frequently does neither: verified on a PS3, of three real changes
+      // only the first arrived as a SOURCE_CHANGE event — the two game<->game
+      // switches posted NO event and never stalled; frames simply kept flowing
+      // at the new geometry into buffers still sized for the old one (stride
+      // garbage / green bars, or a CMA overrun when the new mode is larger). So
+      // while frames ARE flowing, periodically re-measure the live geometry and,
+      // if it no longer matches what our buffers are sized for, drive the same
+      // recover path — the existing settle+reinit below then adopts it with
+      // exactly one renegotiation.
+      //
+      // The QUERY is gated on frames actively flowing: a QUERY_DV_TIMINGS
+      // against a dark/unlocked PHY makes the driver re-run controller_init and
+      // storm `cr write done failed`, and sustained that wedges the receiver.
+      // Frames flowing == a healthy locked PHY == the only safe time to probe
+      // (the no-signal hold path owns the dark case), so we never poll a dark
+      // input from here.
+      constexpr auto BACKSTOP_EVERY = std::chrono::milliseconds(2000);
+      constexpr auto FRAMES_FRESH = std::chrono::milliseconds(1000);
+      if (fd >= 0 && streaming && !stalled && !recover_pending && width > 0 && height > 0 &&
+          now - last_frame_at < FRAMES_FRESH && now - last_backstop_at >= BACKSTOP_EVERY) {
+        last_backstop_at = now;
+        v4l2_dv_timings live {};
+        if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) == 0 &&
+            live.type == V4L2_DV_BT_656_1120 && live.bt.width > 0 && live.bt.height > 0 &&
+            (static_cast<int>(live.bt.width) != width || static_cast<int>(live.bt.height) != height)) {
+          const bool grow = static_cast<int>(live.bt.width) > width ||
+                            static_cast<int>(live.bt.height) > height;
+          BOOST_LOG(info) << "RKMPP direct V4L2: live signal "sv << live.bt.width << 'x' << live.bt.height
+                          << " differs from the negotiated "sv << width << 'x' << height
+                          << " while frames flow (no stall, no event); renegotiating"sv
+                          << (grow ? " (grow: halting DMA first to avoid a buffer overrun)"sv : ""sv);
+          // GROW: the driver DMAs the larger frame into our smaller buffers with
+          // no size clamp — a CMA overrun. STREAMOFF now (we are in the safe
+          // frames-flowing window, so the frame IRQ acks the stop cleanly) to
+          // halt DMA before it can overrun; the reinit rebuilds the queue at the
+          // new size. Buffers stay mapped, so the held last-good frame keeps
+          // showing until then. A shrink/same-size change is contained (garbage,
+          // not corruption), so ride the open stream through to the reinit.
+          if (grow) {
+            int type = buf_type();
+            xioctl(fd, VIDIOC_STREAMOFF, &type);
+            streaming = false;
+          }
+          pending_since = now;
+          recover_pending = true;
+          recovery_logged = false;  // let the recover path log its progress afresh
+        }
+      }
+
       const bool was_pending = recover_pending;
       recover_pending = recover_pending || stalled;
       if (!recover_pending) {
@@ -500,6 +566,7 @@ namespace rkmpp {
           probe_bt = live.bt;
         }
         if (!locked && query_err != ENOTTY) {
+          locked_since = {};  // lock lost: restart the settle timer when it returns
           if (!recovery_logged) {
             BOOST_LOG(info) << "RKMPP direct V4L2: "sv
                             << (stalled ? "capture stalled"sv : "source change reported"sv)
@@ -529,8 +596,12 @@ namespace rkmpp {
         }
         // A benign trigger (brief stall that already resolved, event for a
         // change the driver absorbed): frames are flowing and the locked
-        // signal matches what we're configured for — nothing to replay.
-        if (locked && !stalled) {
+        // signal matches what we're configured for — nothing to replay. Only
+        // when still streaming: if the grow backstop above already halted the
+        // stream, a signal that settled back to the old geometry (a momentary
+        // grow-blip) still needs one reinit to restart delivery, so fall
+        // through to the replay rather than clearing pending on a dead stream.
+        if (locked && !stalled && streaming) {
           const auto clock_close = [](std::uint64_t a, std::uint64_t b) {
             const auto diff = a > b ? a - b : b - a;
             return diff * 100 <= b;
@@ -541,6 +612,31 @@ namespace rkmpp {
               cur.bt.interlaced == live.bt.interlaced &&
               (live.bt.pixelclock == 0 || clock_close(live.bt.pixelclock, cur.bt.pixelclock))) {
             recover_pending = false;
+            locked_since = {};
+            return;
+          }
+        }
+
+        // Ride out an unstable lock before tearing anything down. A console
+        // changing video mode (or the HDCP re-auth that rides along) makes the
+        // PHY drop and re-acquire lock over a beat; the query can report locked
+        // mid-relock while the capture pipeline isn't actually delivering yet.
+        // Re-initing there is the whole failure: STREAMON yields no frame, the
+        // following STREAMOFF times out waiting for an IRQ that never comes
+        // (`wait last irq timeout`), and that start/stop churn is what drives
+        // the RX PHY into its `cr write done failed` storm — black until a
+        // reboot. So require the lock to hold steady for a beat first; while it
+        // settles the running stream is left alone to resume delivery on its
+        // own (the vendor driver re-locks a changed source internally), and the
+        // held last-good frame stays up. A genuine resolution change still
+        // needs one re-init to renegotiate buffers, but exactly one, against a
+        // signal that has stopped moving.
+        constexpr auto LOCK_SETTLE = std::chrono::milliseconds(1000);
+        if (locked) {
+          if (locked_since.time_since_epoch().count() == 0) {
+            locked_since = now;
+          }
+          if (now - locked_since < LOCK_SETTLE) {
             return;
           }
         }
@@ -557,20 +653,17 @@ namespace rkmpp {
       // in a loop against such a signal is the CMA alloc/free churn the
       // no-signal hold exists to prevent. If the last replay produced no
       // frames and the live signal hasn't changed since, hold — probing stays
-      // cheap, and a console powering on changes the timings, which unblocks
-      // the replay immediately. A slow retry remains as a safety net so a
-      // transiently failed init against a real signal can't hold forever.
-      // "No frames since the replay" must be read from ever_produced (cleared
-      // by stop(), set on the first presented frame) — last_frame_at is reset
-      // by init() as a stall-detection grace period and always looks fresh.
-      // A real signal can also fail a replay transiently (observed: a console
-      // powering on locks the PHY a beat before its InfoFrames flow, and the
-      // whole init lands in that window), so the first few fruitless replays
-      // retry on the normal backoff; only a signal that keeps producing
-      // nothing settles into the slow hold — that persistence is what marks
-      // the idle-carrier case whose replay churn is the CMA hazard.
+      // cheap, and a console powering on or switching modes changes the
+      // timings, which breaks the hold immediately. A slow retry remains as a
+      // safety net so a transiently failed init against a real signal can't
+      // hold forever. "No frames since the replay" must be read from
+      // ever_produced (cleared by stop(), set on the first presented frame) —
+      // last_frame_at is reset by init() as a stall-detection grace period and
+      // always looks fresh. The LOCK_SETTLE gate above already keeps us from
+      // re-initing against a still-settling signal, so a fruitless replay here
+      // means the signal is locked-but-unusable (the idle carrier S_DV_TIMINGS
+      // rejects): don't retry it on the fast backoff — one re-init, then hold.
       constexpr auto SAME_SIGNAL_RETRY = std::chrono::seconds(30);
-      constexpr int QUICK_REPLAYS = 3;  // total attempts before the slow hold
       const auto clock_close = [](std::uint64_t a, std::uint64_t b) {
         const auto diff = a > b ? a - b : b - a;
         return diff * 100 <= b;
@@ -581,25 +674,44 @@ namespace rkmpp {
         probe_bt.interlaced == last_replay_bt.interlaced &&
         (probe_bt.pixelclock == 0 || last_replay_bt.pixelclock == 0 ||
          clock_close(probe_bt.pixelclock, last_replay_bt.pixelclock));
-      if (same_fruitless_signal && fruitless_replays >= QUICK_REPLAYS &&
-          now - last_recover_at < SAME_SIGNAL_RETRY) {
+      if (same_fruitless_signal && now - last_recover_at < SAME_SIGNAL_RETRY) {
         if (!recovery_logged) {
           BOOST_LOG(info) << "RKMPP direct V4L2: signal "sv << probe_bt.width << 'x' << probe_bt.height
-                          << " unchanged after "sv << fruitless_replays
-                          << " fruitless re-inits; holding until it changes"sv;
+                          << " unchanged since the last fruitless re-init; holding until it changes"sv;
           recovery_logged = true;
         }
         return;
       }
+
+      // The absolute backstop against the kernel-hang loop: a signal that keeps
+      // *changing* slips past same_fruitless_signal, so cap total re-inits per
+      // dark episode. Once we've torn down a few times without a single frame
+      // coming back, the driver is wedged and more STREAMOFF/STREAMON only
+      // deepens the corruption (and risks the watchdog reset) — stop tearing
+      // down and hold the last frame. episode_reinits resets to 0 the instant a
+      // real frame is delivered (update_latest_frame), so healthy recovery is
+      // untouched; only a genuinely stuck receiver reaches the cap, and it then
+      // waits quietly for the signal to come back on its own instead of
+      // hammering the device.
+      constexpr int MAX_EPISODE_REINITS = 3;
+      if (!ever_produced && episode_reinits >= MAX_EPISODE_REINITS) {
+        if (!recovery_logged) {
+          BOOST_LOG(warning) << "RKMPP direct V4L2: capture still dark after "sv << episode_reinits
+                             << " re-inits; holding without further teardown to avoid wedging the receiver"sv;
+          recovery_logged = true;
+        }
+        return;
+      }
+
       last_recover_at = now;
       last_replay_bt = probe_bt;
       last_replay_valid = probe_locked;
-      fruitless_replays = same_fruitless_signal ? fruitless_replays + 1 : 1;
+      ++episode_reinits;
 
       recover_pending = false;
-      BOOST_LOG(info) << "RKMPP direct V4L2: "sv
-                      << (stalled ? "capture stalled"sv : "source change reported"sv)
-                      << "; re-initializing capture"sv;
+      locked_since = {};
+      BOOST_LOG(info) << "RKMPP direct V4L2: capture stalled; re-initializing capture (attempt "sv
+                      << episode_reinits << ")"sv;
       recovery_logged = true;
       const auto device = dev_path;
       stop();
@@ -661,6 +773,7 @@ namespace rkmpp {
       if (have_latest) {
         last_frame_at = std::chrono::steady_clock::now();
         recovery_logged = false;
+        episode_reinits = 0;  // a real frame ends the dark episode; re-arm recovery
         auto *src = (const std::uint8_t *) buffers[latest.index].start;
         if (is_mjpeg) {
           // Decoded into the CPU latest_frame; the capture buffer is free now.
@@ -1857,11 +1970,22 @@ namespace rkmpp {
     std::chrono::steady_clock::time_point pending_since {};
     std::chrono::steady_clock::time_point last_probe_at {};
     std::chrono::steady_clock::time_point last_recover_at {};
+    // Throttles the frames-flowing geometry backstop (maybe_recover_source): a
+    // slow QUERY_DV_TIMINGS while frames flow that catches a live mode change
+    // which posts no SOURCE_CHANGE event and never stalls delivery.
+    std::chrono::steady_clock::time_point last_backstop_at {};
+    // When the current recovery episode first saw a steadily-locked signal;
+    // gates the settle delay before a re-init (see maybe_recover_source's
+    // LOCK_SETTLE). Reset whenever lock is lost or the episode resolves.
+    std::chrono::steady_clock::time_point locked_since {};
     v4l2_bt_timings last_replay_bt {};
     bool last_replay_valid {};
-    int fruitless_replays {};
     bool recover_pending {};
     bool recovery_logged {};
+    // Per-dark-episode re-init counter; caps STREAMOFF/STREAMON teardowns so a
+    // wedged receiver can't drive the unbounded loop that hangs the kernel.
+    // Reset to 0 the moment a real frame is delivered.
+    int episode_reinits {};
   };
 
 #ifdef SUNSHINE_BUILD_RGA
