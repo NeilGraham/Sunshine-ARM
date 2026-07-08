@@ -413,6 +413,23 @@ namespace rkmpp {
 
       streaming = true;
 
+      // Record the live signal geometry we just negotiated against, so the
+      // frames-flowing backstop can tell an intentional capture<signal
+      // sub-window (source bigger than the stream size) apart from a real
+      // source change. Read from the driver (QUERY reflects the locked signal);
+      // fall back to the capture geometry if it can't report timings.
+      {
+        v4l2_dv_timings sig {};
+        if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &sig) == 0 &&
+            sig.type == V4L2_DV_BT_656_1120 && sig.bt.width > 0 && sig.bt.height > 0) {
+          signal_width = (int) sig.bt.width;
+          signal_height = (int) sig.bt.height;
+        } else {
+          signal_width = this->width;
+          signal_height = this->height;
+        }
+      }
+
       // Session marker for retro-web: while this exists (and the PID inside is
       // alive), the capture device belongs to the live stream and screenshots
       // must go through the request-file handshake, never the device.
@@ -512,15 +529,23 @@ namespace rkmpp {
       // input from here.
       constexpr auto BACKSTOP_EVERY = std::chrono::milliseconds(2000);
       constexpr auto FRAMES_FRESH = std::chrono::milliseconds(1000);
+      // Compare the live signal against the geometry we last adopted the signal
+      // AT, not the capture buffer size — see signal_width/height. Equal to
+      // width/height in the common case (capture == signal), so console mode
+      // switches still trigger exactly one renegotiation; different only when we
+      // are deliberately capturing a sub-window of an oversized source, where
+      // re-triggering would loop forever.
+      const int ref_w = signal_width > 0 ? signal_width : width;
+      const int ref_h = signal_height > 0 ? signal_height : height;
       if (fd >= 0 && streaming && !stalled && !recover_pending && width > 0 && height > 0 &&
           now - last_frame_at < FRAMES_FRESH && now - last_backstop_at >= BACKSTOP_EVERY) {
         last_backstop_at = now;
         v4l2_dv_timings live {};
         if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) == 0 &&
             live.type == V4L2_DV_BT_656_1120 && live.bt.width > 0 && live.bt.height > 0 &&
-            (static_cast<int>(live.bt.width) != width || static_cast<int>(live.bt.height) != height)) {
-          const bool grow = static_cast<int>(live.bt.width) > width ||
-                            static_cast<int>(live.bt.height) > height;
+            (static_cast<int>(live.bt.width) != ref_w || static_cast<int>(live.bt.height) != ref_h)) {
+          const bool grow = static_cast<int>(live.bt.width) > ref_w ||
+                            static_cast<int>(live.bt.height) > ref_h;
           BOOST_LOG(info) << "RKMPP direct V4L2: live signal "sv << live.bt.width << 'x' << live.bt.height
                           << " differs from the negotiated "sv << width << 'x' << height
                           << " while frames flow (no stall, no event); renegotiating"sv
@@ -1078,6 +1103,18 @@ namespace rkmpp {
     int height {};
 
   private:
+    // The signal geometry QUERY_DV_TIMINGS reported at the last (re)init, which
+    // is NOT always the capture geometry (width/height): on a source larger than
+    // the requested stream size the driver hands us a smaller sub-window, so
+    // width<signal. The frames-flowing backstop must fire on a genuine *signal*
+    // change, not on that intentional capture!=signal gap — comparing the live
+    // signal against width there re-triggers a "grow" every tick forever (an
+    // unbounded STREAMOFF/STREAMON loop, and the teardown churn that can wedge
+    // the driver). Compare against these instead; 0 means "unknown, fall back to
+    // width/height" (preserves the pre-existing behaviour for USB/no-DV cards).
+    int signal_width {};
+    int signal_height {};
+
     struct buffer_t {
       void *start {};
       std::size_t length {};
@@ -1135,6 +1172,8 @@ namespace rkmpp {
       latest_ptr = nullptr;
       held_index = -1;
       ever_produced = false;
+      signal_width = 0;
+      signal_height = 0;
     }
 
     void copy_nv12(const std::uint8_t *src, AVFrame *dst, int dst_width, int dst_height) {
