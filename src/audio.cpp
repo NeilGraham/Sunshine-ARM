@@ -3,13 +3,23 @@
  * @brief Definitions for audio capture and encoding.
  */
 // standard includes
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <string>
 #include <thread>
+#include <utility>
 
 // lib includes
 #include <opus/opus_multistream.h>
 
 // local includes
 #include "audio.h"
+#include "audio_gate.h"
 #include "config.h"
 #include "globals.h"
 #include "logging.h"
@@ -219,6 +229,59 @@ namespace audio {
 
     int samples_per_frame = frame_size * stream.channelCount;
 
+    // --- Audio gate: squelch the HDMI-RX FIFO-dump click (see audio_gate.h) ---
+    // The rk_hdmirx audio FIFO re-inits on every source re-lock and dumps a
+    // full-scale burst (measured peak ~0.97 FS). rkmpp.cpp arms audio_gate for
+    // the transitions it can see; here we ramp/zero the PCM across an armed
+    // gate and self-detect same-geometry re-inits rkmpp never sees.
+    //
+    // Env tunables, read once at capture start:
+    //   SUNSHINE_AUDIO_GATE     off/0 disables the whole gate (default on)
+    //   SUNSHINE_AUDIO_GATE_MS  reneg-trigger squelch duration (default 500)
+    //   SUNSHINE_AUDIO_TAP=path append post-gate audio as s16le (debug)
+    const auto env_val = [](const char *name) -> const char * {
+      const char *v = std::getenv(name);
+      return (v && *v) ? v : nullptr;
+    };
+    bool gate_enabled = true;
+    if (const char *v = env_val("SUNSHINE_AUDIO_GATE")) {
+      gate_enabled = !(std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0);
+    }
+    if (const char *v = env_val("SUNSHINE_AUDIO_GATE_MS")) {
+      int ms = std::atoi(v);
+      if (ms > 0) {
+        audio_gate::reneg_ms.store(ms, std::memory_order_relaxed);
+      }
+    }
+    std::FILE *tap = nullptr;
+    if (const char *path = env_val("SUNSHINE_AUDIO_TAP")) {
+      tap = std::fopen(path, "ab");
+      BOOST_LOG(info) << "audio gate: post-gate tap "sv << (tap ? "open -> "sv : "FAILED to open "sv) << path;
+    }
+    BOOST_LOG(info) << "audio gate: "sv << (gate_enabled ? "enabled"sv : "disabled"sv)
+                    << " (reneg squelch "sv << audio_gate::reneg_ms.load(std::memory_order_relaxed) << " ms)"sv;
+
+    // ~10 ms raised-cosine edge ramp, applied only at gate entry/exit; the
+    // middle of an armed gate is hard silence. gate_phase in [0,1] is
+    // "openness" and the applied gain is a raised cosine of it.
+    const int ramp_frames = std::max(1, stream.sampleRate / 100);  // 10 ms of per-channel frames
+    const double ramp_step = 1.0 / ramp_frames;
+    double gate_phase = 1.0;  // fully open
+    const int channels = std::max(1, stream.channelCount);
+
+    // Rolling ~200 ms RMS across frames for the squelch heuristic.
+    const int rms_window_frames = std::max(1, 200 / std::max(1, config.packetDuration));
+    std::deque<std::pair<double, long long>> rms_ring;  // (sum-of-squares, sample count) per frame
+    double rms_sumsq = 0.0;
+    long long rms_count = 0;
+    std::uint64_t squelch_count = 0;
+
+    auto fg_tap = util::fail_guard([&tap]() {
+      if (tap) {
+        std::fclose(tap);
+      }
+    });
+
     while (!shutdown_event->peek()) {
       std::vector<float> sample_buffer;
       sample_buffer.resize(samples_per_frame);
@@ -241,6 +304,82 @@ namespace audio {
           continue;
         default:
           return;
+      }
+
+      if (gate_enabled) {
+        // Per-frame stats (from the raw, pre-gate samples).
+        float peak = 0.0f;
+        double frame_sumsq = 0.0;
+        for (float s : sample_buffer) {
+          const float a = std::fabs(s);
+          if (a > peak) {
+            peak = a;
+          }
+          frame_sumsq += static_cast<double>(s) * s;
+        }
+
+        bool gate_now = audio_gate::active();
+
+        // Squelch heuristic: a near-silent recent window (< ~-60 dBFS) with a
+        // sudden full-scale spike is the FIFO-dump click on a re-init rkmpp
+        // never sees (e.g. a same-geometry menu->Apollo relock). Evaluate the
+        // rolling RMS over PRIOR frames (before folding in this one) so the
+        // spike can't mask its own quiet lead-in.
+        const double rolling_rms = rms_count > 0 ? std::sqrt(rms_sumsq / static_cast<double>(rms_count)) : 0.0;
+        bool heuristic_zero = false;
+        if (!gate_now && rolling_rms < 1e-3 && peak > 0.97f) {
+          audio_gate::trigger(300);
+          gate_now = true;
+          heuristic_zero = true;  // sacrifice this whole click frame
+          gate_phase = 0.0;       // jump closed: a smooth fade can't outrun the click already in-frame
+          ++squelch_count;
+          BOOST_LOG(info) << "audio gate: squelch triggered (n="sv << squelch_count
+                          << ", peak="sv << peak << ", rolling_rms="sv << rolling_rms << ")"sv;
+        }
+
+        // Advance the rolling RMS window with this frame's energy.
+        rms_ring.emplace_back(frame_sumsq, static_cast<long long>(sample_buffer.size()));
+        rms_sumsq += frame_sumsq;
+        rms_count += static_cast<long long>(sample_buffer.size());
+        while (static_cast<int>(rms_ring.size()) > rms_window_frames) {
+          rms_sumsq -= rms_ring.front().first;
+          rms_count -= rms_ring.front().second;
+          rms_ring.pop_front();
+        }
+
+        // Apply the envelope. A heuristic hit hard-zeros the frame; otherwise
+        // ramp gate_phase toward the target (0 closed / 1 open) one step per
+        // per-channel frame, with a raised-cosine gain. Untouched when fully
+        // open and no gate is armed.
+        if (heuristic_zero) {
+          std::fill(sample_buffer.begin(), sample_buffer.end(), 0.0f);
+        } else if (gate_now || gate_phase < 1.0) {
+          const double target = gate_now ? 0.0 : 1.0;
+          for (size_t i = 0; i < sample_buffer.size(); i += channels) {
+            if (gate_phase < target) {
+              gate_phase = std::min(target, gate_phase + ramp_step);
+            } else if (gate_phase > target) {
+              gate_phase = std::max(target, gate_phase - ramp_step);
+            }
+            const float gain = static_cast<float>(0.5 * (1.0 - std::cos(M_PI * gate_phase)));
+            for (int c = 0; c < channels && i + static_cast<size_t>(c) < sample_buffer.size(); ++c) {
+              sample_buffer[i + c] *= gain;
+            }
+          }
+        }
+      }
+
+      if (tap) {
+        // The only observation point downstream of the gate. s16le, clamped;
+        // best-effort, never fails capture.
+        std::vector<std::int16_t> pcm;
+        pcm.reserve(sample_buffer.size());
+        for (float s : sample_buffer) {
+          float v = s * 32767.0f;
+          v = std::min(32767.0f, std::max(-32768.0f, v));
+          pcm.push_back(static_cast<std::int16_t>(std::lrintf(v)));
+        }
+        std::fwrite(pcm.data(), sizeof(std::int16_t), pcm.size(), tap);
       }
 
       samples->raise(std::move(sample_buffer));

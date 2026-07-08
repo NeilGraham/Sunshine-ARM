@@ -63,6 +63,7 @@ extern "C" {
 #endif
 
 // local includes
+#include "src/audio_gate.h"
 #include "graphics.h"
 #include "misc.h"
 #include "rkmpp.h"
@@ -277,6 +278,10 @@ namespace rkmpp {
                       << (pick.bt.interlaced ? 'i' : 'p')
                       << " pixelclock "sv << pick.bt.pixelclock
                       << (have_cur ? " (driver held stale timings)"sv : ""sv);
+      // A timings adoption means the RX just re-locked the source, which makes
+      // its audio FIFO re-init and dump a full-scale click. Squelch audio
+      // across the transition (see audio_gate.h).
+      audio_gate::trigger(audio_gate::reneg_ms.load(std::memory_order_relaxed));
     }
 
     bool init(const char *device, int width, int height, int fps) {
@@ -565,6 +570,9 @@ namespace rkmpp {
           pending_since = now;
           recover_pending = true;
           recovery_logged = false;  // let the recover path log its progress afresh
+          // A live geometry change forces a renegotiation (and the RX audio
+          // FIFO re-inits with it) — squelch the click across it.
+          audio_gate::trigger(audio_gate::reneg_ms.load(std::memory_order_relaxed));
         }
       }
 
@@ -781,6 +789,10 @@ namespace rkmpp {
       BOOST_LOG(info) << "RKMPP direct V4L2: capture stalled; re-initializing capture (attempt "sv
                       << episode_reinits << ")"sv;
       recovery_logged = true;
+      // A full replay re-locks the source and re-inits the RX audio FIFO (the
+      // click). Squelch across it; init()'s own sync_dv_timings() adoption may
+      // extend this, which is fine (extend-don't-shorten).
+      audio_gate::trigger(audio_gate::reneg_ms.load(std::memory_order_relaxed));
       const auto device = dev_path;
       stop();
       if (!init(device.c_str(), req_width, req_height, req_fps)) {
