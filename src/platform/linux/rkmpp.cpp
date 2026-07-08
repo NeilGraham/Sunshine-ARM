@@ -330,6 +330,29 @@ namespace rkmpp {
       parm.parm.capture.timeperframe.denominator = fps;
       xioctl(fd, VIDIOC_S_PARM, &parm);
 
+      // Never STREAMON without a locked signal. The vendor driver's
+      // start_streaming spins its lock-retry loop against a dark PHY, gives
+      // up, and runs the same internal stop a teardown does — STREAMOFF racing
+      // a DMA IRQ that never comes (`stream start stopping` -> `wait last irq
+      // timeout, return bufs`), the exact vb2/PHY corruption documented in
+      // maybe_recover_source (observed twice in the minute before the
+      // 2026-07-07 hard kernel hang, reached from here via the no-lock PHY
+      // power-cycle -> reopen replay). Defer instead: keep the fd open (event
+      // subscription and probing keep working, and the no-lock hold owns the
+      // wait) and let the replay that runs once the signal locks and settles
+      // do the buffer setup and STREAMON. USB capture cards can't report lock
+      // (ENOTTY) and don't have the race — start those unconditionally.
+      {
+        v4l2_dv_timings live {};
+        const int query_err = xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &live) == 0 ? 0 : errno;
+        const bool locked = query_err == 0 && live.type == V4L2_DV_BT_656_1120 &&
+                            live.bt.width > 0 && live.bt.height > 0;
+        if (!locked && query_err != ENOTTY) {
+          BOOST_LOG(info) << "RKMPP direct V4L2: no locked signal; deferring buffer setup and stream start until a source locks"sv;
+          return true;  // deferred: fd stays open, streaming stays false; the stall path replays on lock
+        }
+      }
+
       v4l2_requestbuffers req {};
       req.count = 4;
       req.type = buf_type();
@@ -703,6 +726,26 @@ namespace rkmpp {
         return;
       }
 
+      // One fruitless re-init against a locked signal means the receiver is
+      // wedged past what STREAMOFF/STREAMON can fix: after a stop that raced
+      // the dark DMA queue (`wait last irq timeout`), every later STREAMON
+      // succeeds and delivers nothing (observed 2026-07-07 entering Apollo
+      // Save Tool: 3 re-inits, all dark; a service restart — i.e. a close and
+      // fresh open — healed it instantly). Escalate to that heal directly:
+      // close the device so the RX block runtime-suspends, and let the fd<0
+      // replay on the next backoff tick reopen it fresh, instead of burning
+      // the remaining episode attempts on more racy stops. Gated behind
+      // same_fruitless_signal above, so an idle carrier still holds for
+      // SAME_SIGNAL_RETRY between heals rather than churning CMA.
+      if (fd >= 0 && probe_locked && !ever_produced && episode_reinits >= 1) {
+        BOOST_LOG(info) << "RKMPP direct V4L2: capture still dark after a re-init on a locked signal; "
+                           "closing the device to reset the receiver before retrying"sv;
+        last_recover_at = now;
+        recovery_logged = true;
+        stop();
+        return;
+      }
+
       last_recover_at = now;
       last_replay_bt = probe_bt;
       last_replay_valid = probe_locked;
@@ -717,6 +760,10 @@ namespace rkmpp {
       stop();
       if (!init(device.c_str(), req_width, req_height, req_fps)) {
         stop();  // failed part-way: release the fd so the next attempt starts clean
+      } else if (!streaming) {
+        // init() deferred STREAMON (no locked signal): nothing was torn down,
+        // so hand the episode attempt back — the cap budgets real teardowns.
+        --episode_reinits;
       }
     }
 
