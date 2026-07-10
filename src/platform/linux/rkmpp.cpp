@@ -751,12 +751,39 @@ namespace rkmpp {
       // hammering the device.
       constexpr int MAX_EPISODE_REINITS = 3;
       if (!ever_produced && episode_reinits >= MAX_EPISODE_REINITS) {
-        if (!recovery_logged) {
-          BOOST_LOG(warning) << "RKMPP direct V4L2: capture still dark after "sv << episode_reinits
-                             << " re-inits; holding without further teardown to avoid wedging the receiver"sv;
-          recovery_logged = true;
+        // The cap must not outlive the fault it guards against. A console
+        // powering back on (or switching modes) presents a freshly, stably
+        // locked signal whose geometry differs from the one that burned the
+        // budget — for it same_fruitless_signal is false. Grant that signal
+        // exactly one more attempt (and a slow safety-net retry even for a
+        // same-geometry wedge) so recovery can never be blocked forever, while
+        // a signal that keeps re-locking the *same* dead geometry still holds
+        // (same_fruitless_signal true, already LOCK_SETTLE-paced) — the
+        // anti-churn guarantee the cap exists for is preserved. Record the
+        // current signal as the last replay so an immediate re-failure on it is
+        // recognised as same_fruitless_signal on the next tick and re-held.
+        constexpr auto CAP_SAFETY_RETRY = std::chrono::minutes(5);
+        const bool cap_escape_disabled = fault_hook_mode == 2;  // test-only: show the pre-fix wedge
+        const bool new_locked_signal = probe_locked && !same_fruitless_signal;
+        if (!cap_escape_disabled &&
+            (new_locked_signal || now - last_recover_at >= CAP_SAFETY_RETRY)) {
+          BOOST_LOG(info) << "RKMPP direct V4L2: "sv
+                          << (new_locked_signal ? "new stable lock "sv : "safety-net retry "sv)
+                          << probe_bt.width << 'x' << probe_bt.height
+                          << " after the re-init cap; re-arming one recovery attempt"sv;
+          episode_reinits = MAX_EPISODE_REINITS - 1;
+          last_replay_bt = probe_bt;
+          last_replay_valid = probe_locked;
+          recovery_logged = false;
+          // fall through to the recovery ladder below (escalation-close / re-init)
+        } else {
+          if (!recovery_logged) {
+            BOOST_LOG(warning) << "RKMPP direct V4L2: capture still dark after "sv << episode_reinits
+                               << " re-inits; holding without further teardown to avoid wedging the receiver"sv;
+            recovery_logged = true;
+          }
+          return;
         }
-        return;
       }
 
       // One fruitless re-init against a locked signal means the receiver is
@@ -850,6 +877,19 @@ namespace rkmpp {
       // evidence of health, and a benign trigger is cleared by the probe
       // before this suppression is ever visible.
       if (have_latest && recover_pending) {
+        requeue_buffer(latest.index);
+        have_latest = false;
+      }
+
+      // Test-only fault injection: simulate a locked-but-frameless idle carrier
+      // (a console powered off behind an HDMI splitter) by dropping delivered
+      // frames while the trigger file exists. last_frame_at stays stale, so the
+      // stall detector fires, recovery re-inits, and — since frames are still
+      // dropped — the episode-reinit cap engages: the exact console-power-cycle
+      // wedge, reproducible on the loopback. Gated behind SUNSHINE_RKMPP_FAULT_HOOK
+      // so production never stats the file.
+      if (fault_hook_mode >= 1 && have_latest &&
+          access("/run/sunshine-fault-dark", F_OK) == 0) {
         requeue_buffer(latest.index);
         have_latest = false;
       }
@@ -2084,6 +2124,16 @@ namespace rkmpp {
     // wedged receiver can't drive the unbounded loop that hangs the kernel.
     // Reset to 0 the moment a real frame is delivered.
     int episode_reinits {};
+    // Test-only fault injection (SUNSHINE_RKMPP_FAULT_HOOK), read once at
+    // construction: 0 = off/production; 1 = drop delivered frames while
+    // /run/sunshine-fault-dark exists (reproduces the locked-but-frameless idle
+    // carrier); 2 = as 1 but also disable the episode-cap escape, to demonstrate
+    // the pre-fix hold-forever wedge in a fail-then-pass gate. The per-frame
+    // access() is skipped entirely unless mode >= 1, so production pays nothing.
+    int fault_hook_mode = [] {
+      const char *v = std::getenv("SUNSHINE_RKMPP_FAULT_HOOK");
+      return v ? std::atoi(v) : 0;
+    }();
   };
 
 #ifdef SUNSHINE_BUILD_RGA
