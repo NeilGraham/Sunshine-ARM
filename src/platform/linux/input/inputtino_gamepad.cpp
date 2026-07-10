@@ -165,9 +165,13 @@ namespace platf::gamepad {
               feedback_queue->raise(gamepad_feedback_msg_t::make_adaptive_triggers(idx, trigger_effect.event_flags, trigger_effect.type_left, trigger_effect.type_right, trigger_effect.left, trigger_effect.right));
             });
 
-            // Activate the motion sensors
-            feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.clientRelativeIndex, LI_MOTION_TYPE_ACCEL, 100));
-            feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.clientRelativeIndex, LI_MOTION_TYPE_GYRO, 100));
+            // Activate the motion sensors. 250 Hz instead of upstream's 100:
+            // the client throttles to whatever we request (and hardware-caps
+            // below it), and a shorter batching period means fresher motion at
+            // every downstream sampling point — the forwarded DS3 sixaxis path
+            // is latency-sensitive (see retro-stream profiles/sixaxis.rs).
+            feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.clientRelativeIndex, LI_MOTION_TYPE_ACCEL, 250));
+            feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.clientRelativeIndex, LI_MOTION_TYPE_GYRO, 250));
 
             gamepad->joypad = std::make_unique<joypads_t>(std::move(*ds5));
             raw->gamepads[id.globalIndex] = std::move(gamepad);
