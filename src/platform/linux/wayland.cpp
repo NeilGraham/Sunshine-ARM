@@ -2,9 +2,6 @@
  * @file src/platform/linux/wayland.cpp
  * @brief Definitions for Wayland capture.
  */
-// standard includes
-#include <cstdlib>
-
 // platform includes
 #include <drm_fourcc.h>
 #include <fcntl.h>
@@ -15,6 +12,9 @@
 #include <wayland-util.h>
 #include <xf86drm.h>
 
+// lib includes
+#include <lizardbyte/common/env.h>
+
 // local includes
 #include "graphics.h"
 #include "src/logging.h"
@@ -23,7 +23,7 @@
 #include "src/utility.h"
 #include "wayland.h"
 
-extern const wl_interface wl_output_interface;
+extern const wl_interface wl_output_interface;  ///< Wayland output interface.
 
 using namespace std::literals;
 
@@ -40,6 +40,10 @@ namespace wl {
     return ((*reinterpret_cast<T *>(data)).*m)(params...);
   }
 
+/**
+ * @def CLASS_CALL(c, m)
+ * @brief Macro for CLASS CALL.
+ */
 #define CLASS_CALL(c, m) classCall<c, decltype(&c::m), &c::m>
 
   // Define buffer params listener
@@ -49,8 +53,11 @@ namespace wl {
   };
 
   int display_t::init(const char *display_name) {
+    std::string env_display_name;
     if (!display_name) {
-      display_name = std::getenv("WAYLAND_DISPLAY");
+      if (lizardbyte::common::get_env("WAYLAND_DISPLAY", env_display_name)) {
+        display_name = env_display_name.c_str();
+      }
     }
 
     if (!display_name) {
@@ -546,6 +553,9 @@ namespace wl {
     std::fill_n(sd.fds, 4, -1);
   };
 
+  /**
+   * @brief Refresh the monitor list reported by the display server.
+   */
   std::vector<std::unique_ptr<monitor_t>> monitors(const char *display_name) {
     display_t display;
 
@@ -578,6 +588,9 @@ namespace wl {
     return display.init() == 0;
   }
 
+  /**
+   * @brief Initialize Wayland registry interfaces required for capture.
+   */
   int init() {
     static bool validated = validate();
 

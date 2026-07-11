@@ -2786,7 +2786,7 @@ namespace rkmpp {
 
       if (direct_v4l2) {
         BOOST_LOG(info) << "Using RKMPP direct V4L2 encode path"sv;
-        auto nv12_opt = egl::create_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
+        auto nv12_opt = egl::create_nv12_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
         if (!nv12_opt) {
           return -1;
         }
@@ -2822,12 +2822,12 @@ namespace rkmpp {
         BOOST_LOG(info) << "Using RKMPP GPU-convert + read-back encode path"sv;
 
         // Native NV12 render target the GPU converts into.
-        auto nv12_opt = egl::create_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
+        auto nv12_opt = egl::create_nv12_target(frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
         if (!nv12_opt) {
           return -1;
         }
 
-        auto sws_opt = egl::sws_t::make(width, height, frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12);
+        auto sws_opt = egl::sws_t::make(width, height, frame->width, frame->height, (AVPixelFormat) AV_PIX_FMT_NV12, false);
         if (!sws_opt) {
           return -1;
         }
@@ -2841,7 +2841,7 @@ namespace rkmpp {
 
     void apply_colorspace() override {
       if (!direct_v4l2) {
-        sws.apply_colorspace(colorspace);
+        sws.apply_colorspace(colorspace, false);
       }
     }
 
@@ -2994,7 +2994,7 @@ namespace rkmpp {
       }
 
       if (offset_x || offset_y) {
-        sws.load_vram(descriptor, offset_x, offset_y, rgb->tex[0]);
+        sws.load_vram(descriptor, offset_x, offset_y, rgb->tex[0], false);
       } else {
         // The Rockchip/Panfrost path can sample imported KMS DMA-BUF textures,
         // but using them as an FBO source for Sunshine's resize copy can fail
@@ -3003,7 +3003,7 @@ namespace rkmpp {
         sws.load_vram_direct(rgb->tex[0]);
       }
 
-      if (sws.convert(nv12->buf)) {
+      if (sws.convert_nv12(nv12->buf)) {
         return -1;
       }
 

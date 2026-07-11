@@ -13,6 +13,10 @@
 #include "src/logging.h"
 #include "src/utility.h"
 
+/**
+ * @def MAKE_NVENC_VER(major, minor)
+ * @brief Macro for MAKE NVENC VER.
+ */
 #define MAKE_NVENC_VER(major, minor) ((major) | ((minor) << 24))
 
 // Make sure we check backwards compatibility when bumping the Video Codec SDK version
@@ -183,7 +187,7 @@ namespace nvenc {
     };
 
     auto buffer_is_yuv444 = [&]() {
-      return buffer_format == NV_ENC_BUFFER_FORMAT_AYUV || buffer_format == NV_ENC_BUFFER_FORMAT_YUV444_10BIT;
+      return buffer_format == NV_ENC_BUFFER_FORMAT_AYUV || buffer_format == NV_ENC_BUFFER_FORMAT_YUV444 || buffer_format == NV_ENC_BUFFER_FORMAT_YUV444_10BIT;
     };
 
     {
@@ -222,13 +226,9 @@ namespace nvenc {
     init_params.darWidth = encoder_params.width;
     init_params.encodeHeight = encoder_params.height;
     init_params.darHeight = encoder_params.height;
-    init_params.frameRateNum = client_config.framerate;
-    init_params.frameRateDen = 1;
-    if (client_config.framerateX100 > 0) {
-      AVRational fps = video::framerateX100_to_rational(client_config.framerateX100);
-      init_params.frameRateNum = fps.num;
-      init_params.frameRateDen = fps.den;
-    }
+    const AVRational fps = video::framerate_to_rational(client_config);
+    init_params.frameRateNum = fps.num;
+    init_params.frameRateDen = fps.den;
 
     if (client_config.videoFormat > 0 && get_encoder_cap(NV_ENC_CAPS_NUM_ENCODER_ENGINES) > 1) {
       // SFE supports HEVC/AV1 if you have more than 1 nvenc block
@@ -659,9 +659,11 @@ namespace nvenc {
   bool nvenc_base::nvenc_failed(NVENCSTATUS status) {
     auto status_string = [](NVENCSTATUS status) -> std::string {
       switch (status) {
-#define nvenc_status_case(x) \
-  case x: \
-    return #x;
+#ifndef DOXYGEN
+  #define nvenc_status_case(x) \
+    case x: \
+      return #x;
+#endif
         nvenc_status_case(NV_ENC_SUCCESS);
         nvenc_status_case(NV_ENC_ERR_NO_ENCODE_DEVICE);
         nvenc_status_case(NV_ENC_ERR_UNSUPPORTED_DEVICE);
