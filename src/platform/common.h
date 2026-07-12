@@ -791,6 +791,15 @@ namespace platf {
      */
     virtual capture_e sample(std::vector<float> &frame_buffer) = 0;
 
+    /**
+     * @brief Drop any buffered-but-undelivered capture backlog.
+     *
+     * Called on an audio_gate falling edge (SUNSHINE_AUDIO_FLUSH_ON_GATE) so
+     * latency accumulated across an HDMI-RX re-lock cannot persist as fixed
+     * delay. Default no-op; the PulseAudio backend overrides.
+     */
+    virtual void flush() {}
+
     virtual ~mic_t() = default;
   };
 

@@ -243,7 +243,16 @@ namespace audio {
     // Capture takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
-    auto samples = std::make_shared<sample_queue_t::element_type>(30);
+    // Depth of the capture->encode handoff queue. It is normally empty (the
+    // blocking capture paces the producer), but on overflow queue_t clears the
+    // WHOLE backlog at once — so the depth is also the size of that audible
+    // drop: 30 frames = ~150 ms at the 5 ms default. SUNSHINE_AUDIO_QUEUE_DEPTH
+    // tunes it (floor 4).
+    int queue_depth = 30;
+    if (const char *v = std::getenv("SUNSHINE_AUDIO_QUEUE_DEPTH"); v && *v) {
+      queue_depth = std::max(4, std::atoi(v));
+    }
+    auto samples = std::make_shared<sample_queue_t::element_type>(queue_depth);
     std::thread thread {encodeThread, samples, config, channel_data};
 
     auto fg = util::fail_guard([&]() {
@@ -262,17 +271,29 @@ namespace audio {
     // gate and self-detect same-geometry re-inits rkmpp never sees.
     //
     // Env tunables, read once at capture start:
-    //   SUNSHINE_AUDIO_GATE     off/0 disables the whole gate (default on)
-    //   SUNSHINE_AUDIO_GATE_MS  reneg-trigger squelch duration (default 500)
-    //   SUNSHINE_AUDIO_TAP=path append post-gate audio as s16le (debug)
+    //   SUNSHINE_AUDIO_GATE           off/0 disables the whole gate (default on)
+    //   SUNSHINE_AUDIO_GATE_MS        reneg-trigger squelch duration (default 500)
+    //   SUNSHINE_AUDIO_TAP=path       append post-gate audio as s16le (debug)
+    //   SUNSHINE_AUDIO_FLUSH_ON_GATE  1 = drop the PA record backlog when the
+    //                                 gate clears (stale re-lock samples would
+    //                                 otherwise persist as fixed delay)
+    //   SUNSHINE_AUDIO_REOPEN         1 = fully rebuild the PA record stream
+    //                                 when the gate clears (what a Moonlight
+    //                                 restart does, without the restart)
     const auto env_val = [](const char *name) -> const char * {
       const char *v = std::getenv(name);
       return (v && *v) ? v : nullptr;
+    };
+    const auto env_on = [&env_val](const char *name) {
+      const char *v = env_val(name);
+      return v && !(std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0);
     };
     bool gate_enabled = true;
     if (const char *v = env_val("SUNSHINE_AUDIO_GATE")) {
       gate_enabled = !(std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0);
     }
+    const bool flush_on_gate = env_on("SUNSHINE_AUDIO_FLUSH_ON_GATE");
+    const bool reopen_on_gate = env_on("SUNSHINE_AUDIO_REOPEN");
     if (const char *v = env_val("SUNSHINE_AUDIO_GATE_MS")) {
       int ms = std::atoi(v);
       if (ms > 0) {
@@ -308,7 +329,44 @@ namespace audio {
       }
     });
 
+    // Rebuild the PA record stream (shared by the error path and the
+    // gate-clear SUNSHINE_AUDIO_REOPEN path).
+    auto reinit_mic = [&]() {
+      mic.reset();
+      do {
+        mic = control->microphone(stream.mapping, stream.channelCount, stream.sampleRate, frame_size, continuous_audio, host_audio);
+        if (!mic) {
+          BOOST_LOG(warning) << "Couldn't re-initialize audio input"sv;
+        }
+      } while (!mic && !shutdown_event->view(5s));
+    };
+
+    // Falling-edge tracking for the flush/reopen-on-gate-clear paths.
+    bool gate_was_armed = false;
+
     while (!shutdown_event->peek()) {
+      // Gate falling edge: the re-lock window just ended. Anything the PA
+      // stream buffered across it is stale by the re-lock duration and, with
+      // a realtime-rate consumer, would persist as fixed delay — drop it
+      // (flush) or rebuild the stream outright (reopen; clears whatever a full
+      // Moonlight restart would).
+      if (gate_enabled && (flush_on_gate || reopen_on_gate)) {
+        const bool armed = audio_gate::active();
+        if (gate_was_armed && !armed) {
+          if (reopen_on_gate) {
+            BOOST_LOG(info) << "audio gate: cleared; reopening capture stream"sv;
+            reinit_mic();
+            if (!mic) {
+              return;
+            }
+          } else {
+            BOOST_LOG(info) << "audio gate: cleared; flushing capture backlog"sv;
+            mic->flush();
+          }
+        }
+        gate_was_armed = armed;
+      }
+
       std::vector<float> sample_buffer;
       sample_buffer.resize(samples_per_frame);
 
@@ -320,13 +378,10 @@ namespace audio {
           continue;
         case platf::capture_e::reinit:
           BOOST_LOG(info) << "Reinitializing audio capture"sv;
-          mic.reset();
-          do {
-            mic = control->microphone(stream.mapping, stream.channelCount, stream.sampleRate, frame_size, continuous_audio, host_audio);
-            if (!mic) {
-              BOOST_LOG(warning) << "Couldn't re-initialize audio input"sv;
-            }
-          } while (!mic && !shutdown_event->view(5s));
+          reinit_mic();
+          if (!mic) {
+            return;
+          }
           continue;
         default:
           return;
@@ -354,7 +409,9 @@ namespace audio {
         const double rolling_rms = rms_count > 0 ? std::sqrt(rms_sumsq / static_cast<double>(rms_count)) : 0.0;
         bool heuristic_zero = false;
         if (!gate_now && rolling_rms < 1e-3 && peak > 0.97f) {
-          audio_gate::trigger(300);
+          // notify_fifo=false: click-shaped program content fires this too;
+          // only the rkmpp reneg sites poke retro-audio's format re-decide.
+          audio_gate::trigger(300, false);
           gate_now = true;
           heuristic_zero = true;  // sacrifice this whole click frame
           gate_phase = 0.0;       // jump closed: a smooth fade can't outrun the click already in-frame

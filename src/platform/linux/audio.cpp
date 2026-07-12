@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <bitset>
+#include <cstdlib>
 #include <sstream>
 #include <thread>
 
@@ -86,6 +87,21 @@ namespace platf {
 
       return capture_e::ok;
     }
+
+    /**
+     * @brief Drop the record stream's buffered backlog (pa_simple_flush).
+     *
+     * Fired on the audio_gate falling edge: samples buffered while the HDMI-RX
+     * re-locked are stale by exactly the re-lock duration, and because the
+     * blocking read drains at realtime rate that backlog would otherwise
+     * persist as fixed added latency for the rest of the session.
+     */
+    void flush() override {
+      int status;
+      if (pa_simple_flush(mic.get(), &status)) {
+        BOOST_LOG(warning) << "pa_simple_flush() failed: "sv << pa_strerror(status);
+      }
+    }
   };
 
   /**
@@ -109,12 +125,24 @@ namespace platf {
       channel = position_mapping[*mapping++];
     });
 
+    // Bound the record-stream backlog. The server-default maxlength is
+    // effectively unbounded, so any capture-thread stall becomes PERMANENT
+    // added latency: the blocking read only drains at realtime rate, so a
+    // backlog never shrinks. 16 fragments (~80 ms at the 5 ms default frame)
+    // caps the damage at one brief overrun-drop instead.
+    // SUNSHINE_AUDIO_MAXLENGTH_FRAMES tunes it; 0 restores the old unbounded
+    // behavior.
+    const uint32_t fragsize = uint32_t(frame_size * channels * sizeof(float));
+    int maxlength_frames = 16;
+    if (const char *v = std::getenv("SUNSHINE_AUDIO_MAXLENGTH_FRAMES")) {
+      maxlength_frames = std::atoi(v);
+    }
     pa_buffer_attr pa_attr = {
-      .maxlength = uint32_t(-1),
+      .maxlength = maxlength_frames > 0 ? fragsize * uint32_t(maxlength_frames) : uint32_t(-1),
       .tlength = uint32_t(-1),
       .prebuf = uint32_t(-1),
       .minreq = uint32_t(-1),
-      .fragsize = uint32_t(frame_size * channels * sizeof(float))
+      .fragsize = fragsize
     };
 
     int status;
