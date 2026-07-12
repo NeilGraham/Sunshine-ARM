@@ -193,6 +193,16 @@ namespace rkmpp {
       return client;
     }
 
+    void release_lease(int index) {
+      if (index < 0 || !leased[index]) {
+        return;
+      }
+      rcap_release rel {{RCAP_MSG_RELEASE, 0}, (std::uint32_t) index, 0, 0};
+      if (send_msg(&rel, sizeof(rel))) {
+        leased[index] = false;
+      }
+    }
+
     // Drain the socket, keep the newest FRAME, release superseded leases, and
     // return the DRM_PRIME wrapper for the current buffer. Newest-frame-wins:
     // identical latency semantics to the old in-process update_latest_frame().
@@ -227,6 +237,14 @@ namespace rkmpp {
             if (!leased[f->index]) {
               leased[f->index] = true;  // lease created by first reference
             }
+            // A frame superseded within this same drain must be released here:
+            // it is neither cur_index nor the drain's winner, so the post-loop
+            // release below never sees it, and the daemon cannot re-send an
+            // index it still considers leased — each occurrence would
+            // permanently shrink the 4-buffer pool.
+            if (newest >= 0 && newest != (int) f->index && newest != cur_index) {
+              release_lease(newest);
+            }
             newest = (int) f->index;
             newest_flags = f->flags;
           }
@@ -245,12 +263,9 @@ namespace rkmpp {
           audio_gate::trigger(audio_gate::reneg_ms.load(std::memory_order_relaxed), false);
           last_was_held = now_held;
         }
-        if (cur_index >= 0 && cur_index != newest && leased[cur_index]) {
+        if (cur_index != newest) {
           // Superseded: hand the buffer back so the daemon can write into it.
-          rcap_release rel {{RCAP_MSG_RELEASE, 0}, (std::uint32_t) cur_index, 0, 0};
-          if (send_msg(&rel, sizeof(rel))) {
-            leased[cur_index] = false;
-          }
+          release_lease(cur_index);
         }
         cur_index = newest;
       }
