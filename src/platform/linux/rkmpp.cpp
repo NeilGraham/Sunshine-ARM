@@ -480,6 +480,28 @@ namespace rkmpp {
     // DV-timings re-latch, format negotiation, buffer setup. Throttled so an
     // absent source retries calmly until it appears (the held last-good frame
     // is shown meanwhile — see update_latest_frame's suppression).
+    // Drive the vendor driver's HPD line (BASE_VIDIOC_PRIVATE + 4, see
+    // ~/bin/hdmirx-ctl.c). Uses the open capture fd when there is one, else a
+    // transient open — the ioctl is a register poke, not a stream operation.
+    bool set_hpd(int level) {
+      constexpr auto RK_SET_HPD = _IOW('V', 192 + 4, int);
+      int f = fd;
+      int transient = -1;
+      if (f < 0) {
+        transient = ::open(dev_path.c_str(), O_RDWR | O_NONBLOCK);
+        f = transient;
+        if (f < 0) {
+          return false;
+        }
+      }
+      int v = level;
+      const bool ok = xioctl(f, RK_SET_HPD, &v) == 0;
+      if (transient >= 0) {
+        ::close(transient);
+      }
+      return ok;
+    }
+
     void maybe_recover_source() {
       // The vendor rk_hdmirx driver re-locks a changed source and resumes
       // delivery on the SAME open stream — a game launch or a mode/HDCP/audio
@@ -513,6 +535,28 @@ namespace rkmpp {
 
       const auto now = std::chrono::steady_clock::now();
       const bool stalled = now - last_frame_at >= STALL_AFTER;
+
+      // HPD-heal pulse in flight: hold everything (no probes — a QUERY against
+      // the deliberately-dropped link would just storm the driver log) until
+      // the low dwell elapses, then raise HPD and let the source re-handshake.
+      // The normal ladder then renegotiates against the fresh link with a
+      // fresh episode budget (one straight replay, no redundant close first —
+      // the re-handshake already reset the receiver harder than a close can).
+      if (hpd_low_at.time_since_epoch().count() != 0) {
+        constexpr auto HPD_LOW_DWELL = std::chrono::milliseconds(2000);
+        if (now - hpd_low_at >= HPD_LOW_DWELL) {
+          const bool ok = set_hpd(1);
+          BOOST_LOG(info) << "RKMPP direct V4L2: HPD raised after the heal dwell"sv
+                          << (ok ? ""sv : " (ioctl failed)"sv)
+                          << "; waiting for the source to re-handshake"sv;
+          hpd_low_at = {};
+          pending_since = now;  // fresh probe/settle window for the re-handshake
+          locked_since = {};
+          last_replay_valid = false;  // fresh link: prior fruitless record is moot
+          episode_reinits = 0;
+        }
+        return;
+      }
 
       // Frames-flowing geometry backstop. The stall trigger above only catches a
       // source change that *stops* delivery for STALL_AFTER. A live console mode
@@ -687,7 +731,14 @@ namespace rkmpp {
         // held last-good frame stays up. A genuine resolution change still
         // needs one re-init to renegotiate buffers, but exactly one, against a
         // signal that has stopped moving.
-        constexpr auto LOCK_SETTLE = std::chrono::milliseconds(1000);
+        // 2000 ms (was 1000): the vendor driver's own signal-change handling
+        // re-locks ~1.5 s after a change, and a console transition (blanking +
+        // HDCP re-auth + infoframe churn) can report locked while the driver's
+        // internal timing state is still latching — re-initing there is how
+        // the 2026-07-12 delay_line-stale wedge started. Costs ~1 s of extra
+        // held-frame on a real console mode switch; clean switches (loopback)
+        // never stall so they never pay it.
+        constexpr auto LOCK_SETTLE = std::chrono::milliseconds(2000);
         if (locked) {
           if (locked_since.time_since_epoch().count() == 0) {
             locked_since = now;
@@ -730,7 +781,47 @@ namespace rkmpp {
         probe_bt.interlaced == last_replay_bt.interlaced &&
         (probe_bt.pixelclock == 0 || last_replay_bt.pixelclock == 0 ||
          clock_close(probe_bt.pixelclock, last_replay_bt.pixelclock));
-      if (same_fruitless_signal && now - last_recover_at < SAME_SIGNAL_RETRY) {
+      // HPD-heal escalation: a locked signal that stayed dark through BOTH a
+      // plain re-init AND a close-reopen cycle (episode_reinits >= 2 with the
+      // same fruitless signal) is wedged past anything STREAMOFF/ON or a fresh
+      // open can fix — the driver holds stale internal timing state from the
+      // previous mode (observed 2026-07-12: hdmirx_start_streaming
+      // delay_line:720 against a locked 1080p signal, dark forever). The only
+      // userspace cure is a full source re-handshake: pulse HPD (low 2 s ->
+      // high), exactly the manual `retro-unwedge` heal, in-process and
+      // rationed to ONE pulse per dark episode. The pulse drops the source
+      // for ~2 s and re-handshakes (~3-5 s) — acceptable against a screen
+      // that is otherwise black until someone intervenes.
+      // SUNSHINE_RKMPP_HPD_HEAL=0 disables.
+      if (hpd_heal_enabled && !episode_pulsed && !ever_produced &&
+          probe_locked && same_fruitless_signal && episode_reinits >= 2) {
+        if (set_hpd(0)) {
+          episode_pulsed = true;
+          hpd_low_at = now;
+          recovery_logged = false;
+          BOOST_LOG(warning) << "RKMPP direct V4L2: capture still dark after a re-init and a "
+                                "device close on a locked signal; pulsing HPD to force a full "
+                                "source re-handshake (SUNSHINE_RKMPP_HPD_HEAL=0 disables)"sv;
+          // The re-handshake re-inits the RX audio path too — squelch the
+          // click across it and let retro-audio mute + re-decide the format.
+          audio_gate::trigger(audio_gate::reneg_ms.load(std::memory_order_relaxed));
+          return;
+        }
+        // ioctl unavailable (USB capture card / permission): fall through to
+        // the normal hold; don't retry the pulse every tick.
+        episode_pulsed = true;
+      }
+
+      // While the HPD-heal escalation is still unspent, let the ladder run at
+      // the normal RECOVER_BACKOFF pace instead of the 30 s same-signal hold:
+      // the hold exists to stop CMA-churning replays against an idle carrier,
+      // but a wedged console signal deserves the close->reopen->pulse ladder
+      // promptly (~13 s to the pulse instead of ~45 s of black). Once the
+      // pulse is spent (or the heal is disabled), the hold applies as before.
+      const bool heal_pending = hpd_heal_enabled && !episode_pulsed &&
+                                probe_locked && !ever_produced;
+      if (same_fruitless_signal && !heal_pending &&
+          now - last_recover_at < SAME_SIGNAL_RETRY) {
         if (!recovery_logged) {
           BOOST_LOG(info) << "RKMPP direct V4L2: signal "sv << probe_bt.width << 'x' << probe_bt.height
                           << " unchanged since the last fruitless re-init; holding until it changes"sv;
@@ -807,8 +898,16 @@ namespace rkmpp {
       }
 
       last_recover_at = now;
-      last_replay_bt = probe_bt;
-      last_replay_valid = probe_locked;
+      if (fd >= 0) {
+        // Record the signal this replay ran against — but ONLY when the probe
+        // actually ran this tick. The fd<0 replay (after the escalation-close)
+        // skips the probe block entirely; clobbering the record with the empty
+        // probe made every post-close relock look like a "new stable lock",
+        // defeating same_fruitless_signal AND the episode cap — the 2026-07-12
+        // infinite close/reopen churn against a wedged 1080p signal.
+        last_replay_bt = probe_bt;
+        last_replay_valid = probe_locked;
+      }
       ++episode_reinits;
 
       recover_pending = false;
@@ -898,6 +997,7 @@ namespace rkmpp {
         last_frame_at = std::chrono::steady_clock::now();
         recovery_logged = false;
         episode_reinits = 0;  // a real frame ends the dark episode; re-arm recovery
+        episode_pulsed = false;  // ...including the once-per-episode HPD heal
         auto *src = (const std::uint8_t *) buffers[latest.index].start;
         if (is_mjpeg) {
           // Decoded into the CPU latest_frame; the capture buffer is free now.
@@ -2124,6 +2224,17 @@ namespace rkmpp {
     // wedged receiver can't drive the unbounded loop that hangs the kernel.
     // Reset to 0 the moment a real frame is delivered.
     int episode_reinits {};
+    // HPD-heal state (see maybe_recover_source): a wedge that survives the
+    // escalation-close (stale driver timing state from the previous mode)
+    // only clears on a full source re-handshake. hpd_low_at non-zero = a
+    // pulse is in flight (low asserted, waiting out the dwell); one pulse per
+    // dark episode, reset with episode_reinits on the first delivered frame.
+    std::chrono::steady_clock::time_point hpd_low_at {};
+    bool episode_pulsed {};
+    bool hpd_heal_enabled = [] {
+      const char *v = std::getenv("SUNSHINE_RKMPP_HPD_HEAL");
+      return !(v && (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0));
+    }();
     // Test-only fault injection (SUNSHINE_RKMPP_FAULT_HOOK), read once at
     // construction: 0 = off/production; 1 = drop delivered frames while
     // /run/sunshine-fault-dark exists (reproduces the locked-but-frameless idle
