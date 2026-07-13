@@ -145,6 +145,16 @@ namespace cbs {
     }
 
     auto sps_p = ((CodedBitstreamH264Context *) ctx->priv_data)->active_sps;
+    // The packet can parse cleanly yet activate no SPS (same failure mode the
+    // validate_sps guard covers: a parameter-less packet reaches the first
+    // IDR injection under capture churn). Building a replacement SPS is then
+    // impossible — return empty and let the session run without the VUI
+    // rewrite instead of dereferencing NULL (SEGV'd session::video 3x on the
+    // 2026-07-13 loopback soak; core + bt in ~/stability/hdmi-rx/).
+    if (!sps_p) {
+      BOOST_LOG(error) << "Packet activated no SPS; skipping replacement SPS injection"sv;
+      return {};
+    }
 
     // This is a very large struct that cannot safely be stored on the stack
     auto sps = std::make_unique<H264RawSPS>(*sps_p);
@@ -205,6 +215,12 @@ namespace cbs {
 
     auto vps_p = ((CodedBitstreamH265Context *) ctx->priv_data)->active_vps;
     auto sps_p = ((CodedBitstreamH265Context *) ctx->priv_data)->active_sps;
+    // Same NULL guard as the H.264 path: parse-without-activation must not
+    // deref (the validate_sps fix's failure mode, here on the build side).
+    if (!sps_p || !vps_p) {
+      BOOST_LOG(error) << "Packet activated no SPS/VPS; skipping replacement SPS injection"sv;
+      return {};
+    }
 
     // These are very large structs that cannot safely be stored on the stack
     auto sps = std::make_unique<H265RawSPS>(*sps_p);
