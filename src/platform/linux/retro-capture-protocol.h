@@ -43,7 +43,8 @@
 extern "C" {
 #endif
 
-#define RCAP_PROTO_VERSION 1
+#define RCAP_PROTO_VERSION 2
+#define RCAP_PROTO_VERSION_MIN 1 /* daemon still speaks v1 to old consumers */
 #define RCAP_MAGIC 0x52434150u /* "RCAP" */
 #define RCAP_SOCKET_DEFAULT "/run/retro-stream/retro-capture.sock"
 #define RCAP_MAX_MSG_SIZE 4096
@@ -59,6 +60,9 @@ enum rcap_msg_type {
   RCAP_MSG_RELEASE = 8,    /* consumer -> daemon */
   RCAP_MSG_STATUS_GET = 9, /* status client -> daemon, empty body */
   RCAP_MSG_STATUS = 10,    /* daemon -> status client, JSON body */
+  /* v2 additions: live shader control, no daemon restart. */
+  RCAP_MSG_SHADER_SET = 11, /* status client -> daemon (v2 connections only) */
+  RCAP_MSG_SHADER_ACK = 12, /* daemon -> status client */
 };
 
 enum rcap_role {
@@ -123,15 +127,32 @@ struct RCAP_PACKED rcap_setup {
   uint32_t fps_den;
 };
 
+/* v2 length-extension of SETUP: a consumer MAY send this longer message to
+ * request a pool pixel format for the session. A short (original) SETUP is
+ * equivalent to fourcc 0. fourcc 0 or DRM_FORMAT_NV12 requests the 8-bit
+ * NV12 pool (a 10-bit capture is downconverted); DRM_FORMAT_NV15 requests
+ * the compact 10-bit pool and is served only while the daemon is capturing
+ * 10-bit — otherwise the daemon falls back to NV12. STREAM_INFO remains
+ * authoritative: consumers MUST verify its fourcc matches what the session
+ * requires and reconnect/fail rather than assume. */
+struct RCAP_PACKED rcap_setup2 {
+  struct rcap_setup base;
+  uint32_t fourcc;   /* requested pool format; 0 = DRM_FORMAT_NV12 */
+  uint32_t reserved; /* must be 0 */
+};
+
 struct RCAP_PACKED rcap_stream_info {
   struct rcap_hdr hdr;
   uint32_t width;
   uint32_t height;
   uint32_t fps_num;
   uint32_t fps_den;
-  uint32_t fourcc;   /* DRM_FORMAT_NV12 */
+  uint32_t fourcc;   /* DRM_FORMAT_NV12, or DRM_FORMAT_NV15 (Rockchip compact
+                      * 10-bit 4:2:0) when the daemon runs a 10-bit session.
+                      * Consumers MUST honor this rather than assume NV12. */
   uint64_t modifier; /* DRM_FORMAT_MOD_LINEAR */
-  uint32_t stride_y; /* bytes, 16-aligned */
+  uint32_t stride_y; /* bytes (NV12: 16-aligned pixel count; NV15: 64-aligned
+                      * compact byte stride, ALIGN(width*10/8, 320)) */
   uint32_t stride_uv;
   uint32_t offset_y;
   uint32_t offset_uv;
@@ -177,6 +198,42 @@ struct RCAP_PACKED rcap_status_get {
 /* RCAP_MSG_STATUS body is UTF-8 JSON following rcap_hdr, NUL-terminated
  * within the datagram. See PROTOCOL.md §3.10 for the field list; fields are
  * additive without a version bump. */
+
+/* ---- v2: live shader control ---- */
+
+enum rcap_shader_effect {
+  RCAP_SHADER_DISABLED = 0,
+  RCAP_SHADER_CRT_BASIC = 1,
+};
+
+/* Applies the shader state live (next frame, no restart, no effect on the
+ * consumer session or pool). Sent by a STATUS-role client on a connection
+ * speaking version >= 2; the daemon clamps out-of-range values and replies
+ * with SHADER_ACK. crt_width/crt_height describe the emulated CRT raster the
+ * capture is downscaled to before the CRT pass. crt_height 0 follows the
+ * source; crt_width 0 with a set height derives the width from the displayed
+ * aspect ratio (854 for a 480-line 16:9 picture, 640 under a forced 4:3).
+ * Floats are IEEE-754 binary32, little-endian like every other field. */
+struct RCAP_PACKED rcap_shader_set {
+  struct rcap_hdr hdr;
+  uint8_t effect; /* enum rcap_shader_effect */
+  uint8_t fade;   /* 0/1: fade scanlines out near 1:1 vertical scale */
+  uint16_t crt_width;
+  uint16_t crt_height;
+  uint16_t reserved;
+  float scan;   /* 0..1  scanline darkness */
+  float sharp;  /* 0..1  beam sharpness */
+  float mask;   /* 0..1  aperture-grille strength */
+  float bright; /* 0..0.5 brightness compensation */
+  float soft;   /* 0..1  horizontal softness */
+  float pitch;  /* 2..4  grille pitch in output pixels */
+};
+
+struct RCAP_PACKED rcap_shader_ack {
+  struct rcap_hdr hdr;
+  uint16_t ok; /* 1 = accepted (post-clamp), 0 = rejected */
+  uint16_t reserved;
+};
 
 #ifdef __cplusplus
 } /* extern "C" */

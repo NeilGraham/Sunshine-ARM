@@ -60,6 +60,17 @@ using namespace std::literals;
 
 namespace rkmpp {
 
+  static std::string fourcc_str(std::uint32_t fourcc) {
+    const char s[5] = {
+      (char) (fourcc & 0xff),
+      (char) ((fourcc >> 8) & 0xff),
+      (char) ((fourcc >> 16) & 0xff),
+      (char) ((fourcc >> 24) & 0xff),
+      0,
+    };
+    return s;
+  }
+
   // Thin client for the retro-capture daemon. Consumer-agnostic protocol; the
   // only Sunshine-specific piece is wrapping pool buffers as DRM_PRIME
   // AVFrames for the RKMPP encoder (the shape rga_scaler_t::enc_frame() used
@@ -126,12 +137,22 @@ namespace rkmpp {
         return nullptr;
       }
 
-      rcap_setup setup {};
-      setup.hdr = {RCAP_MSG_SETUP, 0};
-      setup.width = width;
-      setup.height = height;
-      setup.fps_num = 0;  // daemon default cadence; the encoder paces itself
-      setup.fps_den = 0;
+      // The session's bit depth decides the pool format we request: the
+      // encoder was created for the frames context's sw_format, and an
+      // 8-bit session must get NV12 even while the daemon captures 10-bit
+      // (the daemon downconverts). SETUP v2 length-extension carries it.
+      bool want_nv15 = false;
+      if (hw_frames_ctx_buf) {
+        auto *fctx = (AVHWFramesContext *) hw_frames_ctx_buf->data;
+        want_nv15 = fctx->sw_format == AV_PIX_FMT_NV15;
+      }
+      rcap_setup2 setup {};
+      setup.base.hdr = {RCAP_MSG_SETUP, 0};
+      setup.base.width = width;
+      setup.base.height = height;
+      setup.base.fps_num = 0;  // daemon default cadence; the encoder paces itself
+      setup.base.fps_den = 0;
+      setup.fourcc = want_nv15 ? 0x3531564e /* DRM_FORMAT_NV15 */ : 0x3231564e /* NV12 */;
       if (!client->send_msg(&setup, sizeof(setup))) {
         return nullptr;
       }
@@ -184,12 +205,23 @@ namespace rkmpp {
         return nullptr;
       }
 
+      // STREAM_INFO is authoritative: the encoder was configured for the
+      // requested layout, so a different pool format (old daemon, or NV15
+      // requested while the capture just left 10-bit) is unusable.
+      if (client->sinfo.fourcc != setup.fourcc) {
+        BOOST_LOG(warning) << "retro-capture: daemon served pool format "sv
+                           << fourcc_str(client->sinfo.fourcc) << " but this session needs "sv
+                           << fourcc_str(setup.fourcc) << "; not using the daemon path"sv;
+        return nullptr;
+      }
+
       client->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_buf);
       client->wrappers.assign(client->pool_fds.size(), nullptr);
       client->leased.assign(client->pool_fds.size(), false);
 
       BOOST_LOG(info) << "retro-capture: connected — "sv << client->sinfo.width << 'x'
-                      << client->sinfo.height << " NV12 pool of "sv << client->sinfo.pool_count
+                      << client->sinfo.height << ' ' << fourcc_str(client->sinfo.fourcc)
+                      << " pool of "sv << client->sinfo.pool_count
                       << " (stride "sv << client->sinfo.stride_y << ", zero-copy DRM_PRIME encode)"sv;
       return client;
     }
