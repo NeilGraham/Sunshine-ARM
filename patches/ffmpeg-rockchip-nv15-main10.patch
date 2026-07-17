@@ -1,0 +1,52 @@
+--- a/libavcodec/rkmppenc.c	2026-07-17 21:19:49.632286515 +0000
++++ b/libavcodec/rkmppenc.c	2026-07-17 21:21:00.670279140 +0000
+@@ -48,6 +48,7 @@
+     case AV_PIX_FMT_YUVJ444P:
+     case AV_PIX_FMT_YUV444P: return MPP_FMT_YUV444P;
+     case AV_PIX_FMT_NV12:    return MPP_FMT_YUV420SP;
++    case AV_PIX_FMT_NV15:    return MPP_FMT_YUV420SP_10BIT;
+     case AV_PIX_FMT_NV21:    return MPP_FMT_YUV420SP_VU;
+     case AV_PIX_FMT_NV16:    return MPP_FMT_YUV422SP;
+     case AV_PIX_FMT_NV24:    return MPP_FMT_YUV444SP;
+@@ -603,8 +604,9 @@
+         break;
+     case AV_CODEC_ID_HEVC:
+         {
+-            avctx->profile = r->pix_fmt == AV_PIX_FMT_GRAY8
+-                ? AV_PROFILE_HEVC_REXT : AV_PROFILE_HEVC_MAIN;
++            avctx->profile = r->pix_fmt == AV_PIX_FMT_GRAY8 ? AV_PROFILE_HEVC_REXT :
++                             r->pix_fmt == AV_PIX_FMT_NV15  ? AV_PROFILE_HEVC_MAIN_10 :
++                                                              AV_PROFILE_HEVC_MAIN;
+             avctx->level = r->level;
+             mpp_enc_cfg_set_s32(cfg, "h265:profile", avctx->profile);
+             mpp_enc_cfg_set_s32(cfg, "h265:level", avctx->level);
+@@ -616,6 +618,8 @@
+             switch (avctx->profile) {
+             case AV_PROFILE_HEVC_MAIN:
+                 av_log(avctx, AV_LOG_VERBOSE, "Profile is set to MAIN\n"); break;
++            case AV_PROFILE_HEVC_MAIN_10:
++                av_log(avctx, AV_LOG_VERBOSE, "Profile is set to MAIN 10\n"); break;
+             case AV_PROFILE_HEVC_REXT:
+                 av_log(avctx, AV_LOG_VERBOSE, "Profile is set to REXT\n"); break;
+             }
+@@ -1162,6 +1166,10 @@
+                av_get_pix_fmt_name(pix_fmt));
+         return AVERROR(ENOSYS);
+     }
++    if (avctx->codec_id == AV_CODEC_ID_H264 && pix_fmt == AV_PIX_FMT_NV15) {
++        av_log(avctx, AV_LOG_ERROR, "10-bit input is only supported for HEVC (Main 10)\n");
++        return AVERROR(ENOSYS);
++    }
+     r->pix_fmt = pix_fmt;
+     r->mpp_fmt = mpp_fmt;
+ 
+--- a/libavcodec/rkmppenc.h	2026-07-17 21:19:50.038960957 +0000
++++ b/libavcodec/rkmppenc.h	2026-07-17 21:21:00.670279140 +0000
+@@ -222,6 +222,7 @@
+     AV_PIX_FMT_YUV444P,
+     AV_PIX_FMT_YUVJ444P,
+     AV_PIX_FMT_NV12,
++    AV_PIX_FMT_NV15,
+     AV_PIX_FMT_NV21,
+     AV_PIX_FMT_NV16,
+     AV_PIX_FMT_NV24,

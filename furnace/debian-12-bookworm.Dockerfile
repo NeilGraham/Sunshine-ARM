@@ -99,6 +99,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --filter=blob:none https://github.com/nyanmisaka/ffmpeg-rockchip.git /opt/ffmpeg-rockchip \
     && git -C /opt/ffmpeg-rockchip checkout "${FFMPEG_ROCKCHIP_REF}"
 
+# 10-bit HDR: teach the rkmpp encoder NV15 input + HEVC Main 10 (upstream has
+# neither at this ref). Committed (not just applied) so build_ffmpeg_rkmpp.sh's
+# revision stamp changes and the cached ffmpeg build is invalidated.
+COPY patches/ffmpeg-rockchip-nv15-main10.patch /tmp/nv15-main10.patch
+RUN git -C /opt/ffmpeg-rockchip apply /tmp/nv15-main10.patch \
+    && git -C /opt/ffmpeg-rockchip -c user.name=furnace -c user.email=furnace@local \
+       commit -am "rkmppenc: NV15 input + HEVC Main 10 (retro-stream 10-bit HDR)" \
+    && rm /tmp/nv15-main10.patch
+
 # Build user matching furnace's --user uid:gid, with passwordless sudo so the
 # (non-root) furnace container can still apt-install and write to /usr/local.
 RUN (getent group "${BUILD_GID}" || groupadd -g "${BUILD_GID}" builder) \

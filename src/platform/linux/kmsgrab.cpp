@@ -1087,6 +1087,13 @@ namespace platf {
        * @return True when the active display mode is HDR.
        */
       bool is_hdr() {
+#ifdef SUNSHINE_BUILD_RKMPP
+        // Capture box: HDR follows what the retro-capture daemon ingests
+        // (NV15 => BT.2020+PQ), not this TX connector's output state.
+        if (rkmpp::daemon_hdr_active()) {
+          return true;
+        }
+#endif
         if (!hdr_metadata_blob_id || *hdr_metadata_blob_id == 0) {
           return false;
         }
@@ -1139,6 +1146,13 @@ namespace platf {
        * @return True when HDR metadata was written to the output structure.
        */
       bool get_hdr_metadata(SS_HDR_METADATA &metadata) {
+#ifdef SUNSHINE_BUILD_RKMPP
+        // See is_hdr(): a daemon 10-bit session serves HDR10 defaults (the
+        // HDMI-RX driver does not parse the source's HDR InfoFrame).
+        if (rkmpp::daemon_hdr_metadata(metadata)) {
+          return true;
+        }
+#endif
         // This performs all the metadata validation
         if (!is_hdr()) {
           return false;

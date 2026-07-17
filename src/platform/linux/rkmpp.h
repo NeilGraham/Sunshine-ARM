@@ -37,4 +37,27 @@ namespace rkmpp {
    * @return The encode device or nullptr on failure.
    */
   std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(int width, int height, file_t &&card, int offset_x, int offset_y);
+
+  /**
+   * @brief Whether the retro-capture daemon is currently ingesting 10-bit
+   *        (NV15 / BT.2020+PQ) content.
+   *
+   * On a capture box the KMS connector's HDR state is irrelevant — HDR-ness
+   * is decided by what the daemon captures. kmsgrab's is_hdr() consults this
+   * when SUNSHINE_RKMPP_V4L2 marks the host as capture-streaming. The result
+   * is cached briefly; returns false when the daemon is unreachable.
+   */
+  bool daemon_hdr_active();
+
+  /**
+   * @brief HDR10 metadata for a daemon 10-bit session.
+   *
+   * The HDMI-RX driver does not parse the source's HDR InfoFrame (MVP
+   * scope), so this serves standard HDR10 defaults (BT.2020 primaries, D65,
+   * 1000-nit mastering display, MaxCLL 1000 / MaxFALL 400).
+   *
+   * @param metadata Filled when the daemon reports 10-bit input.
+   * @return True when metadata was written.
+   */
+  bool daemon_hdr_metadata(SS_HDR_METADATA &metadata);
 }  // namespace rkmpp

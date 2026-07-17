@@ -1193,7 +1193,10 @@ namespace video {
       AV_HWDEVICE_TYPE_NONE,
       AV_PIX_FMT_DRM_PRIME,
       AV_PIX_FMT_NV12,
-      AV_PIX_FMT_NONE,
+      // 10-bit: Rockchip compact NV15 (ffmpeg-rockchip pixel format; the
+      // retro-capture daemon delivers NV15 dma-bufs and the patched
+      // hevc_rkmpp encodes them as HEVC Main 10).
+      AV_PIX_FMT_NV15,
       AV_PIX_FMT_NONE,
       AV_PIX_FMT_NONE,
       rkmpp_init_avcodec_hardware_input_buffer
@@ -3816,6 +3819,10 @@ namespace video {
         return platf::pix_fmt_e::yuv444p;
       case AV_PIX_FMT_YUV444P16:
         return platf::pix_fmt_e::yuv444p16;
+#ifdef SUNSHINE_BUILD_RKMPP
+      case AV_PIX_FMT_NV15:  // ffmpeg-rockchip only
+        return platf::pix_fmt_e::nv15;
+#endif
       default:
         return platf::pix_fmt_e::unknown;
     }

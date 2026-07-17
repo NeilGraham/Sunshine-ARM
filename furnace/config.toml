@@ -32,6 +32,13 @@ include_target = ["build/cpack_artifacts/Sunshine.deb"]
 commands = [
     "rm -rf node_modules; export HOME=/home/builder CCACHE_DIR=$PWD/build/.ccache NPM_CONFIG_CACHE=$PWD/build/npm-cache; (ccache --zero-stats || true); ./scripts/linux_build.sh --skip-deps --skip-cuda --num-processors=4 --rkmpp=/opt/ffmpeg-rockchip; status=$?; (ccache --show-stats || true); rm -rf node_modules; exit \"$status\"",
 ]
+# Build lineage: append time/branch/commit/artifact to ~/build-history/ after
+# every successful build (see ~/build-history/README.md). A job's `then`
+# REPLACES this list, so each job below must repeat the record line with its
+# own label.
+then = [
+    "~/bin/record-sunshine-build build || true",
+]
 
 # Full build (inherited from [run]) plus install + service restart on this
 # device. apt (not dpkg -i) so librockchip-mpp1/librga2 deps resolve.
@@ -39,4 +46,5 @@ commands = [
 then = [
     "sudo -n apt-get install -y --reinstall ./build/cpack_artifacts/Sunshine.deb",
     "sudo -n systemctl restart sunshine-retro 2>/dev/null || true",
+    "~/bin/record-sunshine-build deploy || true",
 ]

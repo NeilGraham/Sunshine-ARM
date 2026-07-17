@@ -26,6 +26,7 @@
 // standard includes
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -336,7 +337,7 @@ namespace rkmpp {
       desc->objects[0].size = sinfo.buffer_size;
       desc->objects[0].format_modifier = sinfo.modifier;
       desc->nb_layers = 1;
-      desc->layers[0].format = sinfo.fourcc;  // DRM_FORMAT_NV12
+      desc->layers[0].format = sinfo.fourcc;  // DRM_FORMAT_NV12 / DRM_FORMAT_NV15
       desc->layers[0].nb_planes = 2;
       desc->layers[0].planes[0].object_index = 0;
       desc->layers[0].planes[0].offset = sinfo.offset_y;
@@ -620,5 +621,98 @@ namespace rkmpp {
     }
 
     return device;
+  }
+
+  // ---- daemon HDR surface (10-bit HDR project) ----
+
+  bool daemon_hdr_active() {
+    if (!std::getenv("SUNSHINE_RKMPP_V4L2")) {
+      return false;  // not a capture-streaming box
+    }
+
+    // Callers run at session-setup/probe cadence; cache briefly so repeated
+    // is_hdr() checks within one setup don't each round-trip the socket.
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point checked_at {};
+    static bool cached = false;
+    std::lock_guard lk(mu);
+    const auto now = std::chrono::steady_clock::now();
+    if (checked_at.time_since_epoch().count() != 0 && now - checked_at < 1s) {
+      return cached;
+    }
+    checked_at = now;
+    cached = false;
+
+    const char *env = std::getenv("RETRO_CAPTURE_SOCKET");
+    const char *path = (env && *env) ? env : RCAP_SOCKET_DEFAULT;
+    int sock = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (sock < 0) {
+      return false;
+    }
+    sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    std::uint8_t buf[RCAP_MAX_MSG_SIZE];
+    const auto recv_reply = [&]() -> ssize_t {
+      pollfd pfd {sock, POLLIN, 0};
+      if (poll(&pfd, 1, 250) <= 0) {
+        return -1;
+      }
+      return ::recv(sock, buf, sizeof(buf), 0);
+    };
+
+    do {
+      if (::connect(sock, (sockaddr *) &addr, sizeof(addr)) < 0) {
+        break;
+      }
+      rcap_hello hello {};
+      hello.hdr = {RCAP_MSG_HELLO, 0};
+      hello.magic = RCAP_MAGIC;
+      hello.ver_min = 1;
+      hello.ver_max = RCAP_PROTO_VERSION;
+      hello.role = RCAP_ROLE_STATUS;
+      std::strncpy(hello.name, "sunshine-hdr", sizeof(hello.name) - 1);
+      if (::send(sock, &hello, sizeof(hello), MSG_NOSIGNAL) != (ssize_t) sizeof(hello)) {
+        break;
+      }
+      ssize_t n = recv_reply();
+      if (n < (ssize_t) sizeof(rcap_hdr) || ((rcap_hdr *) buf)->type != RCAP_MSG_HELLO_ACK) {
+        break;
+      }
+      rcap_status_get get {{RCAP_MSG_STATUS_GET, 0}};
+      if (::send(sock, &get, sizeof(get), MSG_NOSIGNAL) != (ssize_t) sizeof(get)) {
+        break;
+      }
+      n = recv_reply();
+      if (n <= (ssize_t) sizeof(rcap_hdr) || ((rcap_hdr *) buf)->type != RCAP_MSG_STATUS) {
+        break;
+      }
+      buf[n - 1] = 0;  // defensive; STATUS is NUL-terminated within the datagram
+      // PROTOCOL.md 3.10: input.bit_depth is 10 iff the capture is NV15,
+      // which the daemon defines as BT.2020+PQ content (the MVP contract).
+      cached = std::strstr((const char *) buf + sizeof(rcap_hdr), "\"bit_depth\":10") != nullptr;
+    } while (false);
+    ::close(sock);
+    return cached;
+  }
+
+  bool daemon_hdr_metadata(SS_HDR_METADATA &metadata) {
+    if (!daemon_hdr_active()) {
+      return false;
+    }
+    // Standard HDR10 defaults (CTA-861.3 units, matching txctl): BT.2020
+    // primaries, D65 white point, 1000/0.005-nit mastering display,
+    // MaxCLL 1000, MaxFALL 400. Moonlight clients tone-map from these.
+    metadata = {};
+    metadata.displayPrimaries[0] = {35400, 14600};  // R (0.708, 0.292)
+    metadata.displayPrimaries[1] = {8500, 39850};  // G (0.170, 0.797)
+    metadata.displayPrimaries[2] = {6550, 2300};  // B (0.131, 0.046)
+    metadata.whitePoint = {15635, 16450};  // D65 (0.3127, 0.3290)
+    metadata.maxDisplayLuminance = 1000;  // nits
+    metadata.minDisplayLuminance = 50;  // 0.0001-nit units -> 0.005 nits
+    metadata.maxContentLightLevel = 1000;
+    metadata.maxFrameAverageLightLevel = 400;
+    return true;
   }
 }  // namespace rkmpp

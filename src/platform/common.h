@@ -318,6 +318,7 @@ namespace platf {
     yuv420p,  ///< YUV 4:2:0
     yuv420p10,  ///< YUV 4:2:0 10-bit
     nv12,  ///< NV12
+    nv15,  ///< NV15 (Rockchip compact 10-bit 4:2:0 semi-planar)
     p010,  ///< P010
     ayuv,  ///< AYUV
     yuv444p16,  ///< Planar 10-bit (shifted to 16-bit) YUV 4:4:4
@@ -344,6 +345,7 @@ namespace platf {
       _CONVERT(yuv420p);
       _CONVERT(yuv420p10);
       _CONVERT(nv12);
+      _CONVERT(nv15);
       _CONVERT(p010);
       _CONVERT(ayuv);
       _CONVERT(yuv444p16);
