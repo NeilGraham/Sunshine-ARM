@@ -927,25 +927,35 @@ namespace platf {
             }
 
             auto fb = card.fb(plane.get());
-            if (!fb) {
+            // Capture box (SUNSHINE_RKMPP_V4L2): frames come from the
+            // retro-capture daemon socket, never from KMS framebuffers —
+            // and the daemon holds DRM master for its HDMI-TX passthrough
+            // sink, which makes GETFB2/handle export fail with EPERM here.
+            // The display object only supplies geometry + the (already
+            // daemon-driven) HDR hooks, so tolerate a missing fb and take
+            // geometry from the CRTC instead of failing the whole probe.
+            const bool capture_box = std::getenv("SUNSHINE_RKMPP_V4L2") != nullptr;
+            if (!fb && !capture_box) {
               BOOST_LOG(error) << "Couldn't get drm fb for plane ["sv << plane->fb_id << "]: "sv << strerror(errno);
               return -1;
             }
 
-            if (!fb->handles[0]) {
+            if (fb && !fb->handles[0] && !capture_box) {
               BOOST_LOG(error) << "Couldn't get handle for DRM Framebuffer ["sv << plane->fb_id << "]: Probably not permitted"sv;
               return -1;
             }
 
-            for (int i = 0; i < 4; ++i) {
-              if (!fb->handles[i]) {
-                break;
-              }
+            if (fb && fb->handles[0]) {
+              for (int i = 0; i < 4; ++i) {
+                if (!fb->handles[i]) {
+                  break;
+                }
 
-              auto fb_fd = card.handleFD(fb->handles[i]);
-              if (fb_fd.el < 0) {
-                BOOST_LOG(error) << "Couldn't get primary file descriptor for Framebuffer ["sv << fb->fb_id << "]: "sv << strerror(errno);
-                continue;
+                auto fb_fd = card.handleFD(fb->handles[i]);
+                if (fb_fd.el < 0) {
+                  BOOST_LOG(error) << "Couldn't get primary file descriptor for Framebuffer ["sv << fb->fb_id << "]: "sv << strerror(errno);
+                  continue;
+                }
               }
             }
 
@@ -971,10 +981,12 @@ namespace platf {
 
             // TODO: surf_sd = fb->to_sd();
 
-            kms::print(plane.get(), fb.get(), crtc.get());
+            if (fb) {
+              kms::print(plane.get(), fb.get(), crtc.get());
+            }
 
-            img_width = fb->width;
-            img_height = fb->height;
+            img_width = fb ? fb->width : crtc->width;
+            img_height = fb ? fb->height : crtc->height;
             img_offset_x = crtc->x;
             img_offset_y = crtc->y;
 
@@ -2089,12 +2101,17 @@ namespace platf {
         }
 
         auto fb = card.fb(plane.get());
-        if (!fb) {
+        // Capture box: tolerate fb-permission failures (the retro-capture
+        // daemon holds DRM master for the HDMI-TX passthrough sink) — the
+        // display list only feeds geometry/touch viewports here; frames
+        // come from the daemon socket. See display_t::init.
+        const bool capture_box = std::getenv("SUNSHINE_RKMPP_V4L2") != nullptr;
+        if (!fb && !capture_box) {
           BOOST_LOG(error) << "Couldn't get drm fb for plane ["sv << plane->fb_id << "]: "sv << strerror(errno);
           continue;
         }
 
-        if (!fb->handles[0]) {
+        if (fb && !fb->handles[0] && !capture_box) {
           BOOST_LOG(error) << "Couldn't get handle for DRM Framebuffer ["sv << plane->fb_id << "]: Probably not permitted"sv;
 #if defined(SUNSHINE_BUILD_FLATPAK) || defined(SUNSHINE_BUILD_APPIMAGE)
           BOOST_LOG((config::video.capture == "kms") ? fatal : error)
@@ -2124,7 +2141,9 @@ namespace platf {
         kms::env_width = std::max(kms::env_width, (int) (crtc->x + crtc->width));
         kms::env_height = std::max(kms::env_height, (int) (crtc->y + crtc->height));
 
-        kms::print(plane.get(), fb.get(), crtc.get());
+        if (fb) {
+          kms::print(plane.get(), fb.get(), crtc.get());
+        }
 
         display_names.emplace_back(std::to_string(count++));
       }
