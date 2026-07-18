@@ -918,7 +918,17 @@ namespace platf {
             }
 
             if (card.is_cursor(plane->plane_id)) {
-              continue;
+              // Capture box: when the retro-capture daemon's HDMI-TX
+              // passthrough sink is active from boot, the ONLY lit plane is
+              // its Esmart overlay window, which the vendor kernel types as
+              // a cursor plane — and the console primary plane has no fb.
+              // Skipping it leaves zero candidates ("Couldn't find monitor
+              // [0]" → session 503). Accept a lit cursor-typed plane here:
+              // this display object only feeds geometry/HDR hooks, frames
+              // come from the daemon socket.
+              if (!std::getenv("SUNSHINE_RKMPP_V4L2")) {
+                continue;
+              }
             }
 
             if (monitor != monitor_index) {
@@ -2096,16 +2106,22 @@ namespace platf {
           continue;
         }
 
-        if (card.is_cursor(plane->plane_id)) {
-          continue;
-        }
-
-        auto fb = card.fb(plane.get());
         // Capture box: tolerate fb-permission failures (the retro-capture
         // daemon holds DRM master for the HDMI-TX passthrough sink) — the
         // display list only feeds geometry/touch viewports here; frames
         // come from the daemon socket. See display_t::init.
         const bool capture_box = std::getenv("SUNSHINE_RKMPP_V4L2") != nullptr;
+
+        if (card.is_cursor(plane->plane_id)) {
+          // Capture box: the passthrough sink's Esmart overlay is typed as a
+          // cursor plane by the vendor kernel and can be the only lit plane
+          // (sink active from boot) — accept it or the display list is empty.
+          if (!capture_box) {
+            continue;
+          }
+        }
+
+        auto fb = card.fb(plane.get());
         if (!fb && !capture_box) {
           BOOST_LOG(error) << "Couldn't get drm fb for plane ["sv << plane->fb_id << "]: "sv << strerror(errno);
           continue;
