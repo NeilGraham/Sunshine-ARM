@@ -1089,9 +1089,11 @@ namespace platf {
       bool is_hdr() {
 #ifdef SUNSHINE_BUILD_RKMPP
         // Capture box: HDR follows what the retro-capture daemon ingests
-        // (NV15 => BT.2020+PQ), not this TX connector's output state.
-        if (rkmpp::daemon_hdr_active()) {
-          return true;
+        // (NV15 => BT.2020+PQ) EXCLUSIVELY — this TX connector's HDR blob is
+        // at best stale txctl test state (never fall through to it, or the
+        // startup HDR probe runs 10-bit against an 8-bit capture).
+        if (std::getenv("SUNSHINE_RKMPP_V4L2")) {
+          return rkmpp::daemon_hdr_active();
         }
 #endif
         if (!hdr_metadata_blob_id || *hdr_metadata_blob_id == 0) {
@@ -1147,10 +1149,11 @@ namespace platf {
        */
       bool get_hdr_metadata(SS_HDR_METADATA &metadata) {
 #ifdef SUNSHINE_BUILD_RKMPP
-        // See is_hdr(): a daemon 10-bit session serves HDR10 defaults (the
-        // HDMI-RX driver does not parse the source's HDR InfoFrame).
-        if (rkmpp::daemon_hdr_metadata(metadata)) {
-          return true;
+        // See is_hdr(): the daemon is the sole HDR authority on capture
+        // boxes; a 10-bit session serves HDR10 defaults (the HDMI-RX driver
+        // does not parse the source's HDR InfoFrame).
+        if (std::getenv("SUNSHINE_RKMPP_V4L2")) {
+          return rkmpp::daemon_hdr_metadata(metadata);
         }
 #endif
         // This performs all the metadata validation
