@@ -50,6 +50,7 @@ extern "C" {
 #include "graphics.h"
 #include "misc.h"
 #include "retro-capture-protocol.h"
+#include "retro-overlay.h"
 #include "rkmpp.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -526,6 +527,11 @@ namespace rkmpp {
         }
         missing_logged = false;
         this->frame = enc;
+        // Encoder OSD (stream overlay): attach/remove side data on the
+        // wrapper. No pixel work; hidden overlay attaches nothing.
+        auto *desc = (AVDRMFrameDescriptor *) enc->data[0];
+        rovl::attach(enc, enc->width, enc->height,
+                     desc->layers[0].format == 0x3531564e /* DRM_FORMAT_NV15 */);
         return 0;
       }
 

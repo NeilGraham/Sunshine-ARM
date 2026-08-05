@@ -204,7 +204,9 @@ if(SUNSHINE_ENABLE_RKMPP AND LIBDRM_FOUND AND LIBCAP_FOUND)
     add_compile_definitions(SUNSHINE_BUILD_RKMPP)
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.h"
-            "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.cpp")
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.cpp"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/retro-overlay.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/retro-overlay.cpp")
 
     # Optional: Rockchip RGA 2D engine, used as an alternative capture
     # scaler/converter to the Mali GPU path (SUNSHINE_RKMPP_SCALER=rga).

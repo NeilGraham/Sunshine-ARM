@@ -96,6 +96,16 @@ RUN git -C /opt/ffmpeg-rockchip apply /tmp/nv15-main10.patch \
        commit -am "rkmppenc: NV15 input + HEVC Main 10 (retro-stream 10-bit HDR)" \
     && rm /tmp/nv15-main10.patch
 
+# Stream overlay: VEPU580 hardware OSD via AV_FRAME_DATA_RKMPP_OSD side data
+# (retro-overlay daemon -> Sunshine client -> encoder; blend happens inside
+# the encode pass). Generated against the nv15 patch above — keep this apply
+# AFTER it. Committed for the same revision-stamp reason.
+COPY patches/ffmpeg-rockchip-rkmpp-osd.patch /tmp/rkmpp-osd.patch
+RUN git -C /opt/ffmpeg-rockchip apply /tmp/rkmpp-osd.patch \
+    && git -C /opt/ffmpeg-rockchip -c user.name=furnace -c user.email=furnace@local \
+       commit -am "rkmppenc: hardware OSD side data (retro-stream overlay)" \
+    && rm /tmp/rkmpp-osd.patch
+
 # Build user matching furnace's --user uid:gid, with passwordless sudo.
 RUN (getent group "${BUILD_GID}" || groupadd -g "${BUILD_GID}" builder) \
     && useradd -o -u "${BUILD_UID}" -g "${BUILD_GID}" -m -s /bin/bash builder \
