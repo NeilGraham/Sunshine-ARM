@@ -1,8 +1,8 @@
 diff --git a/libavcodec/rkmppenc.c b/libavcodec/rkmppenc.c
-index 6837a79..adc0d49 100644
+index 6837a79..ea4901b 100644
 --- a/libavcodec/rkmppenc.c
 +++ b/libavcodec/rkmppenc.c
-@@ -716,6 +716,155 @@ static int rkmpp_prepare_udu_sei_data(AVCodecContext *avctx, MPPEncFrame *mpp_en
+@@ -716,6 +716,190 @@ static int rkmpp_prepare_udu_sei_data(AVCodecContext *avctx, MPPEncFrame *mpp_en
      return 0;
  }
  
@@ -30,6 +30,39 @@ index 6837a79..adc0d49 100644
 +    return 0;
 +}
 +
++/*
++ * No (usable) side data on this frame. Fire the transition IDR if OSD was
++ * showing, and — once OSD has ever been used — attach an explicit
++ * all-disabled region set instead of leaving the meta key absent, so the
++ * HAL writes osd_e = 0 on every MPP vintage (see osd_ever_used).
++ */
++static int rkmpp_osd_clear(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame)
++{
++    RKMPPEncContext *r = avctx->priv_data;
++    MppEncOSDData2 *dst = &mpp_enc_frame->mpp_osd;
++    MppMeta mpp_meta;
++    MPP_RET ret;
++
++    rkmpp_osd_geometry_changed(avctx, 0);
++
++    if (!r->osd_ever_used)
++        return 0;
++
++    memset(dst, 0, sizeof(*dst));
++    dst->num_region = 1; /* region[0]: enable = 0, zero geometry, no buffer */
++
++    mpp_meta = mpp_frame_get_meta(mpp_enc_frame->mpp_frame);
++    if (!mpp_meta) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to get frame meta\n");
++        return AVERROR_EXTERNAL;
++    }
++    if ((ret = mpp_meta_set_ptr(mpp_meta, KEY_OSD_DATA2, dst)) != MPP_OK) {
++        av_log(avctx, AV_LOG_ERROR, "Failed to set the OSD clear ptr\n");
++        return AVERROR_EXTERNAL;
++    }
++    return 0;
++}
++
 +static int rkmpp_prepare_osd_data(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame)
 +{
 +    RKMPPEncContext *r = avctx->priv_data;
@@ -43,19 +76,19 @@ index 6837a79..adc0d49 100644
 +
 +    sd = av_frame_get_side_data(mpp_enc_frame->frame, AV_FRAME_DATA_RKMPP_OSD);
 +    if (!sd)
-+        return rkmpp_osd_geometry_changed(avctx, 0);
++        return rkmpp_osd_clear(avctx, mpp_enc_frame);
 +
 +    if (sd->size < sizeof(*osd)) {
 +        av_log(avctx, AV_LOG_WARNING, "Invalid RKMPP OSD side data: "
 +               "(%"SIZE_SPECIFIER" < %"SIZE_SPECIFIER"), skipping\n",
 +               sd->size, sizeof(*osd));
-+        return rkmpp_osd_geometry_changed(avctx, 0);
++        return rkmpp_osd_clear(avctx, mpp_enc_frame);
 +    }
 +    osd = (const RKMPPOsdSideData *)sd->data;
 +
 +    if (!osd->num_region || osd->num_region > RKMPP_OSD_MAX_REGIONS ||
 +        osd->fd < 0 || !osd->size)
-+        return rkmpp_osd_geometry_changed(avctx, 0);
++        return rkmpp_osd_clear(avctx, mpp_enc_frame);
 +
 +    {
 +        uint32_t hash = 2166136261u;
@@ -129,6 +162,8 @@ index 6837a79..adc0d49 100644
 +        r->osd_imports[slot].buf  = mpp_buf;
 +    }
 +
++    r->osd_ever_used = 1;
++
 +    memset(dst, 0, sizeof(*dst));
 +    dst->num_region = osd->num_region;
 +    for (i = 0; i < osd->num_region; i++) {
@@ -158,7 +193,7 @@ index 6837a79..adc0d49 100644
  static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
  {
      RKMPPEncContext *r = avctx->priv_data;
-@@ -900,6 +1049,13 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -900,6 +1084,13 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
              goto exit;
      }
  
@@ -172,7 +207,7 @@ index 6837a79..adc0d49 100644
      return mpp_enc_frame;
  
  exit:
-@@ -1102,6 +1258,13 @@ static av_cold int rkmpp_encode_close(AVCodecContext *avctx)
+@@ -1102,6 +1293,13 @@ static av_cold int rkmpp_encode_close(AVCodecContext *avctx)
  
      clear_frame_list(&r->frame_list);
  
@@ -187,7 +222,7 @@ index 6837a79..adc0d49 100644
          av_buffer_unref(&r->hwframe);
      if (r->hwdevice)
 diff --git a/libavcodec/rkmppenc.h b/libavcodec/rkmppenc.h
-index f266fa3..909245e 100644
+index f266fa3..20bbf15 100644
 --- a/libavcodec/rkmppenc.h
 +++ b/libavcodec/rkmppenc.h
 @@ -45,10 +45,36 @@
@@ -227,7 +262,7 @@ index f266fa3..909245e 100644
      struct MPPEncFrame *next;
      int                 queued;
  } MPPEncFrame;
-@@ -70,6 +96,20 @@ typedef struct RKMPPEncContext {
+@@ -70,6 +96,26 @@ typedef struct RKMPPEncContext {
      MPPEncFrame       *frame_list;
      int                async_frames;
  
@@ -244,6 +279,12 @@ index f266fa3..909245e 100644
 +     * client whose loss recovery misses the repaint frames can never keep
 +     * a stale overlay in its reference pictures. */
 +    uint32_t           osd_geom_hash;
++    /* Set once any OSD side data was consumed this session. From then on,
++     * frames WITHOUT side data get an explicit all-disabled region set:
++     * the Dec-2023 MPP this device ships latches the previous frame's OSD
++     * pointer in its task ring when the meta key is merely absent (proven
++     * with a system-library probe — the overlay re-blends forever). */
++    int                osd_ever_used;
 +
      int                rc_mode;
      int                qp_init;
