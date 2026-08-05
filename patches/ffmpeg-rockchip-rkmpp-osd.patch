@@ -1,11 +1,35 @@
 diff --git a/libavcodec/rkmppenc.c b/libavcodec/rkmppenc.c
-index 6837a79..7037d36 100644
+index 6837a79..adc0d49 100644
 --- a/libavcodec/rkmppenc.c
 +++ b/libavcodec/rkmppenc.c
-@@ -716,6 +716,111 @@ static int rkmpp_prepare_udu_sei_data(AVCodecContext *avctx, MPPEncFrame *mpp_en
+@@ -716,6 +716,155 @@ static int rkmpp_prepare_udu_sei_data(AVCodecContext *avctx, MPPEncFrame *mpp_en
      return 0;
  }
  
++/*
++ * Track the enabled OSD region geometry and force an IDR whenever it
++ * changes (including to/from "none"). The blend is clean at the encoder —
++ * verified: absent side data stops rendering within one frame — but the
++ * few frames that repaint a vacated area are ordinary P-frames; if the
++ * link drops them, a receiver keeps the stale overlay in its references
++ * indefinitely (static blocks SKIP forever). One keyframe per overlay
++ * transition makes that impossible.
++ */
++static int rkmpp_osd_geometry_changed(AVCodecContext *avctx, uint32_t hash)
++{
++    RKMPPEncContext *r = avctx->priv_data;
++    MPP_RET ret;
++
++    if (hash == r->osd_geom_hash)
++        return 0;
++    r->osd_geom_hash = hash;
++
++    if ((ret = r->mapi->control(r->mctx, MPP_ENC_SET_IDR_FRAME, NULL)) != MPP_OK)
++        av_log(avctx, AV_LOG_WARNING,
++               "Failed to request IDR for OSD transition: %d\n", ret);
++    return 0;
++}
++
 +static int rkmpp_prepare_osd_data(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame)
 +{
 +    RKMPPEncContext *r = avctx->priv_data;
@@ -19,19 +43,39 @@ index 6837a79..7037d36 100644
 +
 +    sd = av_frame_get_side_data(mpp_enc_frame->frame, AV_FRAME_DATA_RKMPP_OSD);
 +    if (!sd)
-+        return 0;
++        return rkmpp_osd_geometry_changed(avctx, 0);
 +
 +    if (sd->size < sizeof(*osd)) {
 +        av_log(avctx, AV_LOG_WARNING, "Invalid RKMPP OSD side data: "
 +               "(%"SIZE_SPECIFIER" < %"SIZE_SPECIFIER"), skipping\n",
 +               sd->size, sizeof(*osd));
-+        return 0;
++        return rkmpp_osd_geometry_changed(avctx, 0);
 +    }
 +    osd = (const RKMPPOsdSideData *)sd->data;
 +
 +    if (!osd->num_region || osd->num_region > RKMPP_OSD_MAX_REGIONS ||
 +        osd->fd < 0 || !osd->size)
-+        return 0;
++        return rkmpp_osd_geometry_changed(avctx, 0);
++
++    {
++        uint32_t hash = 2166136261u;
++        for (i = 0; i < osd->num_region; i++) {
++            const uint32_t geom[5] = {
++                osd->region[i].enable, osd->region[i].start_mb_x,
++                osd->region[i].start_mb_y, osd->region[i].num_mb_x,
++                osd->region[i].num_mb_y,
++            };
++            const uint8_t *b = (const uint8_t *)geom;
++            size_t k;
++            for (k = 0; k < sizeof(geom); k++)
++                hash = (hash ^ b[k]) * 16777619u;
++        }
++        if (!hash)
++            hash = 1;
++        ret = rkmpp_osd_geometry_changed(avctx, hash);
++        if (ret < 0)
++            return ret;
++    }
 +
 +    /* the palette is applied through the control path, only on change */
 +    if (!r->osd_plt_set || osd->palette_serial != r->osd_plt_serial) {
@@ -114,7 +158,7 @@ index 6837a79..7037d36 100644
  static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
  {
      RKMPPEncContext *r = avctx->priv_data;
-@@ -900,6 +1005,13 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -900,6 +1049,13 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
              goto exit;
      }
  
@@ -128,7 +172,7 @@ index 6837a79..7037d36 100644
      return mpp_enc_frame;
  
  exit:
-@@ -1102,6 +1214,13 @@ static av_cold int rkmpp_encode_close(AVCodecContext *avctx)
+@@ -1102,6 +1258,13 @@ static av_cold int rkmpp_encode_close(AVCodecContext *avctx)
  
      clear_frame_list(&r->frame_list);
  
@@ -143,7 +187,7 @@ index 6837a79..7037d36 100644
          av_buffer_unref(&r->hwframe);
      if (r->hwdevice)
 diff --git a/libavcodec/rkmppenc.h b/libavcodec/rkmppenc.h
-index f266fa3..ee54bed 100644
+index f266fa3..909245e 100644
 --- a/libavcodec/rkmppenc.h
 +++ b/libavcodec/rkmppenc.h
 @@ -45,10 +45,36 @@
@@ -183,7 +227,7 @@ index f266fa3..ee54bed 100644
      struct MPPEncFrame *next;
      int                 queued;
  } MPPEncFrame;
-@@ -70,6 +96,15 @@ typedef struct RKMPPEncContext {
+@@ -70,6 +96,20 @@ typedef struct RKMPPEncContext {
      MPPEncFrame       *frame_list;
      int                async_frames;
  
@@ -195,6 +239,11 @@ index f266fa3..ee54bed 100644
 +    }                  osd_imports[RKMPP_OSD_MAX_REGIONS];
 +    uint32_t           osd_plt_serial;
 +    int                osd_plt_set;
++    /* FNV-1a of the enabled region geometry; 0 = OSD inactive. An IDR is
++     * forced whenever this changes (appear/move/resize/disappear) so a
++     * client whose loss recovery misses the repaint frames can never keep
++     * a stale overlay in its reference pictures. */
++    uint32_t           osd_geom_hash;
 +
      int                rc_mode;
      int                qp_init;
