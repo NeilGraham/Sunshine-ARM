@@ -292,10 +292,42 @@ namespace rkmpp {
         // protocol's flag transitions give this process the same signal for
         // its own outgoing-audio gate (replaces the triggers that lived in
         // the migrated capture code).
-        const bool now_held = (newest_flags & (RCAP_FRAME_HELD | RCAP_FRAME_BLACK)) != 0;
-        if (now_held != last_was_held) {
+        // NOT every held frame is a renegotiation. Measured on a healthy,
+        // locked 4K60 link (2026-08-06): the HDMI-RX silently fails to
+        // deliver a frame 5-9 times a minute, which reaches us as exactly ONE
+        // HELD re-emission — the capture daemon itself loses nothing
+        // (capture.json: drain_dropped 0, driver sequence continuous,
+        // DQBUF->send p99 9.5 ms). Arming a 500 ms squelch on the way into
+        // AND back out of each of those was the "audio cutout every ~6 s":
+        // up to a full second of muted audio per single dropped frame.
+        //
+        // The gate exists for the RX audio FIFO re-init click, which only
+        // accompanies a real renegotiation: signal loss, the pre-first-frame
+        // BLACK prime, or a held run that outlasts any single dropped frame
+        // by an order of magnitude. Squelch those, ignore the one-frame
+        // blips. (The daemon independently notifies retro-audio over its FIFO
+        // at the precise ladder points, so this is belt-and-braces, not the
+        // only protection.)
+        static const auto hold_ms = [] {
+          const char *env = std::getenv("SUNSHINE_AUDIO_GATE_HOLD_MS");
+          const int ms = env && *env ? std::atoi(env) : 120;
+          return std::chrono::milliseconds(ms > 0 ? ms : 120);
+        }();
+        const bool held_now = (newest_flags & (RCAP_FRAME_HELD | RCAP_FRAME_BLACK)) != 0;
+        const bool reneg_now = (newest_flags & (RCAP_FRAME_BLACK | RCAP_FRAME_SIGNAL_LOST)) != 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (!held_now) {
+          held_since = {};
+        } else if (held_since.time_since_epoch().count() == 0) {
+          held_since = now;
+        }
+        const bool sustained = held_now &&
+                               held_since.time_since_epoch().count() != 0 &&
+                               now - held_since >= hold_ms;
+        const bool gate_worthy = reneg_now || sustained;
+        if (gate_worthy != last_was_held) {
           audio_gate::trigger(audio_gate::reneg_ms.load(std::memory_order_relaxed), false);
-          last_was_held = now_held;
+          last_was_held = gate_worthy;
         }
         if (cur_index != newest) {
           // Superseded: hand the buffer back so the daemon can write into it.
@@ -407,6 +439,9 @@ namespace rkmpp {
     std::vector<bool> leased;
     int cur_index {-1};
     bool last_was_held {true};  // stream primes with BLACK
+    // Start of the current unbroken held run, for the renegotiation test
+    // above; zero when fresh content is flowing.
+    std::chrono::steady_clock::time_point held_since {};
     AVBufferRef *hw_frames_ctx {};
     std::chrono::steady_clock::time_point last_reconnect_at {};
   };
