@@ -150,7 +150,7 @@ namespace cbs {
     // IDR injection under capture churn). Building a replacement SPS is then
     // impossible — return empty and let the session run without the VUI
     // rewrite instead of dereferencing NULL (SEGV'd session::video 3x on the
-    // 2026-07-13 loopback soak; core + bt in ~/stability/hdmi-rx/).
+    // 2026-07-13 loopback soak; core + bt in ~/tests/hdmi-rx/).
     if (!sps_p) {
       BOOST_LOG(error) << "Packet activated no SPS; skipping replacement SPS injection"sv;
       return {};
