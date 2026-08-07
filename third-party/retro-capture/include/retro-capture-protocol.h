@@ -43,7 +43,7 @@
 extern "C" {
 #endif
 
-#define RCAP_PROTO_VERSION 2
+#define RCAP_PROTO_VERSION 3
 #define RCAP_PROTO_VERSION_MIN 1 /* daemon still speaks v1 to old consumers */
 #define RCAP_MAGIC 0x52434150u /* "RCAP" */
 #define RCAP_SOCKET_DEFAULT "/run/retro-stream/retro-capture.sock"
@@ -63,6 +63,9 @@ enum rcap_msg_type {
   /* v2 additions: live shader control, no daemon restart. */
   RCAP_MSG_SHADER_SET = 11, /* status client -> daemon (v2 connections only) */
   RCAP_MSG_SHADER_ACK = 12, /* daemon -> status client */
+  /* v3 additions: live HDMI-TX display-passthrough control. */
+  RCAP_MSG_DISPLAY_SET = 13, /* status client -> daemon (v3 connections only) */
+  RCAP_MSG_DISPLAY_ACK = 14, /* daemon -> status client */
 };
 
 enum rcap_role {
@@ -232,6 +235,27 @@ struct RCAP_PACKED rcap_shader_set {
 struct RCAP_PACKED rcap_shader_ack {
   struct rcap_hdr hdr;
   uint16_t ok; /* 1 = accepted (post-clamp), 0 = rejected */
+  uint16_t reserved;
+};
+
+/* ---- v3: live HDMI-TX display passthrough control ---- */
+
+/* Enables/disables the daemon's local display sink (capture frames scanned
+ * out to the board's HDMI-TX) live — next frame, no restart, no effect on
+ * the consumer session or pool. Sent by a STATUS-role client on a connection
+ * speaking version >= 3. The sink must have been armed at daemon start
+ * (RETRO_CAPTURE_DISPLAY=hdmi); when it was not, the daemon replies
+ * available=0 and the enable request is a no-op. */
+struct RCAP_PACKED rcap_display_set {
+  struct rcap_hdr hdr;
+  uint8_t enable; /* 1 = scan out frames, 0 = blank the plane + drop HDR */
+  uint8_t reserved[3];
+};
+
+struct RCAP_PACKED rcap_display_ack {
+  struct rcap_hdr hdr;
+  uint8_t ok;        /* 1 = request queued */
+  uint8_t available; /* 1 = the display sink is armed in this daemon run */
   uint16_t reserved;
 };
 

@@ -208,17 +208,11 @@ if(SUNSHINE_ENABLE_RKMPP AND LIBDRM_FOUND AND LIBCAP_FOUND)
             "${CMAKE_SOURCE_DIR}/src/platform/linux/retro-overlay.h"
             "${CMAKE_SOURCE_DIR}/src/platform/linux/retro-overlay.cpp")
 
-    # Optional: Rockchip RGA 2D engine, used as an alternative capture
-    # scaler/converter to the Mali GPU path (SUNSHINE_RKMPP_SCALER=rga).
-    pkg_check_modules(LIBRGA librga)
-    if(LIBRGA_FOUND)
-        add_compile_definitions(SUNSHINE_BUILD_RGA)
-        list(APPEND PLATFORM_LIBRARIES ${LIBRGA_LIBRARIES})
-        include_directories(SYSTEM ${LIBRGA_INCLUDE_DIRS})
-        message(STATUS "RKMPP: RGA 2D scaler enabled (librga ${LIBRGA_VERSION})")
-    else()
-        message(STATUS "RKMPP: librga not found; RGA scaler path disabled")
-    endif()
+    # The retro-capture consumer client (MIT), vendored verbatim from the
+    # retro-capture repo — see third-party/retro-capture and the drift
+    # tripwire in the build entry points.
+    add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/retro-capture/client" retro-capture-client)
+    list(APPEND PLATFORM_LIBRARIES retro-capture-client)
 endif()
 
 # wayland
