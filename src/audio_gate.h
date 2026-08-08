@@ -22,12 +22,14 @@
 #include <cstdint>
 #include <cstdlib>
 
-#ifdef __linux__
-  // gate-notify FIFO (best-effort, Linux-only like the rest of this fork)
-  #include <cerrno>
-  #include <csignal>
-  #include <fcntl.h>
-  #include <unistd.h>
+// The gate-notify FIFO itself belongs to retro-capture's client library
+// (third-party/retro-capture, MIT): it is that project's pipe, and its daemon
+// writes the same "gate" lines from the other side. What stays here is the
+// squelch policy — how long, and which events deserve it. The library is only
+// linked in RKMPP builds, which are the only ones with an HDMI-RX to gate.
+#if defined(__linux__) && defined(SUNSHINE_BUILD_RKMPP)
+  #include "retro-capture-client.h"
+  #define SUNSHINE_HAVE_GATE_FIFO 1
 #endif
 
 namespace audio_gate {
@@ -58,59 +60,20 @@ namespace audio_gate {
   }
 
   /**
-   * @brief Lazily-resolved fd of the gate-notify FIFO (SUNSHINE_AUDIO_GATE_FIFO).
-   *
-   * -2 = unresolved (env not read yet, or the open should be retried — the
-   * reader may simply not be up yet), -1 = disabled (env unset/empty),
-   * >= 0 = open fd. Pointing the env at retro-audio's event FIFO lets its
-   * supervisor mute the capture loopback and re-decide the stream format the
-   * moment the video path re-locks — the RX re-handshake can flip the audio
-   * between LPCM and IEC 61937, and every pactl round-trip before that mute is
-   * raw bitstream static played as PCM.
-   */
-  inline std::atomic<int> notify_fd {-2};
-
-  /**
    * @brief Best-effort one-line notification to the gate FIFO. Never blocks,
    * never fails the caller.
+   *
+   * SUNSHINE_AUDIO_GATE_FIFO points at retro-audio's event FIFO, so its
+   * supervisor can mute the capture loopback and re-decide the stream format
+   * the moment the video path re-locks — the RX re-handshake can flip the
+   * audio between LPCM and IEC 61937, and every pactl round-trip before that
+   * mute is raw bitstream static played as PCM. The pipe (fd caching,
+   * absent-reader retry, SIGPIPE) is the client library's; the decision to
+   * poke it is ours.
    */
   inline void notify() {
-#ifdef __linux__
-    int fd = notify_fd.load(std::memory_order_relaxed);
-    if (fd == -1) {
-      return;
-    }
-    if (fd == -2) {
-      const char *path = std::getenv("SUNSHINE_AUDIO_GATE_FIFO");
-      if (!path || !*path) {
-        notify_fd.store(-1, std::memory_order_relaxed);
-        return;
-      }
-      // A FIFO write can raise SIGPIPE if the reader vanishes between open and
-      // write (retro-audio recreates its FIFO on restart). Nothing in Sunshine
-      // handles SIGPIPE (asio sends use MSG_NOSIGNAL), so ignore it process-
-      // wide — but only on hosts that opted into the FIFO.
-      ::signal(SIGPIPE, SIG_IGN);
-      // O_NONBLOCK: ENXIO when no reader has the FIFO open — stay unresolved
-      // and retry on the next trigger instead of blocking the video thread.
-      fd = ::open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
-      if (fd < 0) {
-        return;
-      }
-      int expected = -2;
-      if (!notify_fd.compare_exchange_strong(expected, fd, std::memory_order_relaxed)) {
-        ::close(fd);  // another thread won the race; use its fd
-        fd = expected;
-        if (fd < 0) {
-          return;
-        }
-      }
-    }
-    if (::write(fd, "gate\n", 5) < 0 && errno == EPIPE) {
-      // Stale fd (reader recreated its FIFO): drop it and re-resolve next time.
-      ::close(fd);
-      notify_fd.store(-2, std::memory_order_relaxed);
-    }
+#ifdef SUNSHINE_HAVE_GATE_FIFO
+    retro::capture::audio_gate_notify(std::getenv("SUNSHINE_AUDIO_GATE_FIFO"));
 #endif
   }
 
