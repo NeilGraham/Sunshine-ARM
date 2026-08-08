@@ -160,7 +160,98 @@ namespace rkmpp {
     // the old in-process update_latest_frame(). Returns nullptr only before
     // the first frame or after a wrapper allocation failure.
     AVFrame *next_frame() {
-      const auto f = client->next();
+      auto f = client->next();
+
+      // Nothing FRESH in this drain means one of two things, and both used to
+      // end the same way: we polled ahead of the daemon and it has not sent
+      // this slot yet, or the RX silently skipped a frame and the daemon's
+      // cadence watchdog re-emitted the last one. Either way, encoding what
+      // we already hold FABRICATES a duplicate picture, and the next drain
+      // then finds two queued and drops one — the N,N,N+2 judder the stream
+      // suite measures at 0.05% on 1080p60 and 0.47% on 4K60 (tests/stream
+      // FINDING 15). Wait for the frame that is already on its way instead of
+      // inventing one; a skip tells the truth about a lost frame, a duplicate
+      // does not.
+      //
+      // Safe to block: the daemon re-arms its cadence watchdog on every send,
+      // so in every state SOME frame lands well inside the cap. And we only
+      // wait while the hold is BRIEF — a sustained hold is real signal loss,
+      // where the re-emission IS the correct picture and stalling the encoder
+      // would only starve the stream. That bounds the cost of a dead source
+      // to `max_wait_run` frames.
+      // The cap is a FRACTION OF THE FRAME PERIOD, never a fixed duration.
+      // This is a game stream: 20 ms is 1.2 periods at 60 Hz and nearly five
+      // at 240 Hz, so a constant that looks harmless at one rate is dead time
+      // at another. Half a period is the default — enough to collect a frame
+      // that is already in flight (measured cost at 4K60: 0.15 ms of the
+      // 15.5 ms budget), while bounding what a genuinely late frame can add
+      // to content-to-glass latency at HALF A FRAME, at any refresh rate.
+      //
+      // The period is measured from the stream itself rather than plumbed in,
+      // so it needs no call-site change and follows a mid-session mode switch.
+      // 1.5 periods, matching the window retro-capture's own cadence watchdog
+      // uses before it decides the source has stalled: waiting less than the
+      // daemon waits means both ends give up on the same tick and the held
+      // re-emission wins. Measured at 4K60 — 1.5 gives 0 duplicates, 0.5 gives
+      // 9, because the daemon's loop stretches to 20-58 ms under encoder
+      // contention. Still period-relative, so it is 25 ms at 60 Hz, 12.5 ms at
+      // 120 Hz and 6.25 ms at 240 Hz rather than a constant that only suits 60.
+      static const double wait_fraction = [] {
+        const char *env = std::getenv("SUNSHINE_RETRO_FRESH_WAIT_FRACTION");
+        const double v = env && *env ? std::atof(env) : 1.5;
+        return (v > 0.0 && v <= 2.0) ? v : 1.5;
+      }();
+      const int wait_ms = period_ms_ewma > 0.0 ?
+                            (int) (period_ms_ewma * wait_fraction) : 0;
+      constexpr int max_wait_run = 3;
+      if (wait_ms > 0 && !(f.flags & RCAP_FRAME_FRESH) &&
+          nonfresh_run < max_wait_run && client->alive()) {
+        const int cfd = client->fd();
+        if (cfd >= 0) {
+          // Keep waiting until something FRESH lands, not merely until the
+          // socket is readable: the daemon's watchdog re-emission arrives
+          // first in the missing-frame case, and accepting it is exactly the
+          // duplicate we came here to avoid. Each held frame seen on the way
+          // is still folded into `f` so the audio gate below observes the run.
+          const auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(wait_ms);
+          while (!(f.flags & RCAP_FRAME_FRESH)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+              break;
+            }
+            const auto left =
+              std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            pollfd pfd {cfd, POLLIN, 0};
+            if (poll(&pfd, 1, left > 0 ? (int) left : 1) <= 0) {
+              break;
+            }
+            const auto g = client->next();
+            if (g.flags != 0) {
+              f = g;  // a real message; an empty re-drain must not clear f
+            }
+          }
+        }
+      }
+      nonfresh_run = (f.flags & RCAP_FRAME_FRESH) ? 0 : nonfresh_run + 1;
+
+      // Measure the source's frame period from FRESH arrivals. EWMA over a
+      // long window so one late frame cannot widen the very cap that exists
+      // to bound lateness; seeded on the first interval so the wait is armed
+      // within two frames of session start. Intervals outside [1 ms, 100 ms]
+      // are ignored — those are a stall or a mode change, not a period.
+      if (f.flags & RCAP_FRAME_FRESH) {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_fresh.time_since_epoch().count() != 0) {
+          const double ms =
+            std::chrono::duration<double, std::milli>(now - last_fresh).count();
+          if (ms >= 1.0 && ms <= 100.0) {
+            period_ms_ewma = period_ms_ewma > 0.0 ?
+                               (period_ms_ewma * 0.99 + ms * 0.01) : ms;
+          }
+        }
+        last_fresh = now;
+      }
 
       // f.flags is non-zero iff at least one FRAME message arrived in this
       // drain (every daemon frame carries FRESH, HELD or BLACK), which is
@@ -286,6 +377,16 @@ namespace rkmpp {
     std::vector<AVFrame *> wrappers;
     std::uint32_t want_fourcc {};
     bool last_was_held {true};  // stream primes with BLACK
+    // Consecutive drains that produced no FRESH frame. Bounds how long
+    // next_frame() will wait for real content before accepting the daemon's
+    // re-emission: brief runs are a missing frame we refuse to fabricate,
+    // long ones are signal loss we must keep streaming through.
+    int nonfresh_run {};
+    // Measured source frame period, and the last FRESH arrival it came from.
+    // Drives the wait cap so it scales with refresh rate instead of assuming
+    // 60 Hz; zero until the first interval is seen, which disables waiting.
+    double period_ms_ewma {};
+    std::chrono::steady_clock::time_point last_fresh {};
     // Start of the current unbroken held run, for the renegotiation test
     // above; zero when fresh content is flowing.
     std::chrono::steady_clock::time_point held_since {};

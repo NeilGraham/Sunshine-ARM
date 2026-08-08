@@ -1,5 +1,6 @@
 /*
- * retro-capture socket protocol — reference header, protocol version 1.
+ * retro-capture socket protocol — reference header. The version this header
+ * defines is RCAP_PROTO_VERSION below; do not restate it in prose.
  *
  * Copyright (c) 2026 Neil Graham
  *
