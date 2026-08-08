@@ -204,13 +204,12 @@ if(SUNSHINE_ENABLE_RKMPP AND LIBDRM_FOUND AND LIBCAP_FOUND)
     add_compile_definitions(SUNSHINE_BUILD_RKMPP)
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.h"
-            "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.cpp"
-            "${CMAKE_SOURCE_DIR}/src/platform/linux/retro-overlay.h"
-            "${CMAKE_SOURCE_DIR}/src/platform/linux/retro-overlay.cpp")
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/rkmpp.cpp")
 
-    # The retro-capture consumer client (MIT), vendored verbatim from the
-    # retro-capture repo — see third-party/retro-capture and the drift
-    # tripwire in the build entry points.
+    # The retro-capture consumer clients (MIT) — capture session and overlay
+    # SINK, vendored verbatim from the retro-capture repo. See
+    # third-party/retro-capture and the drift tripwire in the build entry
+    # points.
     add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/retro-capture/client" retro-capture-client)
     list(APPEND PLATFORM_LIBRARIES retro-capture-client)
 endif()

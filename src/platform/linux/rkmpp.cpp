@@ -50,12 +50,11 @@ extern "C" {
 #include "src/audio_gate.h"
 #include "graphics.h"
 #include "misc.h"
-// The vendored MIT retro-capture client (third-party/retro-capture); the raw
-// protocol header is still needed by the RCAP_FRAME_* flag policy below and
-// the HDR STATUS query at the bottom of this file.
+// The vendored MIT retro-capture clients (third-party/retro-capture); the raw
+// protocol header is still needed by the RCAP_FRAME_* flag policy below.
 #include "retro-capture-client.h"
+#include "retro-overlay-client.h"
 #include "third-party/retro-capture/include/retro-capture-protocol.h"
-#include "retro-overlay.h"
 #include "rkmpp.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -66,18 +65,42 @@ using namespace std::literals;
 
 namespace rkmpp {
 
-  // One-time bridge from the MIT client's logger callback into BOOST_LOG.
+  // One-time bridge from the MIT clients' logger callbacks into BOOST_LOG.
+  static void client_log(retro::capture::log_level level, const char *message) {
+    if (level == retro::capture::log_warning) {
+      BOOST_LOG(warning) << message;
+    } else {
+      BOOST_LOG(info) << message;
+    }
+  }
+
   static void install_capture_logger() {
     static std::once_flag once;
     std::call_once(once, [] {
-      retro::capture::set_logger([](retro::capture::log_level level, const char *message) {
-        if (level == retro::capture::log_warning) {
-          BOOST_LOG(warning) << message;
-        } else {
-          BOOST_LOG(info) << message;
-        }
-      });
+      retro::capture::set_logger(client_log);
+      retro::overlay::set_logger(client_log);
     });
+  }
+
+  // Encoder OSD: hand the overlay client's state to the RKMPP encoder as
+  // frame side data. This is the consumer-side glue the client deliberately
+  // leaves out — it is the only FFmpeg-shaped part of the overlay path.
+  static void attach_osd(AVFrame *frame, int width, int height, bool ten_bit) {
+    retro::overlay::report_encode_geometry(width, height, ten_bit);
+
+    // The wrapper frames are long-lived and never unref'd between encodes:
+    // stale side data must go, visible or not.
+    av_frame_remove_side_data(frame, AV_FRAME_DATA_RKMPP_OSD);
+
+    rovl_osd_side_data osd {};
+    if (!retro::overlay::current_osd(osd)) {
+      return;
+    }
+    auto *sd = av_frame_new_side_data(frame, AV_FRAME_DATA_RKMPP_OSD, sizeof(osd));
+    if (!sd) {
+      return;
+    }
+    std::memcpy(sd->data, &osd, sizeof(osd));
   }
 
   // Sunshine's frame source on top of the vendored retro-capture client
@@ -387,8 +410,8 @@ namespace rkmpp {
         // Encoder OSD (stream overlay): attach/remove side data on the
         // wrapper. No pixel work; hidden overlay attaches nothing.
         auto *desc = (AVDRMFrameDescriptor *) enc->data[0];
-        rovl::attach(enc, enc->width, enc->height,
-                     desc->layers[0].format == 0x3531564e /* DRM_FORMAT_NV15 */);
+        attach_osd(enc, enc->width, enc->height,
+                   desc->layers[0].format == 0x3531564e /* DRM_FORMAT_NV15 */);
         return 0;
       }
 
@@ -536,59 +559,11 @@ namespace rkmpp {
       return cached;
     }
     checked_at = now;
-    cached = false;
 
-    const char *env = std::getenv("RETRO_CAPTURE_SOCKET");
-    const char *path = (env && *env) ? env : RCAP_SOCKET_DEFAULT;
-    int sock = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (sock < 0) {
-      return false;
-    }
-    sockaddr_un addr {};
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    std::uint8_t buf[RCAP_MAX_MSG_SIZE];
-    const auto recv_reply = [&]() -> ssize_t {
-      pollfd pfd {sock, POLLIN, 0};
-      if (poll(&pfd, 1, 250) <= 0) {
-        return -1;
-      }
-      return ::recv(sock, buf, sizeof(buf), 0);
-    };
-
-    do {
-      if (::connect(sock, (sockaddr *) &addr, sizeof(addr)) < 0) {
-        break;
-      }
-      rcap_hello hello {};
-      hello.hdr = {RCAP_MSG_HELLO, 0};
-      hello.magic = RCAP_MAGIC;
-      hello.ver_min = 1;
-      hello.ver_max = RCAP_PROTO_VERSION;
-      hello.role = RCAP_ROLE_STATUS;
-      std::strncpy(hello.name, "sunshine-hdr", sizeof(hello.name) - 1);
-      if (::send(sock, &hello, sizeof(hello), MSG_NOSIGNAL) != (ssize_t) sizeof(hello)) {
-        break;
-      }
-      ssize_t n = recv_reply();
-      if (n < (ssize_t) sizeof(rcap_hdr) || ((rcap_hdr *) buf)->type != RCAP_MSG_HELLO_ACK) {
-        break;
-      }
-      rcap_status_get get {{RCAP_MSG_STATUS_GET, 0}};
-      if (::send(sock, &get, sizeof(get), MSG_NOSIGNAL) != (ssize_t) sizeof(get)) {
-        break;
-      }
-      n = recv_reply();
-      if (n <= (ssize_t) sizeof(rcap_hdr) || ((rcap_hdr *) buf)->type != RCAP_MSG_STATUS) {
-        break;
-      }
-      buf[n - 1] = 0;  // defensive; STATUS is NUL-terminated within the datagram
-      // PROTOCOL.md 3.10: input.bit_depth is 10 iff the capture is NV15,
-      // which the daemon defines as BT.2020+PQ content (the MVP contract).
-      cached = std::strstr((const char *) buf + sizeof(rcap_hdr), "\"bit_depth\":10") != nullptr;
-    } while (false);
-    ::close(sock);
+    // PROTOCOL.md 3.10: input.bit_depth is 10 iff the capture is NV15, which
+    // the daemon defines as BT.2020+PQ content (the MVP contract).
+    install_capture_logger();
+    cached = retro::capture::query_status("sunshine-hdr").input_bit_depth == 10;
     return cached;
   }
 

@@ -10,8 +10,10 @@
  */
 #include "retro-capture-client.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +21,7 @@
 #include <ctime>
 #include <string>
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -349,6 +352,139 @@ namespace retro::capture {
     }
 
     return frame {s.cur_index, newest_flags, s.cur_index != previous};
+  }
+
+  void audio_gate_notify(const char *fifo_path) {
+    // -2 = unresolved (retry the open; the reader may not be up yet),
+    // -1 = disabled (no path), >= 0 = open fd.
+    static std::atomic<int> notify_fd {-2};
+
+    int fd = notify_fd.load(std::memory_order_relaxed);
+    if (fd == -1) {
+      return;
+    }
+    if (fd == -2) {
+      if (!fifo_path || !*fifo_path) {
+        notify_fd.store(-1, std::memory_order_relaxed);
+        return;
+      }
+      // A FIFO write can raise SIGPIPE if the reader vanishes between open
+      // and write (retro-audio recreates its FIFO on restart) — ignore it
+      // process-wide, but only once a host has opted in with a real path.
+      std::signal(SIGPIPE, SIG_IGN);
+      // O_NONBLOCK: ENXIO when no reader has the FIFO open — stay unresolved
+      // and retry on the next call instead of blocking the video thread.
+      fd = ::open(fifo_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+      if (fd < 0) {
+        return;
+      }
+      int expected = -2;
+      if (!notify_fd.compare_exchange_strong(expected, fd, std::memory_order_relaxed)) {
+        ::close(fd);  // another thread won the race; use its fd
+        fd = expected;
+        if (fd < 0) {
+          return;
+        }
+      }
+    }
+    if (::write(fd, "gate\n", 5) < 0 && errno == EPIPE) {
+      // Stale fd (reader recreated its FIFO): drop it and re-resolve next time.
+      ::close(fd);
+      notify_fd.store(-2, std::memory_order_relaxed);
+    }
+  }
+
+  namespace {
+    // Minimal scanner for the flat JSON the daemon emits: finds "obj":{...}
+    // then "key": within it and returns the numeric/bool token after the
+    // colon. Deliberately not a JSON parser — the client stays dependency
+    // free, and STATUS is a generated document with a fixed shape (see
+    // PROTOCOL.md §3.10). Returns nullptr when the path is absent.
+    const char *find_scalar(const char *json, const char *obj, const char *key) {
+      const char *scope = json;
+      if (obj) {
+        char needle[64];
+        std::snprintf(needle, sizeof(needle), "\"%s\":", obj);
+        scope = std::strstr(json, needle);
+        if (!scope) {
+          return nullptr;
+        }
+      }
+      char needle[64];
+      std::snprintf(needle, sizeof(needle), "\"%s\":", key);
+      const char *at = std::strstr(scope, needle);
+      if (!at) {
+        return nullptr;
+      }
+      at += std::strlen(needle);
+      while (*at == ' ') {
+        ++at;
+      }
+      return at;
+    }
+  }  // namespace
+
+  status query_status(const char *name) {
+    status out {};
+
+    const int sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (sock < 0) {
+      return out;
+    }
+    sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, client::socket_path(), sizeof(addr.sun_path) - 1);
+
+    std::uint8_t buf[RCAP_MAX_MSG_SIZE];
+    const auto recv_reply = [&]() -> ssize_t {
+      pollfd pfd {sock, POLLIN, 0};
+      if (poll(&pfd, 1, 250) <= 0) {
+        return -1;
+      }
+      return recv(sock, buf, sizeof(buf), 0);
+    };
+
+    do {
+      if (::connect(sock, (sockaddr *) &addr, sizeof(addr)) < 0) {
+        break;
+      }
+      rcap_hello hello {};
+      hello.hdr = {RCAP_MSG_HELLO, 0};
+      hello.magic = RCAP_MAGIC;
+      // A status query works on any protocol version; accept the whole range
+      // so this keeps answering against an older daemon.
+      hello.ver_min = RCAP_PROTO_VERSION_MIN;
+      hello.ver_max = RCAP_PROTO_VERSION;
+      hello.role = RCAP_ROLE_STATUS;
+      std::strncpy(hello.name, name && *name ? name : "status", sizeof(hello.name) - 1);
+      if (send(sock, &hello, sizeof(hello), MSG_NOSIGNAL) != (ssize_t) sizeof(hello)) {
+        break;
+      }
+      ssize_t n = recv_reply();
+      if (n < (ssize_t) sizeof(rcap_hdr) || ((rcap_hdr *) buf)->type != RCAP_MSG_HELLO_ACK) {
+        break;
+      }
+      rcap_status_get get {{RCAP_MSG_STATUS_GET, 0}};
+      if (send(sock, &get, sizeof(get), MSG_NOSIGNAL) != (ssize_t) sizeof(get)) {
+        break;
+      }
+      n = recv_reply();
+      if (n <= (ssize_t) sizeof(rcap_hdr) || ((rcap_hdr *) buf)->type != RCAP_MSG_STATUS) {
+        break;
+      }
+      buf[n - 1] = 0;  // defensive; STATUS is NUL-terminated within the datagram
+      const char *json = (const char *) buf + sizeof(rcap_hdr);
+      out.valid = true;
+      if (const char *v = find_scalar(json, "input", "bit_depth")) {
+        out.input_bit_depth = std::atoi(v);
+      }
+      if (const char *v = find_scalar(json, "input", "locked")) {
+        out.signal_locked = std::strncmp(v, "true", 4) == 0;
+      }
+    } while (false);
+
+    ::close(sock);
+    return out;
   }
 
   void client::maybe_reconnect(int width, int height, std::uint32_t want_fourcc,

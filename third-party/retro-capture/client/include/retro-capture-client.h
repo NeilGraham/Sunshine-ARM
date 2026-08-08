@@ -88,6 +88,40 @@ namespace retro::capture {
   /// arrival order, on the caller's thread. Set once before the loop starts.
   using frame_observer = void (*)(const frame_telemetry &t, void *user);
 
+  /// Fields a consumer may need from the daemon's STATUS document without
+  /// holding the (single) CONSUMER slot. Additive: a field the daemon did not
+  /// report keeps the default below, so an older daemon degrades quietly.
+  struct status {
+    bool valid {false};      ///< a STATUS document was received and parsed
+    int input_bit_depth {0}; ///< input.bit_depth: 8, or 10 for a BT.2020+PQ
+                             ///< (NV15) capture — PROTOCOL.md §3.10
+    bool signal_locked {false};
+  };
+
+  /// Best-effort "gate\n" line to the retro-audio event FIFO at `fifo_path`,
+  /// telling its supervisor a video re-lock is happening right now — the RX
+  /// re-handshake can flip the audio between LPCM and IEC 61937, and every
+  /// round-trip before that notification is raw bitstream static played as
+  /// PCM. Never blocks and never fails the caller: a missing FIFO, an absent
+  /// reader, or a reader that vanished all resolve to "did nothing".
+  ///
+  /// A null/empty path disables it permanently for the process. WHAT counts
+  /// as gate-worthy stays the caller's policy — this only owns the pipe.
+  ///
+  /// SIDE EFFECT, deliberate and inherited from the code this replaced: the
+  /// first call with a usable path sets SIGPIPE to SIG_IGN process-wide,
+  /// because write() to a FIFO whose reader vanished raises it and there is
+  /// no MSG_NOSIGNAL for write(). Consumers that handle SIGPIPE themselves
+  /// should not call this.
+  void audio_gate_notify(const char *fifo_path);
+
+  /// One-shot STATUS-role query: connect, HELLO, STATUS_GET, parse, close.
+  /// Deliberately synchronous with a short timeout and no caching — callers
+  /// run it at session-setup/probe cadence, never per frame, and decide their
+  /// own caching. Returns a status with valid=false if the daemon is absent
+  /// or does not answer in time.
+  status query_status(const char *name);
+
   /// A connected consumer session. Not thread-safe: drive it from one thread,
   /// as the encoder loop does.
   class client {
