@@ -1878,6 +1878,20 @@ namespace platf {
         auto img = (egl::img_descriptor_t *) img_out.get();
         img->reset();
 
+#ifdef SUNSHINE_BUILD_RKMPP
+        // Capture box, daemon path live: the encoder takes its frames from
+        // the retro-capture socket and throws this image away, so exporting
+        // the KMS framebuffer (drmModeGetPlane + GETFB2 + a PRIME handle per
+        // plane, every frame) buys nothing. The flag is false for a session
+        // that fell back to KMS GPU-convert, so that path still refreshes.
+        if (rkmpp::daemon_capture_active()) {
+          img->frame_timestamp = std::chrono::steady_clock::now();
+          img->sequence = ++sequence;
+          img->data = nullptr;
+          return capture_e::ok;
+        }
+#endif
+
         auto status = refresh(fb_fd, &img->sd, img->frame_timestamp);
         if (status != capture_e::ok) {
           return status;

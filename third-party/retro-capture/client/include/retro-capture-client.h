@@ -145,8 +145,9 @@ namespace retro::capture {
     /// means "the daemon's configured output" and zero want_fourcc means "any
     /// pool format" (both sent wire-identically to a v1 consumer) — oracle
     /// conveniences; a real encoder passes all three explicitly. Returns
-    /// nullptr on any failure; the caller is expected to have a fallback
-    /// capture path.
+    /// nullptr on any failure — see PROTOCOL.md §4 for what a consumer is
+    /// allowed to do next (note that a fallback capturing something OTHER
+    /// than the HDMI-RX, as Sunshine's KMS path does, is not a substitute).
     static std::unique_ptr<client> connect(int width, int height, std::uint32_t want_fourcc,
                                            const char *name);
 

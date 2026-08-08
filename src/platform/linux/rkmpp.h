@@ -60,4 +60,15 @@ namespace rkmpp {
    * @return True when metadata was written.
    */
   bool daemon_hdr_metadata(SS_HDR_METADATA &metadata);
+
+  /**
+   * @brief Whether an encode session is currently sourcing frames from the
+   *        retro-capture daemon socket.
+   *
+   * False until a session connects, and false again for a session that fell
+   * back to KMS GPU-convert — so a caller that skips work on the strength of
+   * this is never skipping work the fallback needs. kmsgrab uses it to avoid
+   * re-exporting a KMS framebuffer that the encoder is going to discard.
+   */
+  bool daemon_capture_active();
 }  // namespace rkmpp

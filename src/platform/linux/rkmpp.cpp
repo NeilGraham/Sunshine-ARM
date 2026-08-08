@@ -25,6 +25,7 @@
  *    available.
  */
 // standard includes
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -291,8 +292,19 @@ namespace rkmpp {
     AVBufferRef *hw_frames_ctx {};
   };
 
+  // Set while an encode session is sourcing frames from the daemon socket;
+  // read by kmsgrab from its capture thread. Namespace-scope because the
+  // reader has no handle on the encode device.
+  static std::atomic<bool> g_daemon_capture_active {false};
+
   class rkmpp_t: public platf::avcodec_encode_device_t {
   public:
+    ~rkmpp_t() override {
+      if (capture) {
+        g_daemon_capture_active.store(false, std::memory_order_relaxed);
+      }
+    }
+
     int init(int in_width, int in_height, file_t &&render_device, int offset_x, int offset_y) {
       file = std::move(render_device);
 
@@ -360,6 +372,9 @@ namespace rkmpp {
         capture = frame_source_t::connect(frame->width, frame->height, hw_frames_ctx_buf);
         if (capture) {
           BOOST_LOG(info) << "Using retro-capture daemon encode path (zero-copy DRM_PRIME)"sv;
+          // Tells kmsgrab its framebuffer export is dead work for this
+          // session (see daemon_capture_active).
+          g_daemon_capture_active.store(true, std::memory_order_relaxed);
           return 0;
         }
         BOOST_LOG(warning) << "retro-capture daemon unavailable; falling back to KMS GPU-convert path"sv;
@@ -565,6 +580,10 @@ namespace rkmpp {
     install_capture_logger();
     cached = retro::capture::query_status("sunshine-hdr").input_bit_depth == 10;
     return cached;
+  }
+
+  bool daemon_capture_active() {
+    return g_daemon_capture_active.load(std::memory_order_relaxed);
   }
 
   bool daemon_hdr_metadata(SS_HDR_METADATA &metadata) {
