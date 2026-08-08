@@ -1824,15 +1824,52 @@ namespace platf {
         while (true) {
           auto now = std::chrono::steady_clock::now();
 
+          // On the retro-capture daemon path this timer is NOT the stream's
+          // clock — the HDMI source is, and the two free-run against each
+          // other. `delay` is 1/fps of the rate the CLIENT asked for (exactly
+          // 60.000 Hz); the source delivers 59.999. That 1 mHz difference
+          // sweeps the phase between "frame published" and "encode thread
+          // wakes up to collect it" through a full frame period every ~16
+          // minutes, and whatever the offset happens to be is added to every
+          // frame's age as pure dead time.
+          //
+          // Measured at 4K60 before this change: frame age at encode ranged
+          // 16.4 - 32.9 ms, a 16.5 ms peak-to-peak wander — one frame period,
+          // exactly the sweep — against a 12.6 ms floor set by the daemon's
+          // own work. Half a frame of latency, on average, purchased nothing.
+          //
+          // So oversample the tick and let the SOURCE pace the stream: the
+          // encode thread blocks in next_frame() until a genuinely FRESH frame
+          // lands (rkmpp.cpp), which makes the cadence the source's and this
+          // timer merely a liveness heartbeat that bounds how long we can go
+          // without looking. Ticking 4x means a published frame is collected
+          // within a quarter period instead of a uniformly random one, and
+          // costs nothing: the extra iterations block on the daemon socket
+          // rather than spinning, and the FRESH gate means an iteration with
+          // no new frame encodes nothing rather than duplicating.
+          //
+          // The KMS path keeps the plain timer — there the tick IS the clock.
+          auto tick = delay;
+#ifdef SUNSHINE_BUILD_RKMPP
+          if (rkmpp::daemon_capture_active()) {
+            static const int oversample = [] {
+              const char *env = std::getenv("SUNSHINE_RETRO_TICK_OVERSAMPLE");
+              const int v = env && *env ? std::atoi(env) : 4;
+              return (v >= 1 && v <= 16) ? v : 4;
+            }();
+            tick = delay / oversample;
+          }
+#endif
+
           if (next_frame > now) {
             std::this_thread::sleep_for(next_frame - now);
             sleep_overshoot_logger.first_point(next_frame);
             sleep_overshoot_logger.second_point_now_and_log();
           }
 
-          next_frame += delay;
+          next_frame += tick;
           if (next_frame < now) {  // some major slowdown happened; we couldn't keep up
-            next_frame = now + delay;
+            next_frame = now + tick;
           }
 
           std::shared_ptr<platf::img_t> img_out;

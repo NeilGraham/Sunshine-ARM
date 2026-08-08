@@ -2502,11 +2502,17 @@ namespace video {
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
-          frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
           }
+          // Read AFTER convert(), not before. A capture path whose frames do
+          // not originate on the capture thread's clock — the retro-capture
+          // daemon path, where the picture is fetched here and arrives with
+          // the source's own DQBUF timestamp — corrects frame_timestamp during
+          // convert(). Every other path leaves it untouched, so this is a
+          // no-op for them.
+          frame_timestamp = img->frame_timestamp;
         } else if (!images->running()) {
           break;
         }

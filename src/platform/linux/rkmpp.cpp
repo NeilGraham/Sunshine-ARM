@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -49,6 +50,7 @@ extern "C" {
 
 // local includes
 #include "src/audio_gate.h"
+#include "src/config.h"  // min_max_avg_periodic_logger's enable test reads config::sunshine
 #include "graphics.h"
 #include "misc.h"
 // The vendored MIT retro-capture clients (third-party/retro-capture); the raw
@@ -152,7 +154,45 @@ namespace rkmpp {
       src->want_fourcc = fourcc;
       src->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_buf);
       src->wrappers.assign(src->client->pool_size(), nullptr);
+      // Per-FRAME telemetry, for the one field this path needs: the instant
+      // the picture was actually taken. `src` is never moved after this (it
+      // lives in the unique_ptr the caller stores), so the pointer is stable.
+      src->client->set_frame_observer(&frame_source_t::observe, src.get());
       return src;
+    }
+
+    // The instant the HDMI-RX frame we are about to encode was DQBUF'd by the
+    // daemon, or nullopt before the first timestamped frame.
+    //
+    // THE point of measurement for this pipeline. Sunshine's own "Frame
+    // processing latency" is measured from `img->frame_timestamp`, which the
+    // kmsgrab capture thread stamps when its METRONOME TICKED — on the daemon
+    // path that tick is unrelated to when the picture was taken, so the metric
+    // it produces moves with the free-running phase between two clocks and
+    // reports dead time as if it were pipeline cost. Stamping the frame's own
+    // DQBUF instant instead turns the same metric into a true capture->encoded
+    // age: the number a game stream is actually judged on, and the one that
+    // cannot be gamed by choosing when to look.
+    //
+    // dqbuf_ns is CLOCK_MONOTONIC, which is precisely what steady_clock is on
+    // glibc — same epoch, no conversion.
+    //
+    // FRESH ONLY, deliberately. A HELD re-emission carries the ORIGINAL
+    // frame's dqbuf_ns (PROTOCOL.md 3.4), so through a signal-loss run its
+    // "age" climbs without bound — seconds — and that is a true statement
+    // about the picture but a false one about the pipeline. Reported as
+    // latency it would say the encoder stalled for four seconds when the
+    // encoder did nothing wrong; the stream suite would raise
+    // encode_latency_spike at its 100 ms threshold, and Moonlight's overlay
+    // would show the same nonsense. Held runs are already measured, as held
+    // frames. So a re-emission keeps the metronome's stamp and this metric
+    // stays what it claims to be: the age of NEW content.
+    std::optional<std::chrono::steady_clock::time_point> capture_time() const {
+      if (last_dqbuf_ns == 0 || !(last_flags & RCAP_FRAME_FRESH)) {
+        return std::nullopt;
+      }
+      return std::chrono::steady_clock::time_point(
+        std::chrono::nanoseconds(last_dqbuf_ns));
     }
 
     // Drain the socket via the client and return the DRM_PRIME wrapper for
@@ -160,6 +200,7 @@ namespace rkmpp {
     // the old in-process update_latest_frame(). Returns nullptr only before
     // the first frame or after a wrapper allocation failure.
     AVFrame *next_frame() {
+      const auto t_enter = std::chrono::steady_clock::now();
       auto f = client->next();
 
       // Nothing FRESH in this drain means one of two things, and both used to
@@ -234,6 +275,52 @@ namespace rkmpp {
         }
       }
       nonfresh_run = (f.flags & RCAP_FRAME_FRESH) ? 0 : nonfresh_run + 1;
+
+      // What the wait COST and what it BOUGHT, measured separately, because
+      // the two answer different questions and only one of them is latency.
+      //
+      // `fresh-frame wait` is dead time this call spent blocked. It is NOT
+      // added end-to-end latency — the metronome would otherwise have slept
+      // the same interval before the next tick — but it is the honest size of
+      // the phase error between Sunshine's timer and the source's cadence, and
+      // driving it toward zero is what makes the wait a genuine no-op instead
+      // of a trade against duplicates.
+      //
+      // `frame age at encode` is the real number: how stale the picture is at
+      // the instant the encoder receives it. Invariant to metronome phase,
+      // which is exactly why it is trustworthy where "Frame processing
+      // latency" was not.
+      const auto t_have = std::chrono::steady_clock::now();
+      wait_logger.collect_and_log(
+        std::chrono::duration<double, std::milli>(t_have - t_enter).count());
+      if (const auto taken = capture_time()) {
+        age_logger.collect_and_log(
+          std::chrono::duration<double, std::milli>(t_have - *taken).count());
+      }
+
+      // Cadence floor for re-emissions — AFTER the measurements above, so this
+      // deliberate pacing never shows up as acquisition cost.
+      //
+      // The capture thread oversamples its tick (kmsgrab, daemon path) so a
+      // published frame is collected promptly; while frames flow, the FRESH
+      // wait turns those extra ticks into source pacing and the encoder still
+      // runs at source rate. But a DEAD source has no FRESH frames to pace
+      // against: the wait gives up after max_wait_run, and every remaining
+      // tick would then re-encode the held picture at the OVERSAMPLED rate —
+      // duplicates several times faster than the stream's own frame rate,
+      // flooding encoder and network at exactly the moment there is nothing to
+      // send. Hold a re-emission to one source period so a dead source costs
+      // what it did before oversampling: the held cadence, and nothing more.
+      if (!(f.flags & RCAP_FRAME_FRESH) && period_ms_ewma > 0.0 &&
+          last_returned.time_since_epoch().count() != 0) {
+        const auto since =
+          std::chrono::duration<double, std::milli>(t_have - last_returned).count();
+        if (since < period_ms_ewma) {
+          std::this_thread::sleep_for(
+            std::chrono::duration<double, std::milli>(period_ms_ewma - since));
+        }
+      }
+      last_returned = std::chrono::steady_clock::now();
 
       // Measure the source's frame period from FRESH arrivals. EWMA over a
       // long window so one late frame cannot widen the very cap that exists
@@ -373,8 +460,27 @@ namespace rkmpp {
       return f;
     }
 
+    // Per-FRAME telemetry hook. Records the DQBUF instant of the most recent
+    // FRAME message in the drain which — arrival order, newest-frame-wins — is
+    // the frame next_frame() hands the encoder. HELD re-emissions deliberately
+    // carry the ORIGINAL frame's dqbuf_ns (PROTOCOL.md 3.4), so a held picture
+    // reports its true age instead of masquerading as new.
+    static void observe(const retro::capture::frame_telemetry &t, void *user) {
+      auto *self = static_cast<frame_source_t *>(user);
+      self->last_dqbuf_ns = t.dqbuf_ns;
+      self->last_flags = t.flags;
+    }
+
     std::unique_ptr<retro::capture::client> client;
     std::vector<AVFrame *> wrappers;
+    std::uint64_t last_dqbuf_ns {};
+    std::uint32_t last_flags {};
+    // Debug-severity 20 s periodic reports, same "(min/max/avg): a/b/c" shape
+    // as Sunshine's own latency loggers — which is what the stream suite's
+    // collector already scrapes, so these need no collector change to appear
+    // in a run report.
+    logging::min_max_avg_periodic_logger<double> age_logger {debug, "Capture: frame age at encode", "ms"};
+    logging::min_max_avg_periodic_logger<double> wait_logger {debug, "Capture: fresh-frame wait", "ms"};
     std::uint32_t want_fourcc {};
     bool last_was_held {true};  // stream primes with BLACK
     // Consecutive drains that produced no FRESH frame. Bounds how long
@@ -387,6 +493,9 @@ namespace rkmpp {
     // 60 Hz; zero until the first interval is seen, which disables waiting.
     double period_ms_ewma {};
     std::chrono::steady_clock::time_point last_fresh {};
+    // Last time next_frame() handed a picture back, for the re-emission
+    // cadence floor above. Zero until the first frame.
+    std::chrono::steady_clock::time_point last_returned {};
     // Start of the current unbroken held run, for the renegotiation test
     // above; zero when fresh content is flowing.
     std::chrono::steady_clock::time_point held_since {};
@@ -522,6 +631,16 @@ namespace rkmpp {
           return -1;
         }
         missing_logged = false;
+        // Re-stamp the capture time with the frame's own DQBUF instant. The
+        // kmsgrab capture thread stamped this when its metronome ticked, which
+        // on the daemon path is a tick number, not a picture — see
+        // frame_source_t::capture_time(). videoThread reads frame_timestamp
+        // AFTER convert() for exactly this handoff, so "Frame processing
+        // latency" (host_lat on the client, and the RTP header extension
+        // Moonlight reports) becomes true capture->encoded age.
+        if (const auto taken = capture->capture_time()) {
+          img.frame_timestamp = *taken;
+        }
         this->frame = enc;
         // Encoder OSD (stream overlay): attach/remove side data on the
         // wrapper. No pixel work; hidden overlay attaches nothing.
