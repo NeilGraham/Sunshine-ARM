@@ -71,4 +71,14 @@ namespace rkmpp {
    * re-exporting a KMS framebuffer that the encoder is going to discard.
    */
   bool daemon_capture_active();
+
+  /**
+   * @brief Measured interval between FRESH frames from the capture daemon, ms.
+   *
+   * The SOURCE's cadence, which is not the client's requested rate and must not
+   * be confused with it: a client may ask for 120 fps from a 60 fps console, and
+   * pacing capture off the request then samples twice as often as there is
+   * anything to sample. Zero until the first interval is measured.
+   */
+  double daemon_source_period_ms();
 }  // namespace rkmpp

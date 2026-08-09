@@ -114,6 +114,12 @@ namespace rkmpp {
   // notes): wrapping pool buffers as DRM_PRIME AVFrames for the RKMPP
   // encoder, and the audio-gate policy that decides what a HELD/BLACK run
   // means for outgoing audio.
+  // Measured FRESH-to-FRESH interval, published for kmsgrab's capture tick
+  // (see daemon_source_period_ms()). Declared ahead of frame_source_t because
+  // next_frame() writes it; namespace-scope because the reader is the capture
+  // thread, which has no handle on the encode device.
+  static std::atomic<double> g_daemon_source_period_ms {0.0};
+
   class frame_source_t {
   public:
     ~frame_source_t() {
@@ -335,6 +341,8 @@ namespace rkmpp {
           if (ms >= 1.0 && ms <= 100.0) {
             period_ms_ewma = period_ms_ewma > 0.0 ?
                                (period_ms_ewma * 0.99 + ms * 0.01) : ms;
+            // Publish for kmsgrab's capture tick — see daemon_source_period_ms().
+            g_daemon_source_period_ms.store(period_ms_ewma, std::memory_order_relaxed);
           }
         }
         last_fresh = now;
@@ -512,6 +520,10 @@ namespace rkmpp {
     ~rkmpp_t() override {
       if (capture) {
         g_daemon_capture_active.store(false, std::memory_order_relaxed);
+        // A stale period must not pace the NEXT session: the source can change
+        // resolution and refresh rate between sessions, and a 60 Hz leftover
+        // would under-sample a 120 Hz console until the EWMA caught up.
+        g_daemon_source_period_ms.store(0.0, std::memory_order_relaxed);
       }
     }
 
@@ -800,6 +812,10 @@ namespace rkmpp {
     install_capture_logger();
     cached = retro::capture::query_status("sunshine-hdr").input_bit_depth == 10;
     return cached;
+  }
+
+  double daemon_source_period_ms() {
+    return g_daemon_source_period_ms.load(std::memory_order_relaxed);
   }
 
   bool daemon_capture_active() {

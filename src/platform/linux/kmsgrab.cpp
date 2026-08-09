@@ -1857,7 +1857,37 @@ namespace platf {
               const int v = env && *env ? std::atoi(env) : 4;
               return (v >= 1 && v <= 16) ? v : 4;
             }();
-            tick = delay / oversample;
+            // Oversample the SOURCE's period, not `delay`. `delay` is 1/fps of
+            // the rate the CLIENT asked for, and the two are independent: a
+            // client may request 120 fps from a 60 fps console, in which case
+            // dividing `delay` samples EIGHT times per source frame — the pool
+            // saturates, the capture thread spends its life in the 1 ms
+            // pull-free-image retry, and the extra ticks buy nothing because
+            // there is no new frame to collect. Every configuration validated
+            // on 2026-08-08 happened to have the client rate equal to the
+            // source rate, which hid this completely.
+            //
+            // Pacing off the measured source period keeps the property the
+            // oversampling is FOR — collect a published frame within a quarter
+            // of a source frame instead of a uniformly random fraction of one —
+            // at whatever rate the source actually runs. Before the first
+            // interval is measured, fall back to `delay`.
+            // Oversample ONLY when the source is no faster than the client's
+            // requested rate. The tick does double duty: it also throttles the
+            // encode thread, because that thread blocks in next_frame() until a
+            // FRESH frame lands and so emits at min(tick rate, source rate). A
+            // source FASTER than the client's request (a 120 Hz console with a
+            // client asking 60) is held to the requested rate by `delay` alone;
+            // oversample there and the FRESH gate would let the encoder run at
+            // the source's rate instead, sending at double the requested fps.
+            // Falling back to plain `delay` in that case is exactly the
+            // behaviour that predates oversampling, so it cannot regress.
+            const double src_ms = rkmpp::daemon_source_period_ms();
+            const auto src_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::duration<double, std::milli>(src_ms));
+            if (src_ms > 0.0 && src_period >= delay) {
+              tick = src_period / oversample;
+            }
           }
 #endif
 
