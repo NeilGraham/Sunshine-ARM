@@ -251,18 +251,40 @@ namespace rkmpp {
       const int wait_ms = period_ms_ewma > 0.0 ?
                             (int) (period_ms_ewma * wait_fraction) : 0;
       constexpr int max_wait_run = 3;
-      if (wait_ms > 0 && !(f.flags & RCAP_FRAME_FRESH) &&
+      // WAIT ONLY WHEN THE DRAIN CAME BACK EMPTY. The two states that reach
+      // here are not the same problem and must not get the same answer:
+      //
+      //   flags == 0  — no FRAME message at all. We polled ahead of the daemon
+      //                 and this slot is still in flight. Waiting collects the
+      //                 real frame; encoding now would fabricate a duplicate
+      //                 out of nothing but our own timing. This is the case
+      //                 that motivated the wait (FINDING 15).
+      //
+      //   HELD        — the daemon's watchdog fired and it is telling us,
+      //                 authoritatively, that the SOURCE produced nothing.
+      //                 There is no frame in flight to wait for. Waiting
+      //                 further cannot conjure content; all it does is convert
+      //                 a held picture into a GAP in frame delivery.
+      //
+      // Treating HELD as "keep waiting" is what this code used to do, and it
+      // is wrong in the field. Measured on a real console at 4K60: every
+      // missing frame originates at the HDMI-RX (host short 9 frames / 80 s,
+      // client short 8 — nothing lost downstream) at 6.7/min, inside the
+      // documented 5-9/min band. That loss is not fixable here. The only
+      // choice this code has is how to PRESENT it: a duplicate on cadence, or
+      // a 33 ms hole. On a 120 Hz VRR display the hole is far more visible,
+      // and the stream suite scored duplicates as failures and gaps as
+      // success — so it rewarded the wrong trade for exactly this case.
+      //
+      // So: break on the first message of any kind. A duplicate we were TOLD
+      // to show beats a gap we chose to leave.
+      if (wait_ms > 0 && f.flags == 0 &&
           nonfresh_run < max_wait_run && client->alive()) {
         const int cfd = client->fd();
         if (cfd >= 0) {
-          // Keep waiting until something FRESH lands, not merely until the
-          // socket is readable: the daemon's watchdog re-emission arrives
-          // first in the missing-frame case, and accepting it is exactly the
-          // duplicate we came here to avoid. Each held frame seen on the way
-          // is still folded into `f` so the audio gate below observes the run.
           const auto deadline = std::chrono::steady_clock::now() +
                                 std::chrono::milliseconds(wait_ms);
-          while (!(f.flags & RCAP_FRAME_FRESH)) {
+          while (f.flags == 0) {
             const auto now = std::chrono::steady_clock::now();
             if (now >= deadline) {
               break;
@@ -275,7 +297,7 @@ namespace rkmpp {
             }
             const auto g = client->next();
             if (g.flags != 0) {
-              f = g;  // a real message; an empty re-drain must not clear f
+              f = g;  // a real message — FRESH or HELD — ends the wait
             }
           }
         }
