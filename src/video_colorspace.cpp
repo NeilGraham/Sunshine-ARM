@@ -59,6 +59,25 @@ namespace video {
 
     colorspace.full_range = (config.encoderCscMode & 0x1);
 
+    // retro-stream fork: the capture chain delivers BT.709 limited-range
+    // YCbCr end to end — the console's own 4:2:0 output, or retro-capture's
+    // RGA conversion (both post-d115c3a), arrive as ready-made NV12 dma-bufs
+    // that the zero-copy encode path CANNOT re-matrix. Honouring a client's
+    // legacy Rec.601 request would signal 601 over bits that are 709 (the
+    // "bright colours blended" mismatch, 2026-08-10). Signal the truth
+    // instead: moonlight-qt on every platform renders by the decoded frame's
+    // colorspace (VUI wins over its own request), and the GPU-convert
+    // fallback path converts with whatever this returns, so 709/limited is
+    // self-consistent on both paths.
+    if (colorspace.colorspace == colorspace_e::rec601) {
+      BOOST_LOG(info) << "Client requested Rec. 601 SDR; signalling Rec. 709 to match the BT.709 capture chain";
+      colorspace.colorspace = colorspace_e::rec709;
+    }
+    if (colorspace.colorspace == colorspace_e::rec709 && colorspace.full_range) {
+      BOOST_LOG(info) << "Client requested full-range SDR; capture chain is limited-range — signalling limited";
+      colorspace.full_range = false;
+    }
+
     switch (config.dynamicRange) {
       case 0:
         colorspace.bit_depth = 8;
