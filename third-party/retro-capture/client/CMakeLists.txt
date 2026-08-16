@@ -1,4 +1,4 @@
-# retro-capture/client — consumer client library.
+# packages/capture/client — consumer client library.
 #
 # Deliberately standalone, with no dependency beyond libc and pthreads:
 # consumers add_subdirectory() this directory directly and do not inherit

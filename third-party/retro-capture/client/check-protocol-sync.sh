@@ -30,7 +30,7 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-owner_dir="${1:-$HOME/retro-stream/retro-overlay}"
+owner_dir="${1:-$HOME/retro-stream/packages/overlay}"
 owner="$owner_dir/include/retro-overlay-protocol.h"
 copy="$here/include/retro-overlay-protocol.h"
 osd_patch="${2:-$HOME/furnace/jobs/sunshine-arm/patches/ffmpeg-rockchip-rkmpp-osd.patch}"
