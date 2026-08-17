@@ -201,6 +201,26 @@ namespace rkmpp {
         std::chrono::nanoseconds(last_dqbuf_ns));
     }
 
+    // Stamp chain of the frame next_frame() just returned (serial + the four
+    // wire/receipt stamps), or nullopt before the first FRAME message.
+    // Deliberately includes HELD re-emissions — see last_telemetry.
+    std::optional<platf::frame_trace_t> frame_trace() const {
+      if (last_telemetry.recv_ns == 0) {
+        return std::nullopt;
+      }
+      return platf::frame_trace_t {
+        last_telemetry.serial,
+        last_telemetry.flags,
+        last_telemetry.dqbuf_ns,
+        last_telemetry.process_done_ns,
+        last_telemetry.send_ns,
+        last_telemetry.recv_ns,
+        0,  // convert_ns: stamped by convert()
+        0,  // encode_submit_ns: stamped by encode_avcodec()
+        0,  // encode_done_ns: stamped by encode_avcodec()
+      };
+    }
+
     // Drain the socket via the client and return the DRM_PRIME wrapper for
     // the current buffer. Newest-frame-wins: identical latency semantics to
     // the old in-process update_latest_frame(). Returns nullptr only before
@@ -499,12 +519,18 @@ namespace rkmpp {
       auto *self = static_cast<frame_source_t *>(user);
       self->last_dqbuf_ns = t.dqbuf_ns;
       self->last_flags = t.flags;
+      self->last_telemetry = t;
     }
 
     std::unique_ptr<retro::capture::client> client;
     std::vector<AVFrame *> wrappers;
     std::uint64_t last_dqbuf_ns {};
     std::uint32_t last_flags {};
+    // Full telemetry of the frame next_frame() just returned, for the
+    // SUNSHINE_VIDEO_TRACE stamp chain. Unlike capture_time() this is NOT
+    // FRESH-gated: the chain wants HELD rows too, with flags carried so the
+    // reader splits them (the trace's whole point is per-frame identity).
+    retro::capture::frame_telemetry last_telemetry {};
     // Debug-severity 20 s periodic reports, same "(min/max/avg): a/b/c" shape
     // as Sunshine's own latency loggers — which is what the stream suite's
     // collector already scrapes, so these need no collector change to appear
@@ -674,6 +700,16 @@ namespace rkmpp {
         // Moonlight reports) becomes true capture->encoded age.
         if (const auto taken = capture->capture_time()) {
           img.frame_timestamp = *taken;
+        }
+        // Per-frame stamp chain (SUNSHINE_VIDEO_TRACE): the wire/receipt
+        // stamps of this exact frame, plus the handoff instant. Rides the
+        // img like frame_timestamp does and costs one struct copy; the
+        // emit-or-not decision lives at the send site in stream.cpp.
+        if (auto trace = capture->frame_trace()) {
+          trace->convert_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+          img.frame_trace = trace;
         }
         this->frame = enc;
         // Encoder OSD (stream overlay): attach/remove side data on the

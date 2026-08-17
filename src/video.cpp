@@ -1841,9 +1841,10 @@ namespace video {
    * @param packets Output queue that receives encoded packets.
    * @param channel_data Platform or protocol state attached to each packet.
    * @param frame_timestamp Capture timestamp associated with the encoded frame.
+   * @param frame_trace Per-stage stamp chain carried from capture; encode submit/done stamped here.
    * @return 0 when packets are queued; nonzero when encoding or packetization fails.
    */
-  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp, std::optional<platf::frame_trace_t> frame_trace) {
     auto &frame = session.device->frame;
     frame->pts = frame_nr;
 
@@ -1851,6 +1852,18 @@ namespace video {
 
     auto &sps = session.sps;
     auto &vps = session.vps;
+
+    // Stamp-chain clock: CLOCK_MONOTONIC ns, same epoch as the capture wire
+    // stamps the trace already carries (steady_clock is CLOCK_MONOTONIC on
+    // this platform).
+    auto trace_now_ns = [] {
+      return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+    };
+    if (frame_trace) {
+      frame_trace->encode_submit_ns = trace_now_ns();
+    }
 
     // send the frame to the encoder
     auto ret = avcodec_send_frame(ctx.get(), frame);
@@ -1907,6 +1920,10 @@ namespace video {
 
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
+        if (frame_trace) {
+          frame_trace->encode_done_ns = trace_now_ns();
+          packet->frame_trace = frame_trace;
+        }
       }
 
       packet->replacements = &session.replacements;
@@ -1955,11 +1972,12 @@ namespace video {
    * @param packets Packets queued or emitted by the stream.
    * @param channel_data Channel data.
    * @param frame_timestamp Frame timestamp.
+   * @param frame_trace Per-stage stamp chain carried from capture (avcodec sessions only).
    * @return 0 when the frame is encoded and queued; nonzero on encoder failure.
    */
-  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp, std::optional<platf::frame_trace_t> frame_trace) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
-      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
+      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp, frame_trace);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
     }
@@ -2498,6 +2516,7 @@ namespace video {
       }
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+      std::optional<platf::frame_trace_t> frame_trace;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
@@ -2511,8 +2530,9 @@ namespace video {
           // daemon path, where the picture is fetched here and arrives with
           // the source's own DQBUF timestamp — corrects frame_timestamp during
           // convert(). Every other path leaves it untouched, so this is a
-          // no-op for them.
+          // no-op for them. Same handoff for the per-frame stamp chain.
           frame_timestamp = img->frame_timestamp;
+          frame_trace = img->frame_trace;
         } else if (!images->running()) {
           break;
         }
@@ -2532,7 +2552,7 @@ namespace video {
         break;
       }
 
-      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
+      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp, frame_trace)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
@@ -2826,11 +2846,13 @@ namespace video {
           }
 
           std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+          std::optional<platf::frame_trace_t> frame_trace;
           if (img) {
             frame_timestamp = img->frame_timestamp;
+            frame_trace = img->frame_trace;
           }
 
-          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
+          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp, frame_trace)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
 
@@ -3068,7 +3090,7 @@ namespace video {
 
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     while (!packets->peek()) {
-      if (encode(1, *session, packets, nullptr, {})) {
+      if (encode(1, *session, packets, nullptr, {}, {})) {
         return -1;
       }
     }

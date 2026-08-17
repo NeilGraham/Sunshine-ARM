@@ -6,9 +6,11 @@
 
 // standard includes
 #include <bitset>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 
 // lib includes
@@ -502,6 +504,28 @@ namespace platf {
   };
 
   /**
+   * @brief Per-stage frame stamp chain, capture socket through network send.
+   *
+   * All stamps are CLOCK_MONOTONIC nanoseconds, the clock the retro-capture
+   * FRAME wire uses (its PROTOCOL.md §3.7), so one frame's row is directly
+   * subtractable across processes on this host. Present only on the daemon
+   * capture path; a HELD re-emission keeps the ORIGINAL frame's
+   * dqbuf/process stamps per that protocol, which is why flags rides along —
+   * a reader must split FRESH from HELD before treating deltas as latency.
+   */
+  struct frame_trace_t {
+    std::uint64_t serial;  ///< Capture daemon FRAME serial (gaps = daemon-side drops).
+    std::uint32_t flags;  ///< RCAP_FRAME_* flags (FRESH/HELD/BLACK/SIGNAL_LOST).
+    std::uint64_t dqbuf_ns;  ///< V4L2 DQBUF of the source frame.
+    std::uint64_t process_done_ns;  ///< RGA/GL completion into the pool buffer.
+    std::uint64_t capture_send_ns;  ///< Daemon-side stamp immediately before sendmsg.
+    std::uint64_t recv_ns;  ///< Socket receipt in this process (client library).
+    std::uint64_t convert_ns;  ///< convert() handoff of the frame to the encode device.
+    std::uint64_t encode_submit_ns;  ///< Frame submitted to the encoder.
+    std::uint64_t encode_done_ns;  ///< Encoded packet received back.
+  };
+
+  /**
    * @brief Captured frame buffer shared between capture and encode stages.
    */
   struct img_t: std::enable_shared_from_this<img_t> {
@@ -520,6 +544,7 @@ namespace platf {
     std::int32_t row_pitch {};  ///< Bytes between consecutive image rows.
 
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
+    std::optional<frame_trace_t> frame_trace;  ///< Per-stage stamp chain; daemon capture path only.
 
     /**
      * @brief Destroy the image.

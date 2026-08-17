@@ -442,6 +442,7 @@ namespace video {
     void *channel_data = nullptr;  ///< Platform or protocol state carried with this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
+    std::optional<platf::frame_trace_t> frame_trace;  ///< Per-stage stamp chain carried from capture; daemon path only.
   };
 
   /**

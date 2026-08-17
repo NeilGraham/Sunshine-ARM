@@ -4,6 +4,9 @@
  */
 
 // standard includes
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <queue>
@@ -1768,6 +1771,42 @@ namespace stream {
                                            ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
 
           frame_network_latency_logger.second_point_now_and_log();
+
+          // Per-frame stamp-chain trace (SUNSHINE_VIDEO_TRACE=<csv path>,
+          // off by default). Emitted after the socket write so net_send_ns
+          // closes the host half of the chain; frame_nr is the RTP frame
+          // index Moonlight reports as frameNumber, which is what joins a
+          // row here to the client's ML-FRAMERECV/ML-FRAMETIME/ML-FRAMEPRESENT
+          // rows. All stamps CLOCK_MONOTONIC ns (capture PROTOCOL.md §3.7);
+          // ~90 bytes/frame, one buffered fprintf + fflush on this thread.
+          static std::FILE *trace_file = []() -> std::FILE * {
+            const char *path = std::getenv("SUNSHINE_VIDEO_TRACE");
+            if (!path || !*path) {
+              return nullptr;
+            }
+            std::FILE *f = std::fopen(path, "ae");
+            BOOST_LOG(info) << "video trace: per-frame stamp chain "sv << (f ? "open -> "sv : "FAILED to open "sv) << path;
+            // ftell right after an append-mode open reports 0 whatever the
+            // size; seek to the real end before deciding on the header.
+            if (f && std::fseek(f, 0, SEEK_END) == 0 && std::ftell(f) == 0) {
+              std::fputs("frame_nr,serial,flags,dqbuf_ns,process_done_ns,capture_send_ns,recv_ns,convert_ns,encode_submit_ns,encode_done_ns,net_send_ns\n", f);
+            }
+            return f;
+          }();
+          if (trace_file && packet->frame_trace) {
+            const auto &t = *packet->frame_trace;
+            const auto net_send_ns = (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+            std::fprintf(trace_file, "%lld,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                         (long long) packet->frame_index(),
+                         (unsigned long long) t.serial, t.flags,
+                         (unsigned long long) t.dqbuf_ns, (unsigned long long) t.process_done_ns,
+                         (unsigned long long) t.capture_send_ns, (unsigned long long) t.recv_ns,
+                         (unsigned long long) t.convert_ns, (unsigned long long) t.encode_submit_ns,
+                         (unsigned long long) t.encode_done_ns, net_send_ns);
+            std::fflush(trace_file);
+          }
 
           BOOST_LOG(verbose) << "Sent Frame seq ["sv << packet->frame_index() << "] pts ["sv << timestamp
                              << "] shards ["sv << shards.size() << "/"sv << shards.percentage << "%]"sv
