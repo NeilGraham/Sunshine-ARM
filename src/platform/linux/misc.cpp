@@ -522,8 +522,10 @@ namespace platf {
     }
   }
 
-  void set_thread_name(const std::string &name) {
-    pthread_setname_np(pthread_self(), name.c_str());
+  void set_thread_name(std::string_view name) {
+    // Truncate name to fit in Linux/FreeBSD kernel's 16 byte limit
+    std::string tr_name {name.substr(0, 15)};
+    pthread_setname_np(pthread_self(), tr_name.c_str());
   }
 
   /**
@@ -1248,7 +1250,15 @@ namespace platf {
    * @return Always `true` because Linux GPU changes are not tracked by this backend.
    */
   bool needs_encoder_reenumeration() {
-    // We don't track GPU state, so we will always reenumerate. Fortunately, it is fast on Linux.
+    // Only re-probe if the GPU render device changed (hotplug, driver reload).
+    // Full re-probing on every reconnect leaks ~20 MB due to FFmpeg CBS
+    // allocations during HEVC/AV1 codec validation.
+    static std::string last_render_device;
+    auto current = platf::resolve_render_device();
+    if (current == last_render_device) {
+      return false;
+    }
+    last_render_device = current;
     return true;
   }
 

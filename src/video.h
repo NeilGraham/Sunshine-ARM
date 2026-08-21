@@ -6,6 +6,7 @@
 
 // standard includes
 #include <chrono>
+#include <string_view>
 
 // local includes
 #include "input.h"
@@ -39,6 +40,29 @@ namespace video {
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
   };
+
+  namespace amf {
+
+    /**
+     * @brief Enumerates supported coder options for the AMF encoder.
+     */
+    enum class coder_e : int {
+      auto_ = 0,  ///< Select the coder based on the H.264 profile.
+      cabac = 1,  ///< CABAC entropy coding.
+      cavlc = 2,  ///< CAVLC entropy coding.
+    };
+
+  }  // namespace amf
+
+  /**
+   * @brief Select the effective FFmpeg H.264 profile for an encoder configuration.
+   *
+   * @param encoder_name FFmpeg encoder name selected for the stream.
+   * @param config Encoding configuration requested by the remote client.
+   * @param amd_coder Configured AMF entropy-coder value.
+   * @return FFmpeg H.264 profile applied to the codec context.
+   */
+  int select_h264_profile(std::string_view encoder_name, const config_t &config, int amd_coder);
 
   /**
    * @brief Map an FFmpeg hardware device type to Sunshine's memory type.
@@ -94,6 +118,74 @@ namespace video {
    * @brief Shared event that transports captured images between capture and encode threads.
    */
   using img_event_t = std::shared_ptr<safe::event_t<std::shared_ptr<platf::img_t>>>;
+
+  /**
+   * @brief FFmpeg software encode device used when no hardware frames are required.
+   */
+  class avcodec_software_encode_device_t: public platf::avcodec_encode_device_t {
+  public:
+    /**
+     * @brief Convert a captured image into the encoder input representation.
+     *
+     * @param img Image or frame object to read from or populate.
+     * @return Conversion status.
+     */
+    int convert(platf::img_t &img) override;
+
+    /**
+     * @brief Attach frame resources used by the next conversion or encode operation.
+     * @note Takes ownership of 'in_frame'.
+     *
+     * @param in_frame Video or graphics frame being processed.
+     * @param hw_frames_ctx FFmpeg hardware frames context associated with the frame.
+     * @return Status from updating frame.
+     */
+    int set_frame(AVFrame *in_frame, AVBufferRef *hw_frames_ctx) override;
+
+    /**
+     * @brief Apply the configured colorspace metadata to the active frame.
+     */
+    void apply_colorspace() override;
+
+    /**
+     * @brief Initialize FFmpeg software encoding for the requested codec.
+     *
+     * @param in_width In width.
+     * @param in_height In height.
+     * @param in_frame Video or graphics frame being processed.
+     * @param format Pixel, audio, or protocol format being converted.
+     * @param hardware Whether the frame is backed by hardware resources.
+     * @return 0 on success; nonzero or negative platform status on failure.
+     */
+    int init(int in_width, int in_height, AVFrame *in_frame, AVPixelFormat format, bool hardware);
+
+  private:
+    /**
+     * @brief When preserving aspect ratio, ensure that padding is black.
+     */
+    void prefill();
+
+    /**
+     * @brief (Re)create the software scaler for the given source format.
+     *
+     * @param src_format Pixel format of the captured frames.
+     * @return 0 on success; nonzero on failure.
+     */
+    int reinit_sws(AVPixelFormat src_format);
+
+    // Store ownership when frame is hw_frame
+    avcodec_frame_t hw_frame;  ///< Hw frame.
+
+    avcodec_frame_t sw_frame;  ///< Sw frame.
+    avcodec_frame_t sws_input_frame;  ///< Sws input frame.
+    avcodec_frame_t sws_output_frame;  ///< Sws output frame.
+    sws_t sws;  ///< Software scaler used when frames need CPU-side pixel conversion.
+    AVPixelFormat sws_src_format {AV_PIX_FMT_BGR0};  ///< Source format the sws context was created with.
+
+    // Offset of input image to output frame in pixels
+    int offsetW;  ///< Offset w.
+    int offsetH;  ///< Offset h.
+  };
 
   /**
    * @brief Pixel formats supported by one encoder backend.

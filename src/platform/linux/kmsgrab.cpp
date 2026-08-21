@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <filesystem>
+#include <ranges>
 #include <thread>
 #include <unistd.h>
 
@@ -657,12 +658,12 @@ namespace platf {
             }
           }
 
-          auto index = ++conn_type_count[conn->connector_type];
+          ++conn_type_count[conn->connector_type];
 
           monitors.emplace_back(connector_t {
             conn->connector_type,
             crtc_id,
-            index,
+            conn->connector_type_id,
             conn->connector_id,
             conn->connection == DRM_MODE_CONNECTED,
           });
@@ -852,6 +853,30 @@ namespace platf {
     }
 
     /**
+     * @brief Map display name to monitor index
+     *
+     * @param display_name Name of the display to determine monitor index for (or monitor index string value)
+     * @return monitor's display index
+     */
+    static int64_t map_display_name_to_monitor_index(const std::string_view &display_name) {
+      // Handle (legacy) monitor index strings by converting them to integer
+      if (display_name.empty() || std::ranges::all_of(display_name, ::isdigit)) {
+        return util::from_view(display_name);
+      }
+      // display_name is a connector name (not empty and containing non-digits)
+      for (auto &card_descriptor : kms::card_descriptors) {
+        for (const auto &monitor_descriptor : card_descriptor.crtc_to_monitor | std::views::values) {
+          if (display_name == std::format("{}-{}", drmModeGetConnectorTypeName(monitor_descriptor.type), monitor_descriptor.index)) {
+            BOOST_LOG(info) << "Mapped '"sv << display_name << "' to kmsgrab monitor index " << monitor_descriptor.monitor_index;
+            return monitor_descriptor.monitor_index;
+          }
+        }
+      }
+      BOOST_LOG(warning) << "Couldn't map '"sv << display_name << "' to a monitor index. Falling back to first monitor in list (index=0).";
+      return 0;  // Fallback to first index if nothing can be matched
+    }
+
+    /**
      * @brief Base KMS display capture backend shared by RAM and VRAM paths.
      */
     class display_t: public platf::display_t {
@@ -876,7 +901,7 @@ namespace platf {
       int init(const std::string &display_name, const ::video::config_t &config) {
         delay = ::video::capture_frame_interval(config);
 
-        int monitor_index = util::from_view(display_name);
+        int monitor_index = map_display_name_to_monitor_index(display_name);
         int monitor = 0;
 
         fs::path card_dir {"/dev/dri"sv};
@@ -2242,7 +2267,14 @@ namespace platf {
           kms::print(plane.get(), fb.get(), crtc.get());
         }
 
-        display_names.emplace_back(std::to_string(count++));
+        // Capture box: the accepted cursor-typed Esmart plane can lack a
+        // crtc_to_monitor entry — fall back to the old numeric name there.
+        if (it != std::end(crtc_to_monitor)) {
+          display_names.emplace_back(std::format("{}-{}", drmModeGetConnectorTypeName(it->second.type), it->second.index));
+        } else {
+          display_names.emplace_back(std::to_string(count));
+        }
+        count++;
       }
 
       cds.emplace_back(kms::card_descriptor_t {
@@ -2280,6 +2312,7 @@ namespace platf {
 
     kms::card_descriptors = std::move(cds);
 
+    BOOST_LOG(debug) << "Final KMS display_names return list: " << (display_names | std::views::join_with(' ') | std::ranges::to<std::string>());
     return display_names;
   }
 
