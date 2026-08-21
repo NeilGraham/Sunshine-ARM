@@ -2312,7 +2312,17 @@ namespace platf {
 
     kms::card_descriptors = std::move(cds);
 
-    BOOST_LOG(debug) << "Final KMS display_names return list: " << (display_names | std::views::join_with(' ') | std::ranges::to<std::string>());
+    // Spelled out without std::views::join_with / std::ranges::to — the fork
+    // still builds with gcc-12 (Debian bookworm cross toolchain), whose
+    // libstdc++ lacks both.
+    std::string display_names_joined;
+    for (const auto &name : display_names) {
+      if (!display_names_joined.empty()) {
+        display_names_joined += ' ';
+      }
+      display_names_joined += name;
+    }
+    BOOST_LOG(debug) << "Final KMS display_names return list: " << display_names_joined;
     return display_names;
   }
 

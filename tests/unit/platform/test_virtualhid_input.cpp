@@ -637,7 +637,10 @@ TEST_F(VirtualHidDeviceTest, TranslatesMouseAndKeyboardInput) {
   EXPECT_FALSE(keyboard_event.pressed);
 
   const auto keyboard_submit_count = context()->keyboard->submit_count();
-  const std::string text = "Sunshine \u{2600}";
+  // ☀ rather than C++23's \u{2600}: same code point, but the fork still
+  // builds with gcc-12 (Debian bookworm cross toolchain), which cannot lex
+  // delimited escape sequences.
+  const std::string text = "Sunshine ☀";
   platf::virtualhid::unicode(*context(), text.data(), static_cast<int>(text.size()));
   EXPECT_EQ(context()->keyboard->submit_count(), keyboard_submit_count + 1);
   platf::virtualhid::unicode(*context(), nullptr, 1);
