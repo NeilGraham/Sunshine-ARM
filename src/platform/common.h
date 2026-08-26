@@ -827,6 +827,17 @@ namespace platf {
      */
     virtual void flush() {}
 
+    /**
+     * @brief Server-side capture backlog in microseconds (SUNSHINE_AUDIO_TRACE).
+     *
+     * The record backlog is the one place fixed audio latency can hide: the
+     * blocking read drains at realtime rate, so it never shrinks on its own.
+     * Default 0 = not measurable on this backend; PulseAudio overrides.
+     */
+    virtual std::uint64_t backlog_us() {
+      return 0;
+    }
+
     virtual ~mic_t() = default;
   };
 

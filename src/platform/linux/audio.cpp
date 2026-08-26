@@ -102,6 +102,15 @@ namespace platf {
         BOOST_LOG(warning) << "pa_simple_flush() failed: "sv << pa_strerror(status);
       }
     }
+
+    /**
+     * @brief Record-stream backlog (pa_simple_get_latency), bounded by maxlength.
+     */
+    std::uint64_t backlog_us() override {
+      int status;
+      const pa_usec_t lat = pa_simple_get_latency(mic.get(), &status);
+      return lat == (pa_usec_t) -1 ? 0 : static_cast<std::uint64_t>(lat);
+    }
   };
 
   /**

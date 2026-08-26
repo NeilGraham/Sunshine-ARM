@@ -329,6 +329,47 @@ namespace audio {
       }
     });
 
+    // SUNSHINE_AUDIO_TRACE=path: one CSV line per second, the audio twin of
+    // SUNSHINE_VIDEO_TRACE. Columns: mono_ms (CLOCK_MONOTONIC ms, comparable
+    // with the video trace and ~/tests audiomon CSVs), frames (capture reads
+    // that second; 200 at 5 ms), pa_backlog_us (server-side record backlog —
+    // the reservoir that never drains on its own, bounded by
+    // SUNSHINE_AUDIO_MAXLENGTH_FRAMES), gate (1 = squelch armed), squelches.
+    std::FILE *trace = nullptr;
+    if (const char *path = env_val("SUNSHINE_AUDIO_TRACE")) {
+      trace = std::fopen(path, "ab");
+      BOOST_LOG(info) << "audio trace: "sv << (trace ? "open -> "sv : "FAILED to open "sv) << path;
+      if (trace) {
+        std::fputs("mono_ms,frames,pa_backlog_us,gate,squelches\n", trace);
+      }
+    }
+    auto fg_trace = util::fail_guard([&trace]() {
+      if (trace) {
+        std::fclose(trace);
+      }
+    });
+    // Per-second bookkeeping shared by the trace and the dead-stream watchdog.
+    std::uint64_t trace_frames = 0;
+    auto trace_next = std::chrono::steady_clock::now() + 1s;
+
+    // Dead-stream watchdog (SUNSHINE_AUDIO_DEAD_REOPEN, default on; off/0
+    // disables). Seen 2026-08-26: a session whose capture stream delivered
+    // exact digital zero at realtime rate with a ~0 ms server backlog for
+    // its whole life, while every other session sits at 8-15 ms — the
+    // stream had been linked into the wrong clock domain during
+    // retro-audio's resume (the graph reloads its source + loopback and
+    // re-elects its driver ~200 ms before this capture opens). The user's
+    // fix was a Moonlight reconnect, i.e. a fresh record stream; do that
+    // here after 3 s of (all-zero AND backlog < 1 ms). Real programme
+    // silence keeps the normal backlog, so it does not trip this.
+    const bool dead_reopen = [&env_val]() {
+      const char *v = env_val("SUNSHINE_AUDIO_DEAD_REOPEN");
+      return !(v && (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0));
+    }();
+    bool sec_all_zero = true;
+    int dead_seconds = 0;
+    std::uint64_t dead_reopens = 0;
+
     // Rebuild the PA record stream (shared by the error path and the
     // gate-clear SUNSHINE_AUDIO_REOPEN path).
     auto reinit_mic = [&]() {
@@ -449,6 +490,41 @@ namespace audio {
               sample_buffer[i + c] *= gain;
             }
           }
+        }
+      }
+
+      {
+        ++trace_frames;
+        if (sec_all_zero) {
+          sec_all_zero = std::all_of(sample_buffer.begin(), sample_buffer.end(), [](float s) { return s == 0.0f; });
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= trace_next) {
+          const auto backlog_us = mic->backlog_us();
+          if (trace) {
+            const auto mono_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+            std::fprintf(trace, "%lld,%llu,%llu,%d,%llu\n",
+                         static_cast<long long>(mono_ms),
+                         static_cast<unsigned long long>(trace_frames),
+                         static_cast<unsigned long long>(backlog_us),
+                         audio_gate::active() ? 1 : 0,
+                         static_cast<unsigned long long>(squelch_count));
+            std::fflush(trace);
+          }
+          dead_seconds = (sec_all_zero && backlog_us < 1000) ? dead_seconds + 1 : 0;
+          if (dead_reopen && dead_seconds >= 3) {
+            ++dead_reopens;
+            BOOST_LOG(warning) << "audio watchdog: capture stream dead (all-zero, backlog "sv << backlog_us
+                               << " us) for "sv << dead_seconds << " s; reopening (n="sv << dead_reopens << ")"sv;
+            dead_seconds = 0;
+            reinit_mic();
+            if (!mic) {
+              return;
+            }
+          }
+          trace_frames = 0;
+          sec_all_zero = true;
+          trace_next = now + 1s;
         }
       }
 
