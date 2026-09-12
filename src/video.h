@@ -694,6 +694,16 @@ namespace video {
   );
 
   /**
+   * @brief Whether the chosen encoder serves every client from one shared encode session.
+   *
+   * When true, each session's encoded video (its own encode, or the fan-out
+   * clones it receives as a listener) is queued on the SESSION mailbox's
+   * `mail::video_packets` rather than the global broadcast queue, and the
+   * session must run its own sender thread for it (stream.cpp).
+   */
+  bool shared_fanout_active();
+
+  /**
    * @brief Validate encoder before it is used.
    *
    * @param encoder Encoder configuration or encoder instance.

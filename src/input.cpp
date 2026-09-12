@@ -272,6 +272,8 @@ namespace input {
 
     int32_t accumulated_vscroll_delta;  ///< Accumulated vscroll delta.
     int32_t accumulated_hscroll_delta;  ///< Accumulated hscroll delta.
+
+    bool active = false;  ///< A running session owns this input (guarded by retained_input_state_t::mutex).
   };
 
   /**
@@ -2093,9 +2095,26 @@ namespace input {
   /**
    * @brief Allocate and initialize platform input state for a stream.
    */
+  void detach(const std::shared_ptr<input_t> &input) {
+    if (!input) {
+      return;
+    }
+    auto &state = retained_input_state();
+    std::lock_guard lock {state.mutex};
+    input->active = false;
+  }
+
   std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id) {
     std::shared_ptr<input_t> input;
     bool resumed = false;
+    // Retained inputs of OTHER clients whose session has ended: a client that
+    // has gone away and not resumed. Left in the map its virtual gamepad stays
+    // allocated, and the console keeps seeing a controller nobody holds — the
+    // next client to connect then shows up as controller 2. Pull those out
+    // here and free their gamepads below (off the lock, off this thread).
+    // Inputs whose session is still RUNNING are other players streaming
+    // right now (shared-encoder fan-out, video.cpp) and are left alone.
+    retained_input_map_t superseded;
     {
       auto &state = retained_input_state();
       std::lock_guard lock {state.mutex};
@@ -2108,8 +2127,27 @@ namespace input {
           mail->event<input::touch_port_t>(mail::touch_port),
           mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
         );
+      }
+      input->active = true;
+      for (auto it = state.inputs.begin(); it != state.inputs.end();) {
+        if (it->first != session_id && !it->second->active) {
+          superseded.emplace(it->first, it->second);
+          it = state.inputs.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (!resumed) {
         state.inputs.try_emplace(std::move(session_id), input);
       }
+    }
+
+    if (!superseded.empty()) {
+      // destroy_gamepads clears each gamepad's id, so the input_t destructors
+      // that run when `superseded` is dropped will not double-free.
+      dispatch_input_task([superseded = std::move(superseded)]() {
+        destroy_gamepads(superseded);
+      });
     }
 
     if (resumed) {

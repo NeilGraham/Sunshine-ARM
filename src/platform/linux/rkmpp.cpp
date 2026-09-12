@@ -639,7 +639,19 @@ namespace rkmpp {
       }
 
       if (capture_expected) {
-        capture = frame_source_t::connect(frame->width, frame->height, hw_frames_ctx_buf);
+        // The daemon admits one consumer at a time. When this encode session
+        // replaces one that just ended — a fan-out listener promoted to
+        // encoder owner (video.cpp), or a plain encoder reinit — the daemon
+        // may not have reaped the previous connection yet. Retry briefly
+        // before falling back to KMS capture, which on this host would
+        // silently stream the desktop instead of the console.
+        for (int attempt = 0; attempt < 10 && !capture; ++attempt) {
+          if (attempt) {
+            std::this_thread::sleep_for(200ms);
+            BOOST_LOG(info) << "retro-capture: connect retry "sv << attempt;
+          }
+          capture = frame_source_t::connect(frame->width, frame->height, hw_frames_ctx_buf);
+        }
         if (capture) {
           BOOST_LOG(info) << "Using retro-capture daemon encode path (zero-copy DRM_PRIME)"sv;
           // Tells kmsgrab its framebuffer export is dead work for this
@@ -710,6 +722,18 @@ namespace rkmpp {
                                 std::chrono::steady_clock::now().time_since_epoch())
                                 .count();
           img.frame_trace = trace;
+        }
+        // Carry a pending IDR request onto the frame that is actually about
+        // to be encoded. video.cpp stamps request_idr_frame() on
+        // device->frame BEFORE convert(), i.e. on whichever pool wrapper the
+        // previous frame used; without this the IDR lands whenever that
+        // wrapper next comes around (a pool's worth of frames late) and
+        // fan-out listeners, which can only start at an IDR, wait with it.
+        if (AVFrame *prev = this->frame; prev && prev != enc && (prev->flags & AV_FRAME_FLAG_KEY)) {
+          prev->pict_type = AV_PICTURE_TYPE_NONE;
+          prev->flags &= ~AV_FRAME_FLAG_KEY;
+          enc->pict_type = AV_PICTURE_TYPE_I;
+          enc->flags |= AV_FRAME_FLAG_KEY;
         }
         this->frame = enc;
         // Encoder OSD (stream overlay): attach/remove side data on the

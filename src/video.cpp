@@ -7,7 +7,10 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cstdlib>
 #include <list>
+#include <mutex>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -403,6 +406,7 @@ namespace video {
     YUV444_SUPPORT = 1 << 10,  ///< Encoder may support 4:4:4 chroma sampling depending on hardware
     ASYNC_TEARDOWN = 1 << 11,  ///< Encoder supports async teardown on a different thread
     FIXED_GOP_SIZE = 1 << 12,  ///< Use fixed small GOP size (encoder doesn't support on-demand IDR frames)
+    SHARED_CLIENT_FANOUT = 1 << 13,  ///< One encoder session serves every client; additional clients receive fan-out copies of its packets (see video::fanout)
   };
 
   /**
@@ -1262,7 +1266,10 @@ namespace video {
       {},  // Fallback options
       "h264_rkmpp"s,
     },
-    LIMITED_GOP_SIZE | PARALLEL_ENCODING
+    // SHARED_CLIENT_FANOUT: the retro-capture daemon admits ONE consumer and
+    // the VPU is budgeted for one 4K60 encode, so a second Moonlight client
+    // must share the first client's encoder rather than open its own.
+    LIMITED_GOP_SIZE | PARALLEL_ENCODING | SHARED_CLIENT_FANOUT
   };
 
   #endif
@@ -1847,6 +1854,272 @@ namespace video {
     }
   }
 
+  input::touch_port_t make_port(platf::display_t *display, const config_t &config);
+
+  /**
+   * @brief Shared-encoder fan-out (SHARED_CLIENT_FANOUT).
+   *
+   * On a capture box one Moonlight client cannot open a second encoder: the
+   * retro-capture daemon admits a single consumer (PROTOCOL.md ERROR BUSY) and
+   * the VPU budget is one 4K60 session. So the FIRST session to start video
+   * becomes the encoder "owner" and runs the ordinary capture/encode path;
+   * every later session is a "listener" that receives a refcounted clone of
+   * each encoded packet, stamped with its own channel_data and its own
+   * monotonic frame index, on its OWN session mailbox queue. stream.cpp drains
+   * that queue on a per-session sender thread, so the second client's FEC,
+   * encryption and pacing run on another core and can never delay the first
+   * client's frames.
+   *
+   * Cost to a single-client stream — the case that must not regress: two
+   * relaxed atomic loads per encoded frame (listener_count and the owner
+   * check), nothing else. No lock is taken and no packet is touched until a
+   * listener actually exists.
+   *
+   * A listener only starts receiving at the first IDR after it joins (the
+   * owner forces one), so its client can always decode from its first packet.
+   * Any listener's IDR / reference-invalidation request becomes a shared IDR.
+   * When the owner's session ends a listener promotes itself to owner, starts
+   * a fresh encoder (the daemon slot is handed over — rkmpp.cpp retries the
+   * connect), and keeps its frame numbering where its listener numbering left
+   * off.
+   */
+  namespace fanout {
+    struct listener_t {
+      void *channel_data;
+      safe::mail_raw_t::queue_t<packet_t> packets;  ///< The listener session's own video queue (stream.cpp sends from it).
+      safe::mail_raw_t::event_t<bool> shutdown_event;
+      safe::mail_raw_t::event_t<bool> idr_events;
+      safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
+      safe::mail_raw_t::event_t<hdr_info_t> hdr_events;
+      safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;
+      config_t config;
+      int frame_nr;  ///< Next frame index for this listener's packet clones.
+      bool joined;  ///< The owner validated the config and raised the initial events.
+      bool active;  ///< Receiving packets; set at the first IDR after joining.
+      bool rejected;  ///< Config incompatible with the shared stream.
+    };
+
+    /**
+     * @brief A packet clone handed to a listener.
+     *
+     * The encoded bytes are shared with the owner's packet (av_packet_ref).
+     * The SPS/VPS replacement rules are NOT: the owner's point into its
+     * encode session, which can be torn down while this clone still waits in
+     * the listener's queue, so a clone carries its own copy.
+     */
+    struct packet_raw_fanout: packet_raw_avcodec {
+      std::vector<std::pair<std::string, std::string>> replacement_bytes;
+      std::vector<packet_raw_t::replace_t> owned_replacements;
+    };
+
+    static std::mutex mutex;  ///< Guards listeners, current_hdr, and owner transitions.
+    static std::atomic<void *> owner_channel {nullptr};
+    static std::atomic<int> listener_count {0};
+    static std::vector<std::shared_ptr<listener_t>> listeners;
+    static hdr_info_raw_t current_hdr {false};  ///< Owner's HDR state, replayed to late joiners.
+
+    static bool try_acquire_owner(void *channel_data) {
+      std::lock_guard lg {mutex};
+      void *expected = nullptr;
+      return owner_channel.compare_exchange_strong(expected, channel_data, std::memory_order_acq_rel);
+    }
+
+    static void release_owner(void *channel_data) {
+      std::lock_guard lg {mutex};
+      if (owner_channel.load(std::memory_order_acquire) != channel_data) {
+        return;
+      }
+      owner_channel.store(nullptr, std::memory_order_release);
+
+      // Remaining listeners must be re-joined (and re-IDR'd) by the next owner
+      for (auto &listener : listeners) {
+        listener->joined = false;
+        listener->active = false;
+      }
+    }
+
+    static bool owner_alive() {
+      return owner_channel.load(std::memory_order_acquire) != nullptr;
+    }
+
+    static std::shared_ptr<listener_t> subscribe(safe::mail_t &mail, const config_t &config, void *channel_data, int frame_nr) {
+      auto listener = std::make_shared<listener_t>();
+      listener->channel_data = channel_data;
+      listener->packets = mail->queue<packet_t>(mail::video_packets);
+      listener->shutdown_event = mail->event<bool>(mail::shutdown);
+      listener->idr_events = mail->event<bool>(mail::idr);
+      listener->invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      listener->hdr_events = mail->event<hdr_info_t>(mail::hdr);
+      listener->touch_port_events = mail->event<input::touch_port_t>(mail::touch_port);
+      listener->config = config;
+      listener->frame_nr = frame_nr;
+      listener->joined = false;
+      listener->active = false;
+      listener->rejected = false;
+
+      std::lock_guard lg {mutex};
+      listeners.emplace_back(listener);
+      listener_count.fetch_add(1, std::memory_order_release);
+      return listener;
+    }
+
+    /**
+     * @brief Remove a listener and return its next frame index for continuity.
+     */
+    static int unsubscribe(const std::shared_ptr<listener_t> &listener) {
+      std::lock_guard lg {mutex};
+      listeners.erase(std::remove(std::begin(listeners), std::end(listeners), listener), std::end(listeners));
+      listener_count.fetch_sub(1, std::memory_order_release);
+      return listener->frame_nr;
+    }
+
+    static void update_hdr(void *channel_data, const hdr_info_raw_t &hdr) {
+      if (owner_channel.load(std::memory_order_acquire) != channel_data) {
+        return;
+      }
+      std::lock_guard lg {mutex};
+      current_hdr = hdr;
+    }
+
+    /**
+     * @brief Clone an encoded packet to every active listener (slow path; a listener exists).
+     */
+    static void fanout_packets_slow(packet_raw_avcodec &src) {
+      std::lock_guard lg {mutex};
+      if (owner_channel.load(std::memory_order_relaxed) != src.channel_data) {
+        return;
+      }
+
+      const bool key = src.av_packet->flags & AV_PKT_FLAG_KEY;
+      for (auto &listener : listeners) {
+        if (!listener->joined || listener->rejected) {
+          continue;
+        }
+        if (!listener->active) {
+          if (!key) {
+            continue;
+          }
+          listener->active = true;
+        }
+
+        auto clone = std::make_unique<packet_raw_fanout>();
+        if (!clone->av_packet || av_packet_ref(clone->av_packet, src.av_packet) < 0) {
+          BOOST_LOG(error) << "Couldn't clone encoded packet for fan-out"sv;
+          continue;
+        }
+        clone->av_packet->pts = listener->frame_nr++;
+        clone->channel_data = listener->channel_data;
+        clone->frame_timestamp = src.frame_timestamp;
+        clone->after_ref_frame_invalidation = src.after_ref_frame_invalidation;
+        // frame_trace deliberately not copied: the stamp-chain trace is one
+        // row per encoded frame, keyed by the OWNER's frame index.
+
+        if (key && src.replacements && !src.replacements->empty()) {
+          // reserve() first: the string_views below point into these strings,
+          // and a vector growth would move them (SSO buffers move too).
+          clone->replacement_bytes.reserve(src.replacements->size());
+          clone->owned_replacements.reserve(src.replacements->size());
+          for (auto &r : *src.replacements) {
+            auto &bytes = clone->replacement_bytes.emplace_back(std::string {r.old}, std::string {r._new});
+            clone->owned_replacements.emplace_back(std::string_view {bytes.first}, std::string_view {bytes.second});
+          }
+          clone->replacements = &clone->owned_replacements;
+        }
+
+        listener->packets->raise(std::move(clone));
+      }
+    }
+
+    /**
+     * @brief Hot-path entry: costs one relaxed atomic load while no listener exists.
+     */
+    static inline void fanout_packets(packet_raw_avcodec &src) {
+      if (listener_count.load(std::memory_order_relaxed) == 0) {
+        return;
+      }
+      fanout_packets_slow(src);
+    }
+
+    /**
+     * @brief Owner-side servicing of joins and listener IDR requests.
+     *
+     * Runs once per encoded frame on the owner's encode thread. Returns true
+     * when the owner must encode an IDR. Costs two relaxed atomic loads
+     * unless this session is the owner AND a listener exists.
+     */
+    static bool owner_service(platf::display_t *disp, const config_t &owner_config, void *channel_data) {
+      if (listener_count.load(std::memory_order_relaxed) == 0 ||
+          owner_channel.load(std::memory_order_relaxed) != channel_data) {
+        return false;
+      }
+
+      bool want_idr = false;
+
+      std::lock_guard lg {mutex};
+      for (auto &listener : listeners) {
+        if (listener->rejected) {
+          continue;
+        }
+
+        if (!listener->joined) {
+          auto &config = listener->config;
+          if (config.videoFormat != owner_config.videoFormat ||
+              config.dynamicRange != owner_config.dynamicRange ||
+              config.chromaSamplingType != owner_config.chromaSamplingType) {
+            BOOST_LOG(error) << "Rejecting additional client: requested stream (codec "sv << config.videoFormat
+                             << ", dynamicRange "sv << config.dynamicRange
+                             << ", chroma "sv << config.chromaSamplingType
+                             << ") is incompatible with the active shared stream (codec "sv << owner_config.videoFormat
+                             << ", dynamicRange "sv << owner_config.dynamicRange
+                             << ", chroma "sv << owner_config.chromaSamplingType
+                             << "). Reconnect with matching codec settings to join."sv;
+            listener->rejected = true;
+            listener->shutdown_event->raise(true);
+            continue;
+          }
+
+          if (config.width != owner_config.width || config.height != owner_config.height ||
+              config.framerate != owner_config.framerate || config.bitrate != owner_config.bitrate) {
+            BOOST_LOG(warning) << "Additional client requested "sv << config.width << 'x' << config.height
+                               << '@' << config.framerate << " ("sv << config.bitrate
+                               << " kbps) but joins the shared stream at "sv << owner_config.width << 'x'
+                               << owner_config.height << '@' << owner_config.framerate << " ("sv
+                               << owner_config.bitrate << " kbps)"sv;
+          }
+
+          listener->touch_port_events->raise(make_port(disp, config));
+          listener->hdr_events->raise(std::make_unique<hdr_info_raw_t>(current_hdr.enabled, current_hdr.metadata));
+          listener->joined = true;
+          want_idr = true;
+
+          BOOST_LOG(info) << "Client joined the shared video stream ("sv << listener_count.load(std::memory_order_relaxed) + 1 << " clients total)"sv;
+        }
+
+        if (listener->idr_events->peek()) {
+          listener->idr_events->pop();
+          want_idr = true;
+        }
+        // The rkmpp session implements reference invalidation as an IDR anyway
+        while (listener->invalidate_ref_frames_events->peek()) {
+          listener->invalidate_ref_frames_events->pop(0ms);
+          want_idr = true;
+        }
+      }
+
+      return want_idr;
+    }
+  }  // namespace fanout
+
+  bool shared_fanout_active() {
+    // SUNSHINE_SHARED_FANOUT=0|off forces the upstream one-encoder-per-client
+    // path for A/B measurement (a second client then finds the daemon BUSY).
+    static const bool disabled = [] {
+      const char *env = std::getenv("SUNSHINE_SHARED_FANOUT");
+      return env && (std::string_view {env} == "0" || std::string_view {env} == "off");
+    }();
+    return !disabled && chosen_encoder && (chosen_encoder->flags & SHARED_CLIENT_FANOUT);
+  }
+
   /**
    * @brief Drain encoded packets from an FFmpeg encoder session.
    *
@@ -1942,6 +2215,8 @@ namespace video {
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
+      // Shared-encoder listeners (one relaxed atomic load when there are none)
+      fanout::fanout_packets(*packet);
       packets->raise(std::move(packet));
     }
 
@@ -2496,7 +2771,12 @@ namespace video {
     BOOST_LOG(info) << "Frame wait target set to "sv << minimum_fps_target << "fps ("sv << max_frametime.count() << "ms)"sv;
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
-    auto packets = mail::man->queue<packet_t>(mail::video_packets);
+    // Shared-encoder platforms queue video on the SESSION mailbox: stream.cpp
+    // sends it from a per-session thread, and fan-out listeners get their
+    // clones on their own session queue the same way. Everyone else keeps the
+    // global broadcast queue.
+    const bool shared_fanout = shared_fanout_active();
+    auto packets = shared_fanout ? mail->queue<packet_t>(mail::video_packets) : mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
 
@@ -2523,6 +2803,12 @@ namespace video {
       if (idr_events->peek()) {
         requested_idr_frame = true;
         idr_events->pop();
+      }
+
+      // Fan-out listeners sharing this encoder: service joins and honor their
+      // IDR requests. Two relaxed atomic loads unless a listener exists.
+      if (shared_fanout && fanout::owner_service(disp.get(), config, channel_data)) {
+        requested_idr_frame = true;
       }
 
       if (requested_idr_frame) {
@@ -2944,11 +3230,13 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Video configuration.
    * @param channel_data Opaque channel data passed to packets.
+   * @param frame_nr Next frame index; persists across owner promotions in shared fan-out mode.
    */
   void capture_async(
     safe::mail_t mail,
     config_t &config,
-    void *channel_data
+    void *channel_data,
+    int &frame_nr
   ) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
@@ -2968,8 +3256,6 @@ namespace video {
     if (!ref->capture_ctx_queue->running()) {
       return;
     }
-
-    int frame_nr = 1;
 
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
@@ -3013,6 +3299,8 @@ namespace video {
           BOOST_LOG(error) << "Couldn't get display hdr metadata when colorspace selection indicates it should have one";
         }
       }
+      // Late-joining fan-out listeners need the HDR state replayed to them
+      fanout::update_hdr(channel_data, *hdr_info);
       hdr_event->raise(std::move(hdr_info));
 
       encode_run(
@@ -3026,6 +3314,62 @@ namespace video {
         *ref->encoder_p,
         channel_data
       );
+    }
+  }
+
+  /**
+   * @brief Capture and encode video for a session sharing one encoder with every other session.
+   *
+   * The first session to arrive becomes the encoder owner and runs the normal
+   * asynchronous capture/encode path; the others subscribe to its encoded
+   * output (video::fanout) and block here until they shut down or get
+   * promoted to owner.
+   *
+   * @param mail Session mail bus.
+   * @param config Video configuration.
+   * @param channel_data Opaque channel data passed to packets.
+   */
+  void capture_shared(
+    safe::mail_t mail,
+    config_t &config,
+    void *channel_data
+  ) {
+    auto shutdown_event = mail->event<bool>(mail::shutdown);
+
+    // Persists across role changes so this client's frame indexes stay monotonic
+    int frame_nr = 1;
+
+    while (!shutdown_event->peek()) {
+      if (fanout::try_acquire_owner(channel_data)) {
+        auto fg = util::fail_guard([channel_data]() {
+          fanout::release_owner(channel_data);
+        });
+
+        BOOST_LOG(info) << "Shared video stream: this session owns the encoder"sv;
+        // Returns only when the session is over: capture_async raises the
+        // session's shutdown on every exit path, so there is nothing to retry.
+        capture_async(mail, config, channel_data, frame_nr);
+      } else {
+        BOOST_LOG(info) << "Shared video stream: an encoder is already running, joining as a listener"sv;
+
+        // Keep the capture thread alive across an owner handoff: if the owner
+        // leaves and this listener is promoted, the display does not have to
+        // be torn down and re-initialized in between.
+        [[maybe_unused]] auto capture_ref = capture_thread_async.ref();
+
+        auto listener = fanout::subscribe(mail, config, channel_data, frame_nr);
+
+        // The owner services this listener from its encode thread; wait until
+        // the stream ends or the owner leaves (then try to take its place).
+        while (!shutdown_event->peek() && fanout::owner_alive()) {
+          std::this_thread::sleep_for(50ms);
+        }
+
+        frame_nr = fanout::unsubscribe(listener);
+        if (!shutdown_event->peek()) {
+          BOOST_LOG(info) << "Shared video stream: owner left, taking over the encoder"sv;
+        }
+      }
     }
   }
 
@@ -3044,8 +3388,11 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
 
     idr_events->raise(true);
-    if (chosen_encoder->flags & PARALLEL_ENCODING) {
-      capture_async(std::move(mail), config, channel_data);
+    if (shared_fanout_active()) {
+      capture_shared(std::move(mail), config, channel_data);
+    } else if (chosen_encoder->flags & PARALLEL_ENCODING) {
+      int frame_nr = 1;
+      capture_async(std::move(mail), config, channel_data, frame_nr);
     } else {
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();

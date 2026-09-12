@@ -1465,6 +1465,58 @@ namespace stream {
   }
 
   /**
+   * @brief Packetize, FEC-encode, encrypt and send encoded video frames.
+   *
+   * One instance per SENDING THREAD, never shared: it owns the thread's pacing
+   * clock, IV scratch and latency loggers. The global broadcast thread runs
+   * one for every session's packets on the ordinary path; on shared-encoder
+   * platforms (video::shared_fanout_active()) each session runs its own on a
+   * per-session thread, so one client's send work never delays another's.
+   * Per-session send state (lowseq, GCM IV counter, cipher) lives on the
+   * session_t and is only ever touched by the one thread that sends for that
+   * session.
+   */
+  class video_sender_t {
+  public:
+    explicit video_sender_t(udp::socket &sock):
+        sock {sock},
+        video_epoch {std::chrono::steady_clock::now()},
+        frame_processing_latency_logger(debug, "Frame processing latency", "ms"),
+        frame_send_batch_latency_logger(debug, "Network: each send_batch() latency"),
+        frame_fec_latency_logger(debug, "Network: each FEC block latency"),
+        frame_network_latency_logger(debug, "Network: frame's overall network latency"),
+        iv(12),
+        timer {platf::create_high_precision_timer()},
+        ratecontrol_next_frame_start {std::chrono::steady_clock::now()} {
+    }
+
+    /**
+     * @brief Whether the high-precision pacing timer could be created.
+     */
+    explicit operator bool() const {
+      return timer && *timer;
+    }
+
+    /**
+     * @brief Send one encoded frame to the session named by its channel_data.
+     */
+    void send(video::packet_raw_t *packet);
+
+  private:
+    udp::socket &sock;
+    std::chrono::steady_clock::time_point video_epoch;
+
+    logging::min_max_avg_periodic_logger<double> frame_processing_latency_logger;
+    logging::time_delta_periodic_logger frame_send_batch_latency_logger;
+    logging::time_delta_periodic_logger frame_fec_latency_logger;
+    logging::time_delta_periodic_logger frame_network_latency_logger;
+
+    crypto::aes_t iv;
+    std::unique_ptr<platf::high_precision_timer> timer;
+    std::chrono::steady_clock::time_point ratecontrol_next_frame_start;
+  };
+
+  /**
    * @brief Run the broadcast video sender thread.
    *
    * @param sock Socket used to read or write the protocol message.
@@ -1472,33 +1524,30 @@ namespace stream {
   void videoBroadcastThread(udp::socket &sock) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread
     platf::set_thread_name("stream::videoBroadcast");
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
-    logging::min_max_avg_periodic_logger<double> frame_processing_latency_logger(debug, "Frame processing latency", "ms");
-
-    logging::time_delta_periodic_logger frame_send_batch_latency_logger(debug, "Network: each send_batch() latency");
-    logging::time_delta_periodic_logger frame_fec_latency_logger(debug, "Network: each FEC block latency");
-    logging::time_delta_periodic_logger frame_network_latency_logger(debug, "Network: frame's overall network latency");
-
-    crypto::aes_t iv(12);
-
-    auto timer = platf::create_high_precision_timer();
-    if (!timer || !*timer) {
+    video_sender_t sender {sock};
+    if (!sender) {
       BOOST_LOG(error) << "Failed to create timer, aborting video broadcast thread";
       return;
     }
-
-    auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
 
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
         break;
       }
 
+      sender.send(packet.get());
+    }
+
+    shutdown_event->raise(true);
+  }
+
+  void video_sender_t::send(video::packet_raw_t *packet) {
+    {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
@@ -1823,8 +1872,6 @@ namespace stream {
         std::this_thread::sleep_for(100ms);
       }
     }
-
-    shutdown_event->raise(true);
   }
 
   /**
@@ -2131,6 +2178,41 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
+    // Shared-encoder platforms (video::shared_fanout_active()): this session's
+    // encoded video — its own encode when it owns the shared encoder, or the
+    // fan-out clones it receives as a listener — arrives on the SESSION
+    // mailbox's video_packets queue, not the global broadcast queue. Send it
+    // from a thread of this session's own, so a second client's FEC,
+    // encryption and pacing never sit in front of the first client's frames.
+    // The queue is created here, before capture starts, so the encode side
+    // finds it by id. Stopping it is what ends the thread; the jthread joins
+    // on scope exit, after capture() has returned.
+    std::optional<std::jthread> session_sender;
+    safe::mail_raw_t::queue_t<video::packet_t> session_packets;
+    if (video::shared_fanout_active()) {
+      session_packets = session->mail->queue<video::packet_t>(mail::video_packets);
+      session_sender.emplace([session, session_packets, sock = &ref->video_sock]() {
+        platf::set_thread_name("session::videoSend");
+        platf::adjust_thread_priority(platf::thread_priority_e::high);
+
+        video_sender_t sender {*sock};
+        if (!sender) {
+          BOOST_LOG(::error) << "Failed to create timer, aborting session video sender";
+          session::stop(*session);
+          return;
+        }
+
+        while (auto packet = session_packets->pop()) {
+          sender.send(packet.get());
+        }
+      });
+    }
+    auto sender_fg = util::fail_guard([&session_packets]() {
+      if (session_packets) {
+        session_packets->stop();
+      }
+    });
+
     BOOST_LOG(debug) << "Start capturing Video"sv;
     video::capture(session->mail, session->config.monitor, session);
   }
@@ -2220,6 +2302,9 @@ namespace stream {
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
+      // The input stays retained for a resume by the same client, but it is
+      // no longer live: a different client connecting may now reclaim it.
+      input::detach(session.input);
 
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {

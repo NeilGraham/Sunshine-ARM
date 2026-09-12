@@ -29,6 +29,17 @@ namespace input {
   void reset(std::shared_ptr<input_t> &input);
 
   /**
+   * @brief Mark a stream's input as no longer belonging to a live session.
+   *
+   * The input (and its virtual gamepads) stays retained so the same client can
+   * resume onto it, but alloc() for a DIFFERENT client may now evict it. Call
+   * when the session that alloc()'d it has ended.
+   *
+   * @param input Shared stream input state of the ended session.
+   */
+  void detach(const std::shared_ptr<input_t> &input);
+
+  /**
    * @brief Destroy every retained virtual gamepad session.
    *
    * Retained gamepads survive a paused transport connection so they can be reused on resume. Call this when the
