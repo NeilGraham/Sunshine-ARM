@@ -2175,17 +2175,25 @@ namespace video {
       session.inflight.pop_front();
     }
 
-    // Pipelined rkmpp: keep ONE older frame in flight, never more. hevc_rkmpp
+    // Pipelined rkmpp: keep the queue at a FIXED depth, never deeper. hevc_rkmpp
     // hands back at most one packet per submitted frame, so whatever depth
     // the queue reaches at startup it keeps for the whole session — measured:
     // it settles at 4 frames, 33.6 ms of added delay at 120 Hz. hevc_rkmpp
     // picks a blocking or a non-blocking packet wait per call from LOW_DELAY,
-    // so: with an older frame in flight, wait for ITS packet (it finishes
-    // about one encode time after it went in, i.e. while this frame is being
-    // encoded on the other core); with none, do not wait at all. Depth 2 is
-    // what two cores need, and host latency comes back to one encode time.
+    // so: once the queue holds `depth` frames, wait for the oldest one's
+    // packet; below that, do not wait at all. SUNSHINE_RKMPP_PIPELINE_DEPTH
+    // (2-8, default 3).
     if (session.pipelined) {
-      if (session.inflight.size() >= 2) {
+      // Frames allowed in the encoder, the one being submitted included.
+      // MPP only overlaps the two cores with more than one older frame
+      // queued (measured at 4K120: depth 2 = 67 fps, serial again); the
+      // default is the shallowest depth that holds the rate.
+      static const std::size_t depth = [] {
+        const char *env = std::getenv("SUNSHINE_RKMPP_PIPELINE_DEPTH");
+        const int v = env && *env ? std::atoi(env) : 3;
+        return (std::size_t) (v >= 2 && v <= 8 ? v : 3);
+      }();
+      if (session.inflight.size() >= depth) {
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
       } else {
         ctx->flags &= ~AV_CODEC_FLAG_LOW_DELAY;
