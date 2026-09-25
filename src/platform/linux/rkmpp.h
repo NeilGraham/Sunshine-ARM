@@ -81,4 +81,24 @@ namespace rkmpp {
    * anything to sample. Zero until the first interval is measured.
    */
   double daemon_source_period_ms();
+
+  /**
+   * @brief Whether an encode at this geometry and rate needs the pipelined
+   *        (non-LOW_DELAY) encoder to keep up.
+   *
+   * With AV_CODEC_FLAG_LOW_DELAY, hevc_rkmpp blocks on every frame's packet,
+   * so exactly one frame is ever inside MPP and the second VEPU580 core of
+   * the RK3588 never gets overlapping work: 4K caps at ~65 fps however fast
+   * frames arrive. Without it MPP keeps frames in flight and the two cores
+   * overlap (133 fps at 4K measured). The cost is up to one frame period of
+   * added delay, so it is used only above the one-core budget — every rate
+   * up to 4K60 keeps the blocking encoder unchanged.
+   *
+   * SUNSHINE_RKMPP_PIPELINE: "auto" (default), "1" force on, "0" force off.
+   */
+  bool want_pipelined_encode(int width, int height, int fps);
+
+  /// Set by the encoder setup for the session it just built; the capture
+  /// path reads it to hold buffer leases while the encoder still reads them.
+  void set_pipelined_encode(bool on);
 }  // namespace rkmpp
