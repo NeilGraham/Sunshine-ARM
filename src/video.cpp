@@ -3779,6 +3779,17 @@ namespace video {
 
     auto encoder_list = encoders;
 
+#ifdef __linux__
+    // The Linux check reports a change relative to the render device it saw on
+    // its previous call, and the condition below only reaches it once an
+    // encoder is chosen. Record the device this first probe runs against, or
+    // the first launch after every restart compares with nothing and repeats
+    // the whole probe inside the launch request.
+    if (!chosen_encoder) {
+      platf::needs_encoder_reenumeration();
+    }
+#endif
+
     // If we already have a good encoder, check to see if another probe is required
     if (chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration()) {
       return 0;
