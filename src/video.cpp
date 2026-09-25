@@ -2182,16 +2182,17 @@ namespace video {
     // picks a blocking or a non-blocking packet wait per call from LOW_DELAY,
     // so: once the queue holds `depth` frames, wait for the oldest one's
     // packet; below that, do not wait at all. SUNSHINE_RKMPP_PIPELINE_DEPTH
-    // (2-8, default 3).
+    // (2-8, default 4).
     if (session.pipelined) {
       // Frames allowed in the encoder, the one being submitted included.
-      // MPP only overlaps the two cores with more than one older frame
-      // queued (measured at 4K120: depth 2 = 67 fps, serial again); the
-      // default is the shallowest depth that holds the rate.
+      // Measured at 4K120 (tests/stream FINDING 55): depth 2 runs serial
+      // again (67 fps); depth 3 holds 120 fps but releases packets unevenly
+      // (arrival p90 13 ms, 504 client drops in 2 min); depth 4 is steady
+      // (host latency p50 25 ms, arrival p99 11.3 ms). 4 is the default.
       static const std::size_t depth = [] {
         const char *env = std::getenv("SUNSHINE_RKMPP_PIPELINE_DEPTH");
-        const int v = env && *env ? std::atoi(env) : 3;
-        return (std::size_t) (v >= 2 && v <= 8 ? v : 3);
+        const int v = env && *env ? std::atoi(env) : 4;
+        return (std::size_t) (v >= 2 && v <= 8 ? v : 4);
       }();
       if (session.inflight.size() >= depth) {
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
