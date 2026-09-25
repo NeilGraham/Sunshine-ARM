@@ -30,7 +30,9 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <cstdlib>
 #include <string>
+#include <string_view>
 #include <thread>
 
 // lib includes
@@ -119,6 +121,9 @@ namespace rkmpp {
   // next_frame() writes it; namespace-scope because the reader is the capture
   // thread, which has no handle on the encode device.
   static std::atomic<double> g_daemon_source_period_ms {0.0};
+  // Set per encode session by video.cpp (set_pipelined_encode); read when the
+  // capture path connects. See want_pipelined_encode() in rkmpp.h.
+  static std::atomic<bool> g_pipelined_encode {false};
 
   class frame_source_t {
   public:
@@ -164,7 +169,26 @@ namespace rkmpp {
       // the picture was actually taken. `src` is never moved after this (it
       // lives in the unique_ptr the caller stores), so the pointer is stable.
       src->client->set_frame_observer(&frame_source_t::observe, src.get());
+      // A pipelined encoder is still reading a frame after the next one has
+      // been submitted. Handing that buffer back to the daemon would let it
+      // paint the next picture into it mid-encode, so its lease is held
+      // until hevc_rkmpp drops its clone of the wrapper.
+      if (g_pipelined_encode.load(std::memory_order_relaxed)) {
+        src->client->set_release_guard(&frame_source_t::encoder_holds, src.get());
+      }
       return src;
+    }
+
+    // The encoder keeps an av_frame_clone() of each submitted wrapper until
+    // MPP has finished with the buffer, so a reference count above ours is
+    // exactly "still being encoded".
+    static bool encoder_holds(int index, void *user) {
+      auto *self = static_cast<frame_source_t *>(user);
+      if (index < 0 || index >= (int) self->wrappers.size()) {
+        return false;
+      }
+      AVFrame *w = self->wrappers[index];
+      return w && w->buf[0] && av_buffer_get_ref_count(w->buf[0]) > 1;
     }
 
     // The instant the HDMI-RX frame we are about to encode was DQBUF'd by the
@@ -894,6 +918,26 @@ namespace rkmpp {
     install_capture_logger();
     cached = retro::capture::query_status("sunshine-hdr").input_bit_depth == 10;
     return cached;
+  }
+
+  bool want_pipelined_encode(int width, int height, int fps) {
+    static const int mode = [] {
+      const char *env = std::getenv("SUNSHINE_RKMPP_PIPELINE");
+      if (!env || !*env || std::string_view(env) == "auto") {
+        return -1;
+      }
+      return std::atoi(env) != 0 ? 1 : 0;
+    }();
+    if (mode >= 0) {
+      return mode == 1;
+    }
+    // One VEPU580 core is rated for 4K60; above that the pipeline is what
+    // lets the second core share the work.
+    return (long long) width * height * fps > 3840LL * 2160 * 60;
+  }
+
+  void set_pipelined_encode(bool on) {
+    g_pipelined_encode.store(on, std::memory_order_relaxed);
   }
 
   double daemon_source_period_ms() {

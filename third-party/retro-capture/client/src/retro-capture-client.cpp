@@ -80,6 +80,9 @@ namespace retro::capture {
     int cur_index {-1};
     frame_observer observer {nullptr};
     void *observer_user {nullptr};
+    release_guard guard {nullptr};
+    void *guard_user {nullptr};
+    std::vector<bool> deferred;  // leases whose release the guard is holding
     std::chrono::steady_clock::time_point last_reconnect_at {};
 
     ~impl() {
@@ -121,6 +124,11 @@ namespace retro::capture {
       if (index < 0 || index >= (int) leased.size() || !leased[index]) {
         return;
       }
+      if (guard && guard(index, guard_user)) {
+        deferred[index] = true;
+        return;
+      }
+      deferred[index] = false;
       rcap_release rel {{RCAP_MSG_RELEASE, 0}, (std::uint32_t) index, 0, 0};
       if (send_msg(&rel, sizeof(rel))) {
         leased[index] = false;
@@ -163,6 +171,11 @@ namespace retro::capture {
   void client::set_frame_observer(frame_observer fn, void *user) {
     p->observer = fn;
     p->observer_user = user;
+  }
+
+  void client::set_release_guard(release_guard fn, void *user) {
+    p->guard = fn;
+    p->guard_user = user;
   }
 
   std::unique_ptr<client> client::connect(int width, int height, std::uint32_t want_fourcc,
@@ -283,6 +296,7 @@ namespace retro::capture {
       raw.buffer_size, raw.modifier, raw.pool_count
     };
     s.leased.assign(s.pool_fds.size(), false);
+    s.deferred.assign(s.pool_fds.size(), false);
 
     logf(log_info, "retro-capture: connected — %ux%u %s pool of %u (stride %u, zero-copy dma-buf)",
          raw.width, raw.height, fourcc_str(raw.fourcc).c_str(), raw.pool_count, raw.stride_y);
@@ -295,6 +309,13 @@ namespace retro::capture {
 
     if (s.sock < 0) {
       return frame {s.cur_index, 0, false};
+    }
+
+    // Hand back the leases the guard was holding, now that it lets go.
+    for (int i = 0; i < (int) s.deferred.size(); i++) {
+      if (s.deferred[i] && i != s.cur_index) {
+        s.release_lease(i);
+      }
     }
 
     std::uint8_t buf[RCAP_MAX_MSG_SIZE];
@@ -503,6 +524,8 @@ namespace retro::capture {
       logf(log_info, "retro-capture: reconnected");
       fresh->p->observer = p->observer;
       fresh->p->observer_user = p->observer_user;
+      fresh->p->guard = p->guard;
+      fresh->p->guard_user = p->guard_user;
       p = std::move(fresh->p);
     }
   }

@@ -88,6 +88,14 @@ namespace retro::capture {
   /// arrival order, on the caller's thread. Set once before the loop starts.
   using frame_observer = void (*)(const frame_telemetry &t, void *user);
 
+  /// Asked before a superseded lease is handed back to the daemon: return true
+  /// while the consumer still reads buffer `index`. An asynchronous encoder
+  /// keeps a frame for a while after the next one has been submitted, and a
+  /// released buffer is the daemon's to paint into on its very next frame —
+  /// releasing it mid-encode puts two pictures into one encoded frame. A
+  /// guarded lease is kept and retried on each later next() call.
+  using release_guard = bool (*)(int index, void *user);
+
   /// Fields a consumer may need from the daemon's STATUS document without
   /// holding the (single) CONSUMER slot. Additive: a field the daemon did not
   /// report keeps the default below, so an older daemon degrades quietly.
@@ -164,6 +172,9 @@ namespace retro::capture {
 
     /// Per-FRAME telemetry hook (see frame_observer). Survives reconnects.
     void set_frame_observer(frame_observer fn, void *user);
+
+    /// Lease-release guard (see release_guard). Survives reconnects.
+    void set_release_guard(release_guard fn, void *user);
 
     bool alive() const;
     const stream_info &info() const;

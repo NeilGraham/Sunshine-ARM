@@ -11,6 +11,7 @@
 #include <list>
 #include <mutex>
 #include <string_view>
+#include <deque>
 #include <thread>
 #include <utility>
 
@@ -461,6 +462,8 @@ namespace video {
       replacements = std::move(other.replacements);
       sps = std::move(other.sps);
       vps = std::move(other.vps);
+      inflight = std::move(other.inflight);
+      pipelined = other.pipelined;
 
       inject = other.inject;
 
@@ -517,6 +520,16 @@ namespace video {
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Platform device used by the FFmpeg hardware encoder.
 
     std::vector<packet_raw_t::replace_t> replacements;  ///< NAL-unit byte ranges that must be replaced before packet send.
+
+    /// A frame handed to the encoder whose packet has not come back yet.
+    struct inflight_frame_t {
+      int64_t frame_nr;  ///< pts the packet will carry.
+      std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture instant.
+      std::optional<platf::frame_trace_t> frame_trace;  ///< Stamp chain, encode_submit_ns set.
+    };
+
+    std::deque<inflight_frame_t> inflight;  ///< Frames in the encoder, oldest first (pipelined rkmpp holds several).
+    bool pipelined = false;  ///< rkmpp opened without LOW_DELAY: frames overlap across the VEPU cores.
 
     cbs::nal_t sps;  ///< Original and rewritten sequence parameter set for IDR injection.
     cbs::nal_t vps;  ///< Original and rewritten HEVC video parameter set for IDR injection.
@@ -2153,6 +2166,41 @@ namespace video {
     }
 
     // send the frame to the encoder
+    // A pipelined encoder hands back frame N's packet while encoding N+1, so
+    // the capture stamp and trace travel with the frame number rather than
+    // with the call. With a blocking encoder the packet is always this
+    // frame's and the queue never holds more than one entry.
+    session.inflight.push_back({frame_nr, frame_timestamp, frame_trace});
+    while (session.inflight.size() > 16) {
+      session.inflight.pop_front();
+    }
+
+    // Pipelined rkmpp: keep the queue at a FIXED depth, never deeper. hevc_rkmpp
+    // hands back at most one packet per submitted frame, so whatever depth
+    // the queue reaches at startup it keeps for the whole session — measured:
+    // it settles at 4 frames, 33.6 ms of added delay at 120 Hz. hevc_rkmpp
+    // picks a blocking or a non-blocking packet wait per call from LOW_DELAY,
+    // so: once the queue holds `depth` frames, wait for the oldest one's
+    // packet; below that, do not wait at all. SUNSHINE_RKMPP_PIPELINE_DEPTH
+    // (2-8, default 4).
+    if (session.pipelined) {
+      // Frames allowed in the encoder, the one being submitted included.
+      // Measured at 4K120 (tests/stream FINDING 55): depth 2 runs serial
+      // again (67 fps); depth 3 holds 120 fps but releases packets unevenly
+      // (arrival p90 13 ms, 504 client drops in 2 min); depth 4 is steady
+      // (host latency p50 25 ms, arrival p99 11.3 ms). 4 is the default.
+      static const std::size_t depth = [] {
+        const char *env = std::getenv("SUNSHINE_RKMPP_PIPELINE_DEPTH");
+        const int v = env && *env ? std::atoi(env) : 4;
+        return (std::size_t) (v >= 2 && v <= 8 ? v : 4);
+      }();
+      if (session.inflight.size() >= depth) {
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+      } else {
+        ctx->flags &= ~AV_CODEC_FLAG_LOW_DELAY;
+      }
+    }
+
     auto ret = avcodec_send_frame(ctx.get(), frame);
     if (ret < 0) {
       char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
@@ -2176,7 +2224,10 @@ namespace video {
         BOOST_LOG(debug) << "Frame "sv << frame_nr << ": IDR Keyframe (AV_FRAME_FLAG_KEY)"sv;
       }
 
-      if ((frame->flags & AV_FRAME_FLAG_KEY) && !(av_packet->flags & AV_PKT_FLAG_KEY)) {
+      // Only this frame's own packet can answer an IDR request: a pipelined
+      // encoder's packet for an earlier frame is legitimately not a keyframe.
+      if ((frame->flags & AV_FRAME_FLAG_KEY) && av_packet->pts == frame_nr &&
+          !(av_packet->flags & AV_PKT_FLAG_KEY)) {
         BOOST_LOG(error) << "Encoder did not produce IDR frame when requested!"sv;
       }
 
@@ -2205,12 +2256,17 @@ namespace video {
         );
       }
 
-      if (av_packet && av_packet->pts == frame_nr) {
-        packet->frame_timestamp = frame_timestamp;
-        if (frame_trace) {
-          frame_trace->encode_done_ns = trace_now_ns();
-          packet->frame_trace = frame_trace;
+      while (!session.inflight.empty() && session.inflight.front().frame_nr < av_packet->pts) {
+        session.inflight.pop_front();
+      }
+      if (!session.inflight.empty() && session.inflight.front().frame_nr == av_packet->pts) {
+        auto &sent = session.inflight.front();
+        packet->frame_timestamp = sent.frame_timestamp;
+        if (sent.frame_trace) {
+          sent.frame_trace->encode_done_ns = trace_now_ns();
+          packet->frame_trace = sent.frame_trace;
         }
+        session.inflight.pop_front();
       }
 
       packet->replacements = &session.replacements;
@@ -2410,7 +2466,24 @@ namespace video {
 
       // We forcefully reset the flags to avoid clash on reuse of AVCodecContext
       ctx->flags = 0;
-      ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP | AV_CODEC_FLAG_LOW_DELAY;
+      ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP;
+      bool low_delay = true;
+#ifdef SUNSHINE_BUILD_RKMPP
+      // Above the one-core budget (4K60) hevc_rkmpp only keeps up pipelined;
+      // see rkmpp::want_pipelined_encode().
+      if (encoder.name == "rkmpp"sv) {
+        const int fps_int = fps.den ? (fps.num + fps.den - 1) / fps.den : 0;
+        low_delay = !rkmpp::want_pipelined_encode(ctx->width, ctx->height, fps_int);
+        rkmpp::set_pipelined_encode(!low_delay);
+        if (!low_delay) {
+          BOOST_LOG(info) << "RKMPP: pipelined encode (no LOW_DELAY) for "sv << ctx->width << 'x'
+                          << ctx->height << '@' << fps_int << " — both VEPU cores in flight"sv;
+        }
+      }
+#endif
+      if (low_delay) {
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+      }
 
       ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
@@ -2670,6 +2743,9 @@ namespace video {
 
     encode_device_final->apply_colorspace();
 
+    // Built without LOW_DELAY above only for the pipelined rkmpp case.
+    const bool pipelined = encoder.name == "rkmpp"sv && !(ctx->flags & AV_CODEC_FLAG_LOW_DELAY);
+
     auto session = std::make_unique<avcodec_encode_session_t>(
       std::move(ctx),
       std::move(encode_device_final),
@@ -2677,6 +2753,7 @@ namespace video {
       // 0 ==> don't inject, 1 ==> inject for h264, 2 ==> inject for hevc
       config.videoFormat <= 1 ? (1 - static_cast<int>(video_format[encoder_t::VUI_PARAMETERS])) * (1 + config.videoFormat) : 0
     );
+    session->pipelined = pipelined;
 
     return session;
   }
