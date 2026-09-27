@@ -1247,7 +1247,8 @@ namespace platf {
   /**
    * @brief Report whether encoder backends should be probed again before streaming.
    *
-   * @return Always `true` because Linux GPU changes are not tracked by this backend.
+   * @return `true` when the render device differs from the one seen on the previous call
+   *         (the first call, made by the startup probe, records it).
    */
   bool needs_encoder_reenumeration() {
     // Only re-probe if the GPU render device changed (hotplug, driver reload).
