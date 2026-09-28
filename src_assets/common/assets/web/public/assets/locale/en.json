@@ -284,7 +284,7 @@
     "max_bitrate": "Maximum Bitrate",
     "max_bitrate_desc": "The maximum bitrate (in Kbps) that Sunshine will encode the stream at. If set to 0, it will always use the bitrate requested by Moonlight.",
     "dynamic_bitrate": "Dynamic bitrate",
-    "dynamic_bitrate_desc": "On a capture box, the client's bitrate is the ceiling: under it the bitrate follows the source's mode (a 720p60 console gets proportionally less than the 4K120 the client asked for) and drops as soon as the network starts losing packets, climbing back once it stops. Off: always the client's bitrate.",
+    "dynamic_bitrate_desc": "On a capture box, the client's bitrate is the ceiling: under it the bitrate follows the mode being encoded (a 720p60 console on a client that follows its resolution gets proportionally less than the 4K120 the client asked for) and drops as soon as the network starts losing packets, climbing back once it stops. Off: always the client's bitrate.",
     "dynamic_bitrate_min": "Dynamic bitrate floor",
     "dynamic_bitrate_min_desc": "The lowest bitrate (in Kbps) the network adaptation may go to. 0 picks one from the stream's bitrate.",
     "dynamic_framerate": "Dynamic frame rate",

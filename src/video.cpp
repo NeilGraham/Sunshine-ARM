@@ -2211,19 +2211,16 @@ namespace video {
   /**
    * @brief The mode-scaled bitrate ceiling for the picture being encoded now.
    *
-   * The content's size is the encode size when it follows the source; for a
-   * client held at its requested size, the source fitted into that size (an
-   * upscaled 720p picture carries a 720p picture's information).
+   * Sized from the picture the encoder actually receives, never from the
+   * source behind it: a CRT shader draws a 480p source's scanlines at the
+   * full output size, and budgeting that for 480p would crush them. A
+   * stream that follows its source encodes the source's own size, so it is
+   * sized down; a client held at its requested size keeps that size's
+   * budget, scaled by the frame rate only.
    */
   static std::int64_t mode_ceiling_for(const avcodec_encode_session_t &session, const AVCodecContext *ctx) {
-    int w = ctx->width;
-    int h = ctx->height;
-    if (!session.geometry_follow && session.source_width > 0 && session.source_height > 0) {
-      const double scale = std::min(1.0, std::min((double) ctx->width / session.source_width, (double) ctx->height / session.source_height));
-      w = (int) (session.source_width * scale);
-      h = (int) (session.source_height * scale);
-    }
-    return abr::mode_ceiling_bps(session.requested_bps, session.pool_width, session.pool_height, session.requested_fps, w, h, av_q2d(ctx->framerate));
+    return abr::mode_ceiling_bps(session.requested_bps, session.pool_width, session.pool_height, session.requested_fps,
+                                 ctx->width, ctx->height, av_q2d(ctx->framerate));
   }
 #endif
 
@@ -2922,16 +2919,16 @@ namespace video {
       BOOST_LOG(info) << "Streaming bitrate is " << bitrate;
       requested_bps = bitrate;
 #ifdef SUNSHINE_BUILD_RKMPP
-      if (bitrate_follow && source_width > 0 && source_height > 0) {
-        // Open at the mode-scaled ceiling rather than the client's full
-        // bitrate (see adaptive_bitrate.h); the stream then only moves on a
-        // re-lock or on network loss.
-        const double scale = std::min(1.0, std::min((double) config.width / source_width, (double) config.height / source_height));
+      if (bitrate_follow) {
+        // Open at the mode-scaled ceiling for the frame rate being encoded
+        // (see adaptive_bitrate.h). The size is the one being encoded — the
+        // request; a stream that follows its source rescales the ceiling on
+        // its first size change (mode_ceiling_for).
         const auto ceiling = abr::mode_ceiling_bps(bitrate, config.width, config.height, av_q2d(requested_fps),
-                                                   (int) (source_width * scale), (int) (source_height * scale), av_q2d(encode_fps));
+                                                   config.width, config.height, av_q2d(encode_fps));
         if (ceiling < bitrate) {
-          BOOST_LOG(info) << "Dynamic bitrate: "sv << (int) (source_width * scale) << 'x' << (int) (source_height * scale)
-                          << '@' << av_q2d(encode_fps) << " is "sv << ceiling << " of the client's "sv << bitrate
+          BOOST_LOG(info) << "Dynamic bitrate: "sv << config.width << 'x' << config.height << '@' << av_q2d(encode_fps)
+                          << " is "sv << ceiling << " of the client's "sv << bitrate
                           << " (Moonlight's own default-bitrate curve)"sv;
           bitrate = ceiling;
         }
