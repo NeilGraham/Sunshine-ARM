@@ -1907,10 +1907,24 @@ namespace platf {
             // the source's rate instead, sending at double the requested fps.
             // Falling back to plain `delay` in that case is exactly the
             // behaviour that predates oversampling, so it cannot regress.
+            //
+            // Once the source's spec rate is known (source-rate following,
+            // rkmpp.h), oversample the ENCODE cadence instead: the source
+            // period times the decimation. The FRESH gate in next_frame()
+            // then selects exactly every k-th frame, so a source faster than
+            // the request is held to source/k by the gate rather than by this
+            // timer's 1/request — which beat against the source and dropped
+            // or doubled a frame each time the phase wrapped. Within 1% of
+            // the request counts as equal (60 vs 59.94).
             const double src_ms = rkmpp::daemon_source_period_ms();
             const auto src_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::duration<double, std::milli>(src_ms));
-            if (src_ms > 0.0 && src_period >= delay) {
+            const double enc_ms = rkmpp::daemon_encode_period_ms();
+            const auto enc_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::duration<double, std::milli>(enc_ms));
+            if (enc_ms > 0.0 && enc_period * 100 >= delay * 99) {
+              tick = enc_period / oversample;
+            } else if (src_ms > 0.0 && src_period >= delay) {
               tick = src_period / oversample;
             }
           }

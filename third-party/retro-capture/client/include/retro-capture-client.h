@@ -104,6 +104,11 @@ namespace retro::capture {
     int input_bit_depth {0}; ///< input.bit_depth: 8, or 10 for a BT.2020+PQ
                              ///< (NV15) capture — PROTOCOL.md §3.10
     bool signal_locked {false};
+    double input_fps {0.0};  ///< input.fps: the SOURCE's refresh rate as the
+                             ///< receiver measured it (3 decimals; 59.940 for
+                             ///< a 60000/1001 signal) — not the output cadence
+    int input_width {0};     ///< input.width / input.height: source geometry
+    int input_height {0};
   };
 
   /// Best-effort "gate\n" line to the retro-audio event FIFO at `fifo_path`,

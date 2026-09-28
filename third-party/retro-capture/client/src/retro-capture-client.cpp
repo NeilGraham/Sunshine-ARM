@@ -502,6 +502,15 @@ namespace retro::capture {
       if (const char *v = find_scalar(json, "input", "locked")) {
         out.signal_locked = std::strncmp(v, "true", 4) == 0;
       }
+      if (const char *v = find_scalar(json, "input", "fps")) {
+        out.input_fps = std::strtod(v, nullptr);
+      }
+      if (const char *v = find_scalar(json, "input", "width")) {
+        out.input_width = std::atoi(v);
+      }
+      if (const char *v = find_scalar(json, "input", "height")) {
+        out.input_height = std::atoi(v);
+      }
     } while (false);
 
     ::close(sock);
