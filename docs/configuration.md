@@ -1499,8 +1499,10 @@ editing the `conf` file in a text editor. Use the examples as reference.
         <td>Description</td>
         <td colspan="2">
             Capture box only. The client's requested bitrate becomes the ceiling. Under it the bitrate follows the
-            source's mode (it is scaled by the ratio of Moonlight's own default bitrates for the source's mode and the
-            requested one, so a 720p60 console on a 4K120 session gets proportionally less), and the network adaptation
+            mode being encoded (it is scaled by the ratio of Moonlight's own default bitrates for that mode and the
+            requested one: a 59.94 Hz console on a 120 Hz request gets its frame rate's share, and a stream that
+            follows the console's resolution gets its size's share too, so a 720p60 console on a 4K120 session gets
+            proportionally less; a CRT shader's full-size output keeps the full-size budget), and the network adaptation
             lowers it as soon as a client reports packet loss (a frame that needed FEC recovery, a lost frame, or a
             keyframe request), then climbs back once the loss stops. When disabled, the stream is always encoded at the
             client's requested bitrate.

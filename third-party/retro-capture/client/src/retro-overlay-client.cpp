@@ -21,6 +21,8 @@
 #include <mutex>
 #include <thread>
 
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -53,6 +55,9 @@ namespace retro::overlay {
       int fd = -1;
       std::uint32_t size = 0;
       std::uint32_t stride = 0;
+      // The MB-aligned frame size the daemon laid this surface out for.
+      std::uint32_t width = 0;
+      std::uint32_t height = 0;
     };
 
     struct shared_state_t {
@@ -67,6 +72,12 @@ namespace retro::overlay {
       // SINK_INFO whenever it drifts from what the daemon was told.
       std::atomic<std::uint32_t> want_geometry {0};  // (w << 16) | h
       std::atomic<bool> want_ten_bit {false};
+      // Wakes the socket thread the moment the encode geometry changes, so
+      // SINK_INFO goes out within a frame instead of on the next 1 s
+      // receive timeout (a stream that follows its source changes size
+      // mid-session; until the daemon re-lays the overlay out, nothing may
+      // be attached — see current_osd()).
+      int wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
       void drop_surfaces_locked() {
         for (auto &s : surfaces) {
@@ -190,6 +201,12 @@ namespace retro::overlay {
           s.fd = fd;
           s.size = m->size;
           s.stride = m->stride;
+          s.width = m->width;
+          s.height = m->height;
+          // A new surface set is a new layout (the encode geometry changed):
+          // the PRESENT we hold was laid out for the old one. Nothing is
+          // attached until the daemon presents on the new set.
+          state.visible = false;
           fd = -1;  // ownership taken
           break;
         }
@@ -266,6 +283,17 @@ namespace retro::overlay {
             sent_ten_bit = ten;
           }
 
+          // Wait for a message or a geometry change (1 s cap, as before).
+          pollfd pfds[2] = {{sock, POLLIN, 0}, {state.wake_fd, POLLIN, 0}};
+          const int ready = poll(pfds, state.wake_fd >= 0 ? 2 : 1, 1000);
+          if (ready > 0 && state.wake_fd >= 0 && (pfds[1].revents & POLLIN)) {
+            std::uint64_t v;
+            (void) !read(state.wake_fd, &v, sizeof(v));
+          }
+          if (ready <= 0 || !(pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            continue;  // timeout or wake: loop to re-check geometry
+          }
+
           std::uint8_t buf[ROVL_MAX_MSG_SIZE];
           int fd = -1;
           ssize_t n = recv_msg(sock, buf, sizeof(buf), fd);
@@ -311,8 +339,13 @@ namespace retro::overlay {
 
   void report_encode_geometry(int width, int height, bool ten_bit) {
     ensure_thread();
-    state.want_geometry.store(((std::uint32_t) width << 16) | (std::uint32_t) height);
-    state.want_ten_bit.store(ten_bit);
+    const std::uint32_t geo = ((std::uint32_t) width << 16) | (std::uint32_t) height;
+    const bool geo_changed = state.want_geometry.exchange(geo) != geo;
+    const bool ten_changed = state.want_ten_bit.exchange(ten_bit) != ten_bit;
+    if ((geo_changed || ten_changed) && state.wake_fd >= 0) {
+      const std::uint64_t one = 1;
+      (void) !write(state.wake_fd, &one, sizeof(one));
+    }
   }
 
   bool current_osd(rovl_osd_side_data &out) {
@@ -331,6 +364,19 @@ namespace retro::overlay {
 
     const auto &surf = state.surfaces[state.present.surface_index];
     if (surf.fd < 0) {
+      return false;
+    }
+    // Only a layout made for this frame's size: while a stream that follows
+    // its source changes size, the held PRESENT was laid out on the old MB
+    // grid and would land stretched and misplaced on the new frame. Skip
+    // those frames; the daemon re-renders for the new size within a frame
+    // or two of hearing about it.
+    // Compared on the 16-px MB grid, both sides: the daemon reports the
+    // frame size it was told (1920x1080), the grid covers 1920x1088.
+    const auto mb = [](std::uint32_t px) { return (px + 15) / 16; };
+    const std::uint32_t geo = state.want_geometry.load();
+    if (surf.width && surf.height &&
+        (mb(surf.width) != mb(geo >> 16) || mb(surf.height) != mb(geo & 0xffff))) {
       return false;
     }
 
