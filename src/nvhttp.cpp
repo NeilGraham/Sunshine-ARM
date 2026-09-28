@@ -393,6 +393,8 @@ namespace nvhttp {
     launch_session->continuous_audio = util::from_view(get_arg(args, "continuousAudio", "0"));
     launch_session->gcmap = (int) util::from_view(get_arg(args, "gcmap", "0"));
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
+    // retro-stream's Moonlight declares what it can follow (video::rs_cap_e).
+    launch_session->rs_caps = (int) util::from_view(get_arg(args, "rsCaps", "0"));
 
     // Encrypted RTSP is enabled with client reported corever >= 1
     auto corever = util::from_view(get_arg(args, "corever", "0"));

@@ -137,6 +137,8 @@ namespace rkmpp {
     std::mutex mu;
     AVRational requested {0, 1};  // under mu
     encode_rate_t plan;  // under mu
+    int source_w {};  // under mu: the source's geometry at the last lock
+    int source_h {};
     std::atomic<std::uint64_t> generation {0};
     std::atomic<int> decimation {1};
     std::atomic<double> encode_period_ms {0.0};
@@ -206,22 +208,33 @@ namespace rkmpp {
     return p;
   }
 
-  // Re-plan for a source that (re-)locked at `source`. False if nothing moved.
-  static bool apply_source_rate(AVRational source) {
+  // Re-plan for a source that (re-)locked in `mode`. False if nothing moved.
+  static bool apply_source_mode(const source_mode_t &mode) {
     std::lock_guard lk(rate_state::mu);
-    const auto next = plan_encode_rate(rate_state::requested, source);
+    const auto next = plan_encode_rate(rate_state::requested, mode.rate);
     const auto &cur = rate_state::plan;
+    const bool size_moved = mode.width > 0 && (mode.width != rate_state::source_w || mode.height != rate_state::source_h);
     if (!av_cmp_q(next.source, cur.source) && !av_cmp_q(next.rate, cur.rate) &&
-        next.decimation == cur.decimation) {
+        next.decimation == cur.decimation && !size_moved) {
       return false;
     }
-    BOOST_LOG(info) << "RKMPP: source locked at "sv << rate_str(source) << " Hz (was "sv
-                    << rate_str(cur.source) << "); encoding "sv << rate_str(next.rate)
-                    << " fps"sv
+    BOOST_LOG(info) << "RKMPP: source locked at "sv << mode.width << 'x' << mode.height << ' ' << rate_str(mode.rate)
+                    << " Hz (was "sv << rate_state::source_w << 'x' << rate_state::source_h << ' '
+                    << rate_str(cur.source) << "); encoding "sv << rate_str(next.rate) << " fps"sv
                     << (next.decimation > 1 ? " (1 in "s + std::to_string(next.decimation) + " source frames)"s : ""s);
+    if (mode.width > 0) {
+      rate_state::source_w = mode.width;
+      rate_state::source_h = mode.height;
+    }
     publish_plan_locked(next);
     return true;
   }
+
+  // Geometry following (rkmpp.h). The session's wish is set before the
+  // capture connects; the gate is flipped live by the fan-out owner.
+  static std::atomic<bool> g_follow_geometry {false};
+  static std::atomic<bool> g_follow_allowed {true};
+  static std::atomic<bool> g_encode_at_pool {true};
 
   class frame_source_t {
   public:
@@ -253,13 +266,23 @@ namespace rkmpp {
       }
       const std::uint32_t fourcc = want_nv15 ? 0x3531564e /* DRM_FORMAT_NV15 */ : 0x3231564e /* NV12 */;
 
-      auto client = retro::capture::client::connect(width, height, fourcc, "sunshine");
+      // Geometry following (rkmpp.h): the pool stays the requested size and
+      // becomes the cap; the picture inside it follows the console.
+      const bool want_follow = g_follow_geometry.load(std::memory_order_relaxed);
+      retro::capture::connect_options opts;
+      opts.follow_source = want_follow && g_follow_allowed.load(std::memory_order_relaxed);
+      auto client = retro::capture::client::connect(width, height, fourcc, "sunshine", opts);
       if (!client) {
         return nullptr;
+      }
+      if (want_follow && !client->following() && opts.follow_source) {
+        BOOST_LOG(warning) << "retro-capture: the daemon speaks protocol v"sv << client->version()
+                           << ", which cannot follow the source's resolution; streaming at "sv << width << 'x' << height;
       }
 
       auto src = std::make_unique<frame_source_t>();
       src->client = std::move(client);
+      src->want_follow = want_follow;
       src->want_fourcc = fourcc;
       src->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_buf);
       src->wrappers.assign(src->client->pool_size(), nullptr);
@@ -517,10 +540,11 @@ namespace rkmpp {
         } else if (fresh && relock_pending) {
           const auto now = std::chrono::steady_clock::now();
           if (relock_retry_at.time_since_epoch().count() == 0 || now >= relock_retry_at) {
-            const AVRational src = daemon_source_rate();
+            const auto mode = daemon_source_mode();
+            const AVRational src = mode.rate;
             if (src.num > 0) {
               relock_pending = false;
-              apply_source_rate(src);
+              apply_source_mode(mode);
               period_ms_ewma = period_ms_of(src);
               g_daemon_source_period_ms.store(period_ms_ewma, std::memory_order_relaxed);
               last_fresh = {};  // the interval across the loss run is not a period
@@ -536,7 +560,8 @@ namespace rkmpp {
         } else if (fresh && relock_confirm_at.time_since_epoch().count() != 0 &&
                    std::chrono::steady_clock::now() >= relock_confirm_at) {
           relock_confirm_at = {};
-          if (const AVRational src = daemon_source_rate(); src.num > 0 && apply_source_rate(src)) {
+          if (const auto mode = daemon_source_mode(); mode.rate.num > 0 && apply_source_mode(mode)) {
+            const AVRational src = mode.rate;
             period_ms_ewma = period_ms_of(src);
             g_daemon_source_period_ms.store(period_ms_ewma, std::memory_order_relaxed);
           }
@@ -678,7 +703,28 @@ namespace rkmpp {
         }
       }
 
-      return f.index >= 0 ? wrapper_for(f.index) : nullptr;
+      // Geometry-follow gate (fan-out): a listener that cannot follow a size
+      // change turns following off for as long as it is attached.
+      if (want_follow) {
+        const bool allowed = g_follow_allowed.load(std::memory_order_relaxed);
+        if (allowed != client->following() && client->alive() && client->set_output(allowed)) {
+          BOOST_LOG(info) << "retro-capture: "sv << (allowed ? "following the source's resolution again"sv :
+                                                                "holding the requested resolution for a client that cannot follow it"sv);
+        }
+      }
+
+      if (f.index < 0) {
+        return nullptr;
+      }
+      AVFrame *w = wrapper_for(f.index);
+      // The picture's size inside the pool buffer (capture protocol v4). The
+      // encoder reads frame->width/height as the input crop; the descriptor's
+      // pitch and plane offsets stay the pool's.
+      if (w && f.active_width >= 2 && f.active_height >= 2) {
+        w->width = f.active_width;
+        w->height = f.active_height;
+      }
+      return w;
     }
 
     // Non-blocking reconnect pacing after daemon death (the client rate
@@ -783,6 +829,7 @@ namespace rkmpp {
     logging::min_max_avg_periodic_logger<double> age_logger {debug, "Capture: frame age at encode", "ms"};
     logging::min_max_avg_periodic_logger<double> wait_logger {debug, "Capture: fresh-frame wait", "ms"};
     std::uint32_t want_fourcc {};
+    bool want_follow {};  // the session asked for geometry following (the gate may hold it off)
     bool last_was_held {true};  // stream primes with BLACK
     // Consecutive drains that produced no FRESH frame. Bounds how long
     // next_frame() will wait for real content before accepting the daemon's
@@ -1152,21 +1199,49 @@ namespace rkmpp {
     return cached;
   }
 
-  AVRational daemon_source_rate() {
+  source_mode_t daemon_source_mode() {
+    source_mode_t mode;
     if (!std::getenv("SUNSHINE_RKMPP_V4L2")) {
-      return {0, 1};  // not a capture-streaming box
+      return mode;  // not a capture-streaming box
     }
     install_capture_logger();
     const auto st = retro::capture::query_status("sunshine-rate");
     if (!st.valid || !st.signal_locked) {
-      return {0, 1};
+      return mode;
     }
-    return snap_source_rate(st.input_fps);
+    mode.rate = snap_source_rate(st.input_fps);
+    mode.width = st.input_width;
+    mode.height = st.input_height;
+    return mode;
   }
 
-  void begin_encode_rate(AVRational requested, const encode_rate_t &plan) {
+  AVRational daemon_source_rate() {
+    return daemon_source_mode().rate;
+  }
+
+  void set_follow_geometry(bool on) {
+    g_follow_geometry.store(on, std::memory_order_relaxed);
+    g_follow_allowed.store(true, std::memory_order_relaxed);
+    g_encode_at_pool.store(true, std::memory_order_relaxed);
+  }
+
+  void set_follow_geometry_allowed(bool allowed) {
+    g_follow_allowed.store(allowed, std::memory_order_relaxed);
+  }
+
+  void note_encode_at_pool_size(bool at_pool) {
+    g_encode_at_pool.store(at_pool, std::memory_order_relaxed);
+  }
+
+  bool encode_at_pool_size() {
+    return g_encode_at_pool.load(std::memory_order_relaxed);
+  }
+
+  void begin_encode_rate(AVRational requested, const encode_rate_t &plan, int source_width, int source_height) {
     std::lock_guard lk(rate_state::mu);
     rate_state::requested = requested;
+    rate_state::source_w = source_width;
+    rate_state::source_h = source_height;
     rate_state::signal_lost.store(false, std::memory_order_relaxed);
     rate_state::fresh.store(false, std::memory_order_relaxed);
     publish_plan_locked(plan);
@@ -1179,6 +1254,8 @@ namespace rkmpp {
     std::lock_guard lk(rate_state::mu);  // uncontended: taken once per frame
     out.generation = rate_state::generation.load(std::memory_order_acquire);
     out.plan = rate_state::plan;
+    out.source_width = rate_state::source_w;
+    out.source_height = rate_state::source_h;
     return out;
   }
 

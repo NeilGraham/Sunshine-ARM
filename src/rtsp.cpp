@@ -13,7 +13,9 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <functional>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <utility>
 
@@ -1244,6 +1246,14 @@ namespace rtsp_stream {
       }
       config.audio.flags[audio::config_t::CUSTOM_SURROUND_PARAMS] = valid;
     }
+    config.monitor.rsCaps = session.rs_caps;
+    // Per-client memory for the dynamic bitrate (the certificate is what
+    // tells paired clients apart; Moonlight's uniqueid is a constant).
+    config.monitor.clientKey = session.client_cert.empty() ? 0 : std::hash<std::string> {}(session.client_cert);
+    if (session.rs_caps) {
+      BOOST_LOG(info) << "Client declared retro-stream capabilities "sv << session.rs_caps;
+    }
+
     if (session.continuous_audio) {
       BOOST_LOG(info) << "Client requested continuous audio"sv;
       config.audio.flags[audio::config_t::CONTINUOUS_AUDIO] = true;

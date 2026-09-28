@@ -10,6 +10,7 @@
  */
 #include "retro-capture-client.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <utility>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -74,10 +76,17 @@ namespace retro::capture {
 
   struct client::impl {
     int sock {-1};
+    std::uint16_t version {};
     stream_info sinfo {};
     std::vector<int> pool_fds;
     std::vector<bool> leased;
+    // Per pool slot: the picture size its latest FRAME reported (v4).
+    std::vector<std::pair<int, int>> active;
     int cur_index {-1};
+    // Follow/cap state as last requested, carried across reconnects.
+    bool follow {false};
+    int cap_w {0};
+    int cap_h {0};
     frame_observer observer {nullptr};
     void *observer_user {nullptr};
     release_guard guard {nullptr};
@@ -179,7 +188,7 @@ namespace retro::capture {
   }
 
   std::unique_ptr<client> client::connect(int width, int height, std::uint32_t want_fourcc,
-                                          const char *name) {
+                                          const char *name, const connect_options &opts) {
     std::unique_ptr<client> c {new client()};
     auto &s = *c->p;
 
@@ -199,7 +208,10 @@ namespace retro::capture {
     rcap_hello hello {};
     hello.hdr = {RCAP_MSG_HELLO, 0};
     hello.magic = RCAP_MAGIC;
-    hello.ver_min = RCAP_PROTO_VERSION;
+    // v3 is the oldest daemon this client still streams from (SETUP's pool
+    // format needs v2, the rest of the consumer wire is unchanged since); v4
+    // adds source following, used only when the daemon picks it.
+    hello.ver_min = 3;
     hello.ver_max = RCAP_PROTO_VERSION;
     hello.role = RCAP_ROLE_CONSUMER;
     std::strncpy(hello.name, name && *name ? name : "consumer", sizeof(hello.name) - 1);
@@ -213,6 +225,8 @@ namespace retro::capture {
       logf(log_warning, "retro-capture: daemon refused HELLO");
       return nullptr;
     }
+    s.version = ((rcap_hello_ack *) buf)->version;
+    s.follow = opts.follow_source && s.version >= 4;
 
     // The consumer's encoder was created for one pool format; an 8-bit session
     // must get NV12 even while the daemon captures 10-bit (the daemon
@@ -226,7 +240,10 @@ namespace retro::capture {
     setup.base.fps_num = 0;  // daemon default cadence; the consumer paces itself
     setup.base.fps_den = 0;
     setup.fourcc = want_fourcc;
-    if (!s.send_msg(&setup, want_fourcc ? sizeof(setup) : sizeof(setup.base))) {
+    setup.flags = s.follow ? RCAP_SETUP_FOLLOW_SOURCE : 0;
+    // The long SETUP whenever it carries anything; the v1-shaped short one is
+    // only the oracle's "serve me whatever you have".
+    if (!s.send_msg(&setup, (want_fourcc || setup.flags) ? sizeof(setup) : sizeof(setup.base))) {
       return nullptr;
     }
 
@@ -297,9 +314,11 @@ namespace retro::capture {
     };
     s.leased.assign(s.pool_fds.size(), false);
     s.deferred.assign(s.pool_fds.size(), false);
+    s.active.assign(s.pool_fds.size(), {(int) raw.width, (int) raw.height});
 
-    logf(log_info, "retro-capture: connected — %ux%u %s pool of %u (stride %u, zero-copy dma-buf)",
-         raw.width, raw.height, fourcc_str(raw.fourcc).c_str(), raw.pool_count, raw.stride_y);
+    logf(log_info, "retro-capture: connected (v%u) — %ux%u %s pool of %u (stride %u, zero-copy dma-buf)%s",
+         (unsigned) s.version, raw.width, raw.height, fourcc_str(raw.fourcc).c_str(), raw.pool_count,
+         raw.stride_y, s.follow ? ", following the source" : "");
     return c;
   }
 
@@ -307,8 +326,16 @@ namespace retro::capture {
     auto &s = *p;
     const int previous = s.cur_index;
 
+    const auto active_of = [&s](int index) -> std::pair<int, int> {
+      if (index >= 0 && index < (int) s.active.size()) {
+        return s.active[index];
+      }
+      return {(int) s.sinfo.width, (int) s.sinfo.height};
+    };
+
     if (s.sock < 0) {
-      return frame {s.cur_index, 0, false};
+      const auto a = active_of(s.cur_index);
+      return frame {s.cur_index, 0, false, a.first, a.second};
     }
 
     // Hand back the leases the guard was holding, now that it lets go.
@@ -346,6 +373,18 @@ namespace retro::capture {
           s.observer(t, s.observer_user);
         }
         if (f->index < s.pool_fds.size()) {
+          // v4 length-extension: the picture's size inside this buffer. A
+          // held re-emission reports it too, so this always tracks the slot.
+          if (n >= (ssize_t) sizeof(rcap_frame_v4)) {
+            auto *f4 = (rcap_frame_v4 *) buf;
+            // Copied out first: a packed field cannot bind to pair's
+            // forwarding constructor.
+            const int aw = f4->active_width;
+            const int ah = f4->active_height;
+            if (aw >= 2 && ah >= 2) {
+              s.active[f->index] = {aw, ah};
+            }
+          }
           if (!s.leased[f->index]) {
             s.leased[f->index] = true;  // lease created by first reference
           }
@@ -372,7 +411,35 @@ namespace retro::capture {
       s.cur_index = newest;
     }
 
-    return frame {s.cur_index, newest_flags, s.cur_index != previous};
+    const auto a = active_of(s.cur_index);
+    return frame {s.cur_index, newest_flags, s.cur_index != previous, a.first, a.second};
+  }
+
+  bool client::set_output(bool follow, int max_width, int max_height) {
+    auto &s = *p;
+    if (s.sock < 0 || s.version < 4) {
+      return false;
+    }
+    rcap_output_set set {};
+    set.hdr = {RCAP_MSG_OUTPUT_SET, 0};
+    set.follow = follow ? 1 : 0;
+    set.max_width = (std::uint16_t) std::clamp(max_width, 0, 65535);
+    set.max_height = (std::uint16_t) std::clamp(max_height, 0, 65535);
+    if (!s.send_msg(&set, sizeof(set))) {
+      return false;
+    }
+    s.follow = follow;
+    s.cap_w = max_width;
+    s.cap_h = max_height;
+    return true;
+  }
+
+  bool client::following() const {
+    return p->follow;
+  }
+
+  int client::version() const {
+    return p->sock >= 0 ? p->version : 0;
   }
 
   void audio_gate_notify(const char *fifo_path) {
@@ -528,7 +595,10 @@ namespace retro::capture {
     }
     p->last_reconnect_at = now;
 
-    auto fresh = connect(width, height, want_fourcc, name);
+    connect_options opts;
+    opts.follow_source = p->follow;
+    const int cap_w = p->cap_w, cap_h = p->cap_h;
+    auto fresh = connect(width, height, want_fourcc, name, opts);
     if (fresh) {
       logf(log_info, "retro-capture: reconnected");
       fresh->p->observer = p->observer;
@@ -536,6 +606,10 @@ namespace retro::capture {
       fresh->p->guard = p->guard;
       fresh->p->guard_user = p->guard_user;
       p = std::move(fresh->p);
+      // SETUP carried the follow flag; a cap needs its own message.
+      if (p->follow && (cap_w > 0 || cap_h > 0)) {
+        set_output(true, cap_w, cap_h);
+      }
     }
   }
 

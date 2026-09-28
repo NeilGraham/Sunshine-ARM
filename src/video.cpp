@@ -29,6 +29,7 @@ extern "C" {
 }
 
 // local includes
+#include "adaptive_bitrate.h"
 #include "cbs.h"
 #include "config.h"
 #include "display_device.h"
@@ -530,9 +531,20 @@ namespace video {
 
     std::deque<inflight_frame_t> inflight;  ///< Frames in the encoder, oldest first (pipelined rkmpp holds several).
     bool pipelined = false;  ///< rkmpp opened without LOW_DELAY: frames overlap across the VEPU cores.
-    bool rate_follow = false;  ///< rkmpp capture box: encoder rate and pipelining follow the source (rkmpp.h).
+    bool capture_follow = false;  ///< rkmpp capture box: the live source state is read per frame (rkmpp.h).
+    bool rate_follow = false;  ///< ... and the encoder rate and pipelining follow the source (dynamic_framerate).
+    bool geometry_follow = false;  ///< ... and the encode size follows the picture the daemon delivers (dynamic_resolution).
+    bool bitrate_follow = false;  ///< ... and the bitrate follows the source's mode and the network (dynamic_bitrate).
     std::uint64_t rate_generation = 0;  ///< rkmpp::live_encode_rate() generation last applied.
     int64_t pts_skip = 0;  ///< Frame numbers taken by drain calls, subtracted so the pts (the client's frame index) stays gapless.
+    int pool_width = 0;  ///< Encoder size at open: the client's request, and the capture pool's size.
+    int pool_height = 0;
+    int source_width = 0;  ///< The source's geometry at the last (re-)lock; 0 = unknown.
+    int source_height = 0;
+    std::int64_t requested_bps = 0;  ///< The client's bitrate (after max_bitrate): dynamic_bitrate's ceiling of ceilings.
+    double requested_fps = 0.0;  ///< The client's frame rate, for the mode-scaled ceiling.
+    int inject_kind = 0;  ///< The SPS/VPS injection this session started with, re-armed by a size change.
+    bool resize_drain_logged = false;  ///< One log line per size change that had to drain first.
 
     cbs::nal_t sps;  ///< Original and rewritten sequence parameter set for IDR injection.
     cbs::nal_t vps;  ///< Original and rewritten HEVC video parameter set for IDR injection.
@@ -2064,18 +2076,54 @@ namespace video {
      * unless this session is the owner AND a listener exists.
      */
     static bool owner_service(platf::display_t *disp, const config_t &owner_config, void *channel_data) {
-      if (listener_count.load(std::memory_order_relaxed) == 0 ||
-          owner_channel.load(std::memory_order_relaxed) != channel_data) {
+#ifdef SUNSHINE_BUILD_RKMPP
+      // Resolution following is gated on EVERY client that shares the stream
+      // being able to follow a size change (video::RS_CAP_DYNAMIC_RESOLUTION).
+      static bool follow_allowed = true;
+      const auto set_follow_allowed = [](bool allowed) {
+        if (allowed != follow_allowed) {
+          follow_allowed = allowed;
+          rkmpp::set_follow_geometry_allowed(allowed);
+        }
+      };
+#endif
+      if (owner_channel.load(std::memory_order_relaxed) != channel_data) {
+        return false;
+      }
+      if (listener_count.load(std::memory_order_relaxed) == 0) {
+#ifdef SUNSHINE_BUILD_RKMPP
+        set_follow_allowed(true);
+#endif
         return false;
       }
 
       bool want_idr = false;
 
       std::lock_guard lg {mutex};
+#ifdef SUNSHINE_BUILD_RKMPP
+      bool all_follow = true;
+      for (auto &listener : listeners) {
+        if (!listener->rejected && !(listener->config.rsCaps & RS_CAP_DYNAMIC_RESOLUTION)) {
+          all_follow = false;
+        }
+      }
+      set_follow_allowed(all_follow);
+#endif
       for (auto &listener : listeners) {
         if (listener->rejected) {
           continue;
         }
+
+#ifdef SUNSHINE_BUILD_RKMPP
+        // A client that cannot follow a size change joins only once the
+        // stream is back at the requested size (the gate above turned
+        // following off; the encoder follows the daemon back within a frame
+        // or two). Its first IDR must already be the size it asked for.
+        if (!listener->joined && !(listener->config.rsCaps & RS_CAP_DYNAMIC_RESOLUTION) &&
+            !rkmpp::encode_at_pool_size()) {
+          continue;
+        }
+#endif
 
         if (!listener->joined) {
           auto &config = listener->config;
@@ -2137,17 +2185,47 @@ namespace video {
    * @param encoder Encoder about to be opened.
    * @return True when the session should follow the source rate.
    */
-  static bool rkmpp_rate_follow_enabled(const encoder_t &encoder) {
+  /**
+   * @brief Whether this encoder is fed by the retro-capture daemon (a capture
+   *        box): the only path whose source state Sunshine can follow.
+   */
+  static bool rkmpp_capture_box(const encoder_t &encoder) {
 #ifdef SUNSHINE_BUILD_RKMPP
-    static const bool disabled = [] {
-      const char *env = std::getenv("SUNSHINE_RKMPP_RATE_FOLLOW");
-      return env && (std::string_view {env} == "0" || std::string_view {env} == "off");
-    }();
-    return !disabled && encoder.name == "rkmpp"sv && std::getenv("SUNSHINE_RKMPP_V4L2") != nullptr;
+    return encoder.name == "rkmpp"sv && std::getenv("SUNSHINE_RKMPP_V4L2") != nullptr;
 #else
     return false;
 #endif
   }
+
+  static bool rkmpp_rate_follow_enabled(const encoder_t &encoder) {
+    // dynamic_framerate (config, default on); SUNSHINE_RKMPP_RATE_FOLLOW=0|off
+    // is the older A/B switch and still forces it off.
+    static const bool disabled = [] {
+      const char *env = std::getenv("SUNSHINE_RKMPP_RATE_FOLLOW");
+      return env && (std::string_view {env} == "0" || std::string_view {env} == "off");
+    }();
+    return !disabled && config::video.dynamic_framerate && rkmpp_capture_box(encoder);
+  }
+
+#ifdef SUNSHINE_BUILD_RKMPP
+  /**
+   * @brief The mode-scaled bitrate ceiling for the picture being encoded now.
+   *
+   * The content's size is the encode size when it follows the source; for a
+   * client held at its requested size, the source fitted into that size (an
+   * upscaled 720p picture carries a 720p picture's information).
+   */
+  static std::int64_t mode_ceiling_for(const avcodec_encode_session_t &session, const AVCodecContext *ctx) {
+    int w = ctx->width;
+    int h = ctx->height;
+    if (!session.geometry_follow && session.source_width > 0 && session.source_height > 0) {
+      const double scale = std::min(1.0, std::min((double) ctx->width / session.source_width, (double) ctx->height / session.source_height));
+      w = (int) (session.source_width * scale);
+      h = (int) (session.source_height * scale);
+    }
+    return abr::mode_ceiling_bps(session.requested_bps, session.pool_width, session.pool_height, session.requested_fps, w, h, av_q2d(ctx->framerate));
+  }
+#endif
 
   bool shared_fanout_active() {
     // SUNSHINE_SHARED_FANOUT=0|off forces the upstream one-encoder-per-client
@@ -2193,15 +2271,30 @@ namespace video {
     //     per frame submitted, so its depth never shrinks on its own). A drain
     //     call submits nothing and takes back the oldest in-flight packet;
     //     it is only made on a picture the stream already carries.
+    //
+    //  3. RESOLUTION FOLLOWING (dynamic_resolution; a client that declared it
+    //     follows a size change): the daemon delivers the console's own size
+    //     inside the fixed pool and the wrapper frame carries it. When it
+    //     differs from the encoder's, the context takes the new size and this
+    //     frame is an IDR — the patched hevc_rkmpp re-applies MPP's input size
+    //     and MPP writes new parameter sets. Frames of the old size must not be
+    //     inside MPP when that happens, so a pipelined encoder is drained
+    //     first (normally already done: a size change is a re-lock, and the
+    //     signal-loss run before it drains, see 2.).
+    //
+    //  4. BITRATE FOLLOWING (dynamic_bitrate): the ceiling tracks the mode
+    //     being streamed, and the network adaptation (adaptive_bitrate.h)
+    //     picks the target under it; the patched hevc_rkmpp re-applies rate
+    //     control when bit_rate changes.
     bool drain = false;
     bool hold_single = false;
 #ifdef SUNSHINE_BUILD_RKMPP
-    if (session.rate_follow) {
+    if (session.capture_follow) {
       const auto live = rkmpp::live_encode_rate();
       if (live.generation != session.rate_generation) {
         session.rate_generation = live.generation;
         const auto &rate = live.plan.rate;
-        if (rate.num > 0 && av_cmp_q(rate, ctx->framerate)) {
+        if (session.rate_follow && rate.num > 0 && av_cmp_q(rate, ctx->framerate)) {
           const bool pipelined = rkmpp::want_pipelined_encode(ctx->width, ctx->height, av_q2d(rate));
           BOOST_LOG(info) << "RKMPP: encoder now "sv << rate.num << '/' << rate.den << " fps (was "sv
                           << ctx->framerate.num << '/' << ctx->framerate.den << "), "sv
@@ -2210,11 +2303,66 @@ namespace video {
           ctx->framerate = rate;
           session.pipelined = pipelined;
         }
+        session.source_width = live.source_width;
+        session.source_height = live.source_height;
+        if (session.bitrate_follow) {
+          abr::set_ceiling(mode_ceiling_for(session, ctx.get()));
+        }
       }
-      hold_single = live.signal_lost;
-      const bool single = !session.pipelined || hold_single;
-      drain = !live.fresh && single && !session.inflight.empty() &&
-              !(frame->flags & AV_FRAME_FLAG_KEY);
+      if (session.rate_follow) {
+        hold_single = live.signal_lost;
+        const bool single = !session.pipelined || hold_single;
+        drain = !live.fresh && single && !session.inflight.empty() &&
+                !(frame->flags & AV_FRAME_FLAG_KEY);
+      }
+
+      if (session.geometry_follow && frame->width >= 2 && frame->height >= 2 &&
+          (frame->width != ctx->width || frame->height != ctx->height)) {
+        if (!session.inflight.empty()) {
+          // Take the old size's frames back before resizing; this new-size
+          // frame is not encoded (it takes no frame number), the next one is.
+          drain = true;
+          if (!session.resize_drain_logged) {
+            BOOST_LOG(info) << "RKMPP: draining "sv << session.inflight.size() << " frames before a size change"sv;
+            session.resize_drain_logged = true;
+          }
+        } else {
+          const double fps = av_q2d(ctx->framerate);
+          const bool pipelined = rkmpp::want_pipelined_encode(frame->width, frame->height, fps);
+          BOOST_LOG(info) << "RKMPP: encoder now "sv << frame->width << 'x' << frame->height << " (was "sv
+                          << ctx->width << 'x' << ctx->height << "), following the source; "sv
+                          << (pipelined ? "pipelined"sv : "single-frame"sv) << " — live, no reopen"sv;
+          ctx->width = frame->width;
+          ctx->height = frame->height;
+          session.pipelined = pipelined;
+          session.resize_drain_logged = false;
+          // The new size starts a new stream head: an IDR with fresh
+          // parameter sets (hevc_rkmpp asks MPP for it too).
+          frame->pict_type = AV_PICTURE_TYPE_I;
+          frame->flags |= AV_FRAME_FLAG_KEY;
+          if (session.inject_kind) {
+            // The SPS changed, so the rewrite captured from the first IDR no
+            // longer matches: capture it again from this one.
+            session.inject = session.inject_kind;
+            session.replacements.clear();
+          }
+          rkmpp::note_encode_at_pool_size(ctx->width == session.pool_width && ctx->height == session.pool_height);
+          if (session.bitrate_follow) {
+            // A client may ask for a keyframe while its decoder re-sizes;
+            // that is not network loss.
+            abr::grace_for(1500ms);
+            abr::set_ceiling(mode_ceiling_for(session, ctx.get()));
+          }
+        }
+      }
+
+      if (session.bitrate_follow) {
+        if (const auto want = abr::tick(); want > 0 && std::llabs(want - ctx->bit_rate) * 100 >= ctx->bit_rate) {
+          ctx->bit_rate = want;
+          ctx->rc_max_rate = want;
+          ctx->rc_min_rate = want;
+        }
+      }
     }
 #endif
 
@@ -2290,11 +2438,11 @@ namespace video {
         } else {
           ctx->flags &= ~AV_CODEC_FLAG_LOW_DELAY;
         }
-      } else if (session.rate_follow) {
+      } else if (session.capture_follow) {
         // Single-frame: this call blocks for this frame's own packet. (A
         // session that opened single-frame already has the flag; one that
-        // followed the source down from pipelined, or is riding out a signal
-        // loss, needs it back.)
+        // followed the source down from pipelined — in rate or in size — or
+        // is riding out a signal loss, needs it back.)
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
       }
 
@@ -2515,17 +2663,33 @@ namespace video {
     // encode_avcodec() applies it live.
     const AVRational requested_fps = video::framerate_to_rational(config);
     AVRational encode_fps = requested_fps;
+    const bool capture_follow = rkmpp_capture_box(encoder);
     const bool rate_follow = rkmpp_rate_follow_enabled(encoder);
+    // Resolution following needs a client that declared it handles a
+    // mid-stream size change: every stock Moonlight keeps its requested size.
+    const bool geometry_follow = capture_follow && config::video.dynamic_resolution &&
+                                 (config.rsCaps & RS_CAP_DYNAMIC_RESOLUTION);
+    const bool bitrate_follow = capture_follow && config::video.dynamic_bitrate;
+    int source_width = 0;
+    int source_height = 0;
 #ifdef SUNSHINE_BUILD_RKMPP
-    if (rate_follow) {
-      const auto plan = rkmpp::plan_encode_rate(requested_fps, rkmpp::daemon_source_rate());
-      rkmpp::begin_encode_rate(requested_fps, plan);
-      if (plan.rate.num > 0) {
+    if (capture_follow) {
+      const auto mode = rkmpp::daemon_source_mode();
+      source_width = mode.width;
+      source_height = mode.height;
+      const auto plan = rkmpp::plan_encode_rate(requested_fps, mode.rate);
+      rkmpp::begin_encode_rate(requested_fps, plan, mode.width, mode.height);
+      if (rate_follow && plan.rate.num > 0) {
         encode_fps = plan.rate;
       }
-      BOOST_LOG(info) << "RKMPP: client asked "sv << av_q2d(requested_fps) << " fps; source "sv
-                      << (plan.source.num > 0 ? std::to_string(av_q2d(plan.source)) : "unknown (plans at first light)"s)
-                      << "; encoder opened at "sv << encode_fps.num << '/' << encode_fps.den;
+      rkmpp::set_follow_geometry(geometry_follow);
+      BOOST_LOG(info) << "RKMPP: client asked "sv << config.width << 'x' << config.height << '@' << av_q2d(requested_fps)
+                      << "; source "sv
+                      << (plan.source.num > 0 ? std::to_string(source_width) + "x" + std::to_string(source_height) + "@" + std::to_string(av_q2d(plan.source)) : "unknown (plans at first light)"s)
+                      << "; encoder opened at "sv << encode_fps.num << '/' << encode_fps.den
+                      << "; following: frame rate "sv << (rate_follow ? "on"sv : "off"sv)
+                      << ", resolution "sv << (geometry_follow ? "on"sv : (config::video.dynamic_resolution ? "off (client did not declare it)"sv : "off"sv))
+                      << ", bitrate "sv << (bitrate_follow ? "on"sv : "off"sv);
     }
 #endif
 
@@ -2535,6 +2699,7 @@ namespace video {
     // fallback options, we may need to allow more retries
     // to try applying each set.
     avcodec_ctx_t ctx;
+    std::int64_t requested_bps = 0;
     for (int retries = 0; retries < 2; retries++) {
       ctx.reset(avcodec_alloc_context3(codec));
       ctx->width = config.width;
@@ -2755,6 +2920,23 @@ namespace video {
 
       auto bitrate = ((config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate) * 1000;
       BOOST_LOG(info) << "Streaming bitrate is " << bitrate;
+      requested_bps = bitrate;
+#ifdef SUNSHINE_BUILD_RKMPP
+      if (bitrate_follow && source_width > 0 && source_height > 0) {
+        // Open at the mode-scaled ceiling rather than the client's full
+        // bitrate (see adaptive_bitrate.h); the stream then only moves on a
+        // re-lock or on network loss.
+        const double scale = std::min(1.0, std::min((double) config.width / source_width, (double) config.height / source_height));
+        const auto ceiling = abr::mode_ceiling_bps(bitrate, config.width, config.height, av_q2d(requested_fps),
+                                                   (int) (source_width * scale), (int) (source_height * scale), av_q2d(encode_fps));
+        if (ceiling < bitrate) {
+          BOOST_LOG(info) << "Dynamic bitrate: "sv << (int) (source_width * scale) << 'x' << (int) (source_height * scale)
+                          << '@' << av_q2d(encode_fps) << " is "sv << ceiling << " of the client's "sv << bitrate
+                          << " (Moonlight's own default-bitrate curve)"sv;
+          bitrate = ceiling;
+        }
+      }
+#endif
       ctx->rc_max_rate = bitrate;
       ctx->bit_rate = bitrate;
 
@@ -2892,9 +3074,19 @@ namespace video {
       config.videoFormat <= 1 ? (1 - static_cast<int>(video_format[encoder_t::VUI_PARAMETERS])) * (1 + config.videoFormat) : 0
     );
     session->pipelined = pipelined;
+    session->inject_kind = session->inject;
 #ifdef SUNSHINE_BUILD_RKMPP
+    session->capture_follow = capture_follow;
     session->rate_follow = rate_follow;
-    if (rate_follow) {
+    session->geometry_follow = geometry_follow;
+    session->bitrate_follow = bitrate_follow;
+    session->pool_width = session->avcodec_ctx->width;
+    session->pool_height = session->avcodec_ctx->height;
+    session->source_width = source_width;
+    session->source_height = source_height;
+    session->requested_bps = requested_bps;
+    session->requested_fps = av_q2d(requested_fps);
+    if (capture_follow) {
       session->rate_generation = rkmpp::live_encode_rate().generation;
     }
 #endif
@@ -2968,6 +3160,23 @@ namespace video {
     if (!session) {
       return;
     }
+
+    // dynamic_bitrate's network adaptation runs for the streaming session only
+    // (not for the encoder probes, which build sessions too). It starts at the
+    // ceiling the encoder was opened with.
+    bool abr_running = false;
+    if (auto *av = dynamic_cast<avcodec_encode_session_t *>(session.get()); av && av->bitrate_follow) {
+      const std::int64_t floor_bps = config::video.dynamic_bitrate_min > 0 ?
+                                       (std::int64_t) config::video.dynamic_bitrate_min * 1000 :
+                                       abr::auto_floor_bps(av->requested_bps);
+      abr::session_begin(true, av->avcodec_ctx->bit_rate, floor_bps, config.clientKey);
+      abr_running = true;
+    }
+    auto abr_guard = util::fail_guard([abr_running] {
+      if (abr_running) {
+        abr::session_end();
+      }
+    });
 
     // As a workaround for NVENC hangs and to generally speed up encoder reinit,
     // we will complete the encoder teardown in a separate thread if supported.

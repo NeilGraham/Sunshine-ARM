@@ -791,7 +791,12 @@ namespace config {
     },  // display_device
 
     0,  // max_bitrate
-    0  // minimum_fps_target (0 = framerate)
+    0,  // minimum_fps_target (0 = framerate)
+
+    true,  // dynamic_framerate
+    true,  // dynamic_resolution
+    true,  // dynamic_bitrate
+    0  // dynamic_bitrate_min (0 = automatic)
   };
 
   /**
@@ -1687,6 +1692,10 @@ namespace config {
 
     int_f(vars, "max_bitrate", video.max_bitrate);
     double_between_f(vars, "minimum_fps_target", video.minimum_fps_target, {0.0, 1000.0});
+    bool_f(vars, "dynamic_framerate", video.dynamic_framerate);
+    bool_f(vars, "dynamic_resolution", video.dynamic_resolution);
+    bool_f(vars, "dynamic_bitrate", video.dynamic_bitrate);
+    int_between_f(vars, "dynamic_bitrate_min", video.dynamic_bitrate_min, {0, 1000000});
 
     path_f(vars, "pkey", nvhttp.pkey);
     path_f(vars, "cert", nvhttp.cert);

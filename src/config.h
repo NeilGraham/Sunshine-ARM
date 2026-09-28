@@ -208,6 +208,14 @@ namespace config {
 
     int max_bitrate;  ///< Maximum bitrate ceiling in kbps for bitrate requested from the client.
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
+
+    // Capture-box stream following (RKMPP encoder fed by the retro-capture
+    // daemon). The client's requested resolution, frame rate and bitrate are
+    // the ceiling; under it the stream follows what the HDMI source sends.
+    bool dynamic_framerate;  ///< Encode at the source's own spec frame rate (capped by the request) and follow it live.
+    bool dynamic_resolution;  ///< Encode at the source's own resolution (capped by the request) for clients that declare they follow a mid-stream size change.
+    bool dynamic_bitrate;  ///< Scale the bitrate to the source's mode and lower it when the network loses packets, climbing back when it stops.
+    int dynamic_bitrate_min;  ///< Floor in kbps for dynamic_bitrate's network adaptation; 0 = automatic.
   };
 
   /**

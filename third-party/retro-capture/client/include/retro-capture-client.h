@@ -67,6 +67,20 @@ namespace retro::capture {
     int index {-1};          ///< pool index; -1 before the first frame
     std::uint32_t flags {};  ///< RCAP_FRAME_* bits from the daemon
     bool changed {false};    ///< index differs from the previous next() call
+    /// Size of the picture in the top-left of the buffer (PROTOCOL.md 3.7.1).
+    /// The pool size unless the session follows the source; always the pool
+    /// size against a pre-v4 daemon.
+    int active_width {0};
+    int active_height {0};
+  };
+
+  /// How a consumer session starts. Defaults are the v3 behaviour.
+  struct connect_options {
+    /// Start with the picture following the source's geometry inside the pool
+    /// (PROTOCOL.md 3.7.1): the requested width/height become an upper bound.
+    /// Ignored by a pre-v4 daemon, which keeps scaling to the pool size —
+    /// check following() after connect.
+    bool follow_source {false};
   };
 
   /// One FRAME message as it crossed the socket, before newest-frame-wins
@@ -162,7 +176,7 @@ namespace retro::capture {
     /// allowed to do next (note that a fallback capturing something OTHER
     /// than the HDMI-RX, as Sunshine's KMS path does, is not a substitute).
     static std::unique_ptr<client> connect(int width, int height, std::uint32_t want_fourcc,
-                                           const char *name);
+                                           const char *name, const connect_options &opts = {});
 
     /// Drain the socket, keep the newest FRAME, release superseded leases.
     /// Newest-frame-wins: a consumer that falls behind skips frames rather than
@@ -172,8 +186,23 @@ namespace retro::capture {
     /// Re-establish the session after daemon death, at most once a second.
     /// Until it succeeds the previously received buffers stay valid — the
     /// dma-buf fds outlive the daemon process — so a consumer can keep
-    /// re-sending the last frame instead of tearing down.
+    /// re-sending the last frame instead of tearing down. The new session
+    /// resumes the follow/cap state of the old one (set_output()).
     void maybe_reconnect(int width, int height, std::uint32_t want_fourcc, const char *name);
+
+    /// Live picture-size control (OUTPUT_SET, PROTOCOL.md 3.15): follow the
+    /// source or not, and cap the picture at max_width x max_height (0 = the
+    /// pool size). Applies from the next frame the daemon produces; the FRAME
+    /// active size is the confirmation. Returns false, sending nothing, when
+    /// the daemon speaks a version below 4 or the session is dead.
+    bool set_output(bool follow, int max_width = 0, int max_height = 0);
+
+    /// Whether the session is following the source (as last requested and
+    /// accepted by a v4 daemon).
+    bool following() const;
+
+    /// Protocol version this connection negotiated; 0 while dead.
+    int version() const;
 
     /// Per-FRAME telemetry hook (see frame_observer). Survives reconnects.
     void set_frame_observer(frame_observer fn, void *user);

@@ -23,6 +23,7 @@ extern "C" {
 }
 
 // local includes
+#include "adaptive_bitrate.h"
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
@@ -1142,7 +1143,35 @@ namespace stream {
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
+      // A client asks for a keyframe when it lost a frame: loss, for the
+      // dynamic bitrate (which ignores the ones a stream start or a size
+      // change is expected to cause).
+      abr::report_keyframe_request();
       session->video.idr_events->raise(true);
+    });
+
+    // Per-frame FEC status (SS_FRAME_FEC_STATUS, a Sunshine protocol extension
+    // every current Moonlight sends): one report per frame that needed FEC to
+    // recover missing packets, or that could not be recovered and was dropped.
+    // Upstream Sunshine ignores it; it is the dynamic bitrate's earliest
+    // signal, because a repaired frame is loss the player has not seen yet.
+    // Fields are big-endian.
+    server->map(SS_FRAME_FEC_PTYPE, [&](session_t *session, const std::string_view &payload) {
+      if (payload.size() < sizeof(SS_FRAME_FEC_STATUS)) {
+        return;
+      }
+      SS_FRAME_FEC_STATUS st;
+      std::memcpy(&st, payload.data(), sizeof(st));
+      const auto total_data = util::endian::big(st.totalDataPackets);
+      const auto got_data = util::endian::big(st.receivedDataPackets);
+      const auto got_parity = util::endian::big(st.receivedParityPackets);
+      // Reed-Solomon repairs a block from any total_data of its shards.
+      const bool recovered = got_data + got_parity >= total_data;
+      abr::report_frame_loss(recovered);
+      BOOST_LOG(verbose) << "type [SS_FRAME_FEC_STATUS] frame "sv << util::endian::big(st.frameIndex) << ": "sv
+                         << got_data << '/' << total_data << " data + "sv << got_parity << '/'
+                         << util::endian::big(st.totalParityPackets) << " parity shards, "sv
+                         << (recovered ? "repaired"sv : "lost"sv);
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
@@ -1155,6 +1184,7 @@ namespace stream {
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
 
+      abr::report_keyframe_request();
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
     });
 

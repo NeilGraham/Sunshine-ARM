@@ -1449,6 +1449,95 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### dynamic_framerate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Capture box (RKMPP encoder fed by the retro-capture daemon) only. Encode at the frame rate the HDMI
+            source actually sends, snapped to its spec rate (59.94 stays 60000/1001), capped by the client's request
+            (a faster source is decimated), and follow it live when the console changes mode, without reopening the
+            encoder. When disabled, the stream is always encoded at the client's requested frame rate.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### dynamic_resolution
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Capture box only. Encode at the resolution the HDMI source actually sends, capped by the client's
+            requested resolution (never upscaled), and follow it live when the console changes mode: the switch is an
+            IDR with new parameter sets, on the frame the console re-locks at. Applied only for clients that declare
+            they handle a mid-stream size change (the retro-stream Moonlight client sends `rsCaps` with its launch
+            request); every other client keeps the resolution it asked for. While a client that cannot follow shares
+            the stream, the stream stays at the requested resolution. When disabled, the stream is always encoded at
+            the client's requested resolution.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### dynamic_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Capture box only. The client's requested bitrate becomes the ceiling. Under it the bitrate follows the
+            source's mode (it is scaled by the ratio of Moonlight's own default bitrates for the source's mode and the
+            requested one, so a 720p60 console on a 4K120 session gets proportionally less), and the network adaptation
+            lowers it as soon as a client reports packet loss (a frame that needed FEC recovery, a lost frame, or a
+            keyframe request), then climbs back once the loss stops. When disabled, the stream is always encoded at the
+            client's requested bitrate.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### dynamic_bitrate_min
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The lowest bitrate (in Kbps) the network adaptation of `dynamic_bitrate` may go to. 0 picks one from the
+            stream's bitrate (an eighth of it, at least 2000 Kbps).
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dynamic_bitrate_min = 8000
+            @endcode</td>
+    </tr>
+</table>
+
 ## Network
 
 ### upnp
