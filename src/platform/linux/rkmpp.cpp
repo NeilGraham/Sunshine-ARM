@@ -25,8 +25,11 @@
  *    available.
  */
 // standard includes
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -125,6 +128,101 @@ namespace rkmpp {
   // capture path connects. See want_pipelined_encode() in rkmpp.h.
   static std::atomic<bool> g_pipelined_encode {false};
 
+  // Source-rate following (rkmpp.h). The encoder setup starts a session's
+  // plan (begin_encode_rate); the capture path re-plans at every re-lock;
+  // the encode loop reads it per frame (live_encode_rate). The plan changes a
+  // few times a session at most, so a mutex is plenty for it; the per-frame
+  // flags and the published periods are atomics.
+  namespace rate_state {
+    std::mutex mu;
+    AVRational requested {0, 1};  // under mu
+    encode_rate_t plan;  // under mu
+    std::atomic<std::uint64_t> generation {0};
+    std::atomic<int> decimation {1};
+    std::atomic<double> encode_period_ms {0.0};
+    std::atomic<double> source_period_ms {0.0};  // exact, from the spec rate
+    std::atomic<bool> signal_lost {false};
+    std::atomic<bool> fresh {false};
+  }  // namespace rate_state
+
+  static double period_ms_of(AVRational r) {
+    return r.num > 0 && r.den > 0 ? 1000.0 * r.den / r.num : 0.0;
+  }
+
+  static std::string rate_str(AVRational r) {
+    if (r.num <= 0 || r.den <= 0) {
+      return "unknown";
+    }
+    char buf[48];
+    if (r.den == 1) {
+      std::snprintf(buf, sizeof(buf), "%d", r.num);
+    } else {
+      std::snprintf(buf, sizeof(buf), "%d/%d (%.3f)", r.num, r.den, av_q2d(r));
+    }
+    return buf;
+  }
+
+  // Publish `plan` (caller holds rate_state::mu).
+  static void publish_plan_locked(const encode_rate_t &plan) {
+    rate_state::plan = plan;
+    rate_state::decimation.store(plan.decimation, std::memory_order_relaxed);
+    rate_state::encode_period_ms.store(period_ms_of(plan.rate), std::memory_order_relaxed);
+    rate_state::source_period_ms.store(period_ms_of(plan.source), std::memory_order_relaxed);
+    rate_state::generation.fetch_add(1, std::memory_order_release);
+  }
+
+  AVRational snap_source_rate(double fps) {
+    if (!(fps > 0.0)) {
+      return {0, 1};
+    }
+    constexpr double tol = 4e-4;  // relative; N and N*1000/1001 sit 1e-3 apart
+    const double n = std::round(fps);
+    if (n >= 1.0 && std::abs(fps - n) <= n * tol) {
+      return {(int) n, 1};
+    }
+    const double m = std::round(fps * 1.001);
+    if (m >= 1.0 && std::abs(fps - m * 1000.0 / 1001.0) <= m * tol) {
+      return {(int) m * 1000, 1001};
+    }
+    AVRational r {0, 1};
+    av_reduce(&r.num, &r.den, std::llround(fps * 1000.0), 1000, 1 << 24);
+    return r;
+  }
+
+  encode_rate_t plan_encode_rate(AVRational requested, AVRational source) {
+    encode_rate_t p;
+    if (source.num <= 0 || source.den <= 0) {
+      return p;
+    }
+    p.source = source;
+    p.rate = source;
+    if (requested.num > 0 && requested.den > 0) {
+      const double ratio = av_q2d(source) / av_q2d(requested);
+      if (ratio > 1.01) {
+        p.decimation = std::max(1, (int) std::ceil(ratio - 0.01));
+        av_reduce(&p.rate.num, &p.rate.den, source.num, (int64_t) source.den * p.decimation, 1 << 24);
+      }
+    }
+    return p;
+  }
+
+  // Re-plan for a source that (re-)locked at `source`. False if nothing moved.
+  static bool apply_source_rate(AVRational source) {
+    std::lock_guard lk(rate_state::mu);
+    const auto next = plan_encode_rate(rate_state::requested, source);
+    const auto &cur = rate_state::plan;
+    if (!av_cmp_q(next.source, cur.source) && !av_cmp_q(next.rate, cur.rate) &&
+        next.decimation == cur.decimation) {
+      return false;
+    }
+    BOOST_LOG(info) << "RKMPP: source locked at "sv << rate_str(source) << " Hz (was "sv
+                    << rate_str(cur.source) << "); encoding "sv << rate_str(next.rate)
+                    << " fps"sv
+                    << (next.decimation > 1 ? " (1 in "s + std::to_string(next.decimation) + " source frames)"s : ""s);
+    publish_plan_locked(next);
+    return true;
+  }
+
   class frame_source_t {
   public:
     ~frame_source_t() {
@@ -172,9 +270,18 @@ namespace rkmpp {
       // A pipelined encoder is still reading a frame after the next one has
       // been submitted. Handing that buffer back to the daemon would let it
       // paint the next picture into it mid-encode, so its lease is held
-      // until hevc_rkmpp drops its clone of the wrapper.
-      if (g_pipelined_encode.load(std::memory_order_relaxed)) {
-        src->client->set_release_guard(&frame_source_t::encoder_holds, src.get());
+      // until hevc_rkmpp drops its clone of the wrapper. Installed for every
+      // session now, not just ones that open pipelined: source-rate following
+      // turns pipelining on mid-session when the console switches to 120 Hz.
+      // A blocking (LOW_DELAY) encode has dropped its clone by the time the
+      // lease comes back, so the guard never holds anything there.
+      src->client->set_release_guard(&frame_source_t::encoder_holds, src.get());
+      // Start from the spec rate the session was planned with rather than
+      // measuring it from scratch: the fresh-frame wait and kmsgrab's tick
+      // are both scaled by this period.
+      if (const double ms = rate_state::source_period_ms.load(std::memory_order_relaxed); ms > 0.0) {
+        src->period_ms_ewma = ms;
+        g_daemon_source_period_ms.store(ms, std::memory_order_relaxed);
       }
       return src;
     }
@@ -346,7 +453,99 @@ namespace rkmpp {
           }
         }
       }
+      // DECIMATION (source faster than the client asked for; rkmpp.h
+      // plan_encode_rate). Encode every k-th new source frame, exactly:
+      // 119.88 Hz at a 60 request becomes 59.94, not 60 with a skip every
+      // 16 s. A frame short of the k-th is not "nothing to wait for" — the
+      // next one is at most a source period away — so wait for it here,
+      // bounded by k and a half periods. The frames skipped are released by
+      // the next newest-wins drain without ever reaching the encoder. Any
+      // HELD/BLACK message ends the wait: the source is in trouble and the
+      // re-emission is the picture to send. k == 1 never enters this.
+      if (const int k = rate_state::decimation.load(std::memory_order_relaxed);
+          k > 1 && (f.flags & RCAP_FRAME_FRESH) && period_ms_ewma > 0.0 && client->alive()) {
+        const int cfd = client->fd();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double, std::milli>(period_ms_ewma * (k + 0.5)));
+        while (cfd >= 0 && fresh_messages - fresh_at_encode < (std::uint64_t) k) {
+          const auto now = std::chrono::steady_clock::now();
+          if (now >= deadline) {
+            break;
+          }
+          const auto left =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+          pollfd pfd {cfd, POLLIN, 0};
+          if (poll(&pfd, 1, left > 0 ? (int) left : 1) <= 0) {
+            break;
+          }
+          const auto g = client->next();
+          if (g.flags != 0) {
+            f = g;
+            if (!(g.flags & RCAP_FRAME_FRESH)) {
+              break;
+            }
+          }
+        }
+      }
+      if (f.flags & RCAP_FRAME_FRESH) {
+        fresh_at_encode = fresh_messages;
+      }
+
       nonfresh_run = (f.flags & RCAP_FRAME_FRESH) ? 0 : nonfresh_run + 1;
+
+      // SOURCE-RATE FOLLOWING (rkmpp.h). A mode switch is always a re-lock:
+      // the RX loses the signal, the daemon re-emits the held picture flagged
+      // SIGNAL_LOST, and the first FRESH frame after that run comes from the
+      // new mode. So: flag the loss run for the encode loop (it shrinks a
+      // pipelined encoder on those duplicates, while nothing new is being
+      // shown), and at the first FRESH frame ask the daemon what locked —
+      // one STATUS round trip, well under a millisecond — then re-plan and
+      // re-seed the period at the exact spec rate instead of letting the
+      // EWMA walk there over a hundred frames. BLACK (session prime) arms it
+      // too, so a session that opened on a dark input plans at first light.
+      if (f.flags != 0) {
+        const bool fresh = (f.flags & RCAP_FRAME_FRESH) != 0;
+        const bool lost = !fresh && (f.flags & (RCAP_FRAME_SIGNAL_LOST | RCAP_FRAME_BLACK)) != 0;
+        // Backstop for the re-lock query: any held run of three or more
+        // frames also re-reads the rate afterwards. A lone HELD frame is the
+        // RX missing one delivery (5-9 a minute on a healthy link) and never
+        // a mode change, which holds the picture for hundreds of ms.
+        if (lost || (!fresh && nonfresh_run >= 3)) {
+          relock_pending = true;
+          relock_retry_at = {};
+        } else if (fresh && relock_pending) {
+          const auto now = std::chrono::steady_clock::now();
+          if (relock_retry_at.time_since_epoch().count() == 0 || now >= relock_retry_at) {
+            const AVRational src = daemon_source_rate();
+            if (src.num > 0) {
+              relock_pending = false;
+              apply_source_rate(src);
+              period_ms_ewma = period_ms_of(src);
+              g_daemon_source_period_ms.store(period_ms_ewma, std::memory_order_relaxed);
+              last_fresh = {};  // the interval across the loss run is not a period
+              // One confirming read once the new mode has settled, in case
+              // the first came a snapshot too early (a no-op if it agrees).
+              relock_confirm_at = now + 500ms;
+            } else {
+              // Not answered, or the daemon has not published the new lock
+              // yet: ask again shortly rather than per frame.
+              relock_retry_at = now + 100ms;
+            }
+          }
+        } else if (fresh && relock_confirm_at.time_since_epoch().count() != 0 &&
+                   std::chrono::steady_clock::now() >= relock_confirm_at) {
+          relock_confirm_at = {};
+          if (const AVRational src = daemon_source_rate(); src.num > 0 && apply_source_rate(src)) {
+            period_ms_ewma = period_ms_of(src);
+            g_daemon_source_period_ms.store(period_ms_ewma, std::memory_order_relaxed);
+          }
+        }
+        rate_state::signal_lost.store(lost, std::memory_order_relaxed);
+        rate_state::fresh.store(fresh, std::memory_order_relaxed);
+      } else {
+        rate_state::fresh.store(false, std::memory_order_relaxed);
+      }
 
       // What the wait COST and what it BOUGHT, measured separately, because
       // the two answer different questions and only one of them is latency.
@@ -383,13 +582,16 @@ namespace rkmpp {
       // flooding encoder and network at exactly the moment there is nothing to
       // send. Hold a re-emission to one source period so a dead source costs
       // what it did before oversampling: the held cadence, and nothing more.
+      // (When decimating, the stream's own cadence is k source periods.)
       if (!(f.flags & RCAP_FRAME_FRESH) && period_ms_ewma > 0.0 &&
           last_returned.time_since_epoch().count() != 0) {
+        const double floor_ms =
+          period_ms_ewma * std::max(1, rate_state::decimation.load(std::memory_order_relaxed));
         const auto since =
           std::chrono::duration<double, std::milli>(t_have - last_returned).count();
-        if (since < period_ms_ewma) {
+        if (since < floor_ms) {
           std::this_thread::sleep_for(
-            std::chrono::duration<double, std::milli>(period_ms_ewma - since));
+            std::chrono::duration<double, std::milli>(floor_ms - since));
         }
       }
       last_returned = std::chrono::steady_clock::now();
@@ -399,11 +601,24 @@ namespace rkmpp {
       // to bound lateness; seeded on the first interval so the wait is armed
       // within two frames of session start. Intervals outside [1 ms, 100 ms]
       // are ignored — those are a stall or a mode change, not a period.
+      //
+      // Once the daemon has told us the source's spec rate, the period IS
+      // that rate's (pinned at plan time); measuring would only add jitter —
+      // and under decimation it would measure the encoded cadence, k periods
+      // apart. The measurement stays as the fallback for an unknown rate,
+      // divided by the source frames it spans so a drain that skipped some
+      // still yields the source's period.
       if (f.flags & RCAP_FRAME_FRESH) {
         const auto now = std::chrono::steady_clock::now();
-        if (last_fresh.time_since_epoch().count() != 0) {
+        if (const double spec_ms = rate_state::source_period_ms.load(std::memory_order_relaxed); spec_ms > 0.0) {
+          if (period_ms_ewma != spec_ms) {
+            period_ms_ewma = spec_ms;
+            g_daemon_source_period_ms.store(period_ms_ewma, std::memory_order_relaxed);
+          }
+        } else if (last_fresh.time_since_epoch().count() != 0) {
+          const auto spanned = std::max<std::uint64_t>(1, fresh_messages - fresh_at_last_period);
           const double ms =
-            std::chrono::duration<double, std::milli>(now - last_fresh).count();
+            std::chrono::duration<double, std::milli>(now - last_fresh).count() / (double) spanned;
           if (ms >= 1.0 && ms <= 100.0) {
             period_ms_ewma = period_ms_ewma > 0.0 ?
                                (period_ms_ewma * 0.99 + ms * 0.01) : ms;
@@ -412,6 +627,7 @@ namespace rkmpp {
           }
         }
         last_fresh = now;
+        fresh_at_last_period = fresh_messages;
       }
 
       // f.flags is non-zero iff at least one FRAME message arrived in this
@@ -544,6 +760,11 @@ namespace rkmpp {
       self->last_dqbuf_ns = t.dqbuf_ns;
       self->last_flags = t.flags;
       self->last_telemetry = t;
+      // Every new source frame, including the ones a newest-wins drain
+      // releases unseen: decimation counts source frames, not drains.
+      if (t.flags & RCAP_FRAME_FRESH) {
+        ++self->fresh_messages;
+      }
     }
 
     std::unique_ptr<retro::capture::client> client;
@@ -568,6 +789,17 @@ namespace rkmpp {
     // re-emission: brief runs are a missing frame we refuse to fabricate,
     // long ones are signal loss we must keep streaming through.
     int nonfresh_run {};
+    // FRESH messages observed (every drain, see observe()) and the count at
+    // the last FRESH frame handed to the encoder: decimation's frame clock.
+    std::uint64_t fresh_messages {};
+    std::uint64_t fresh_at_encode {};
+    std::uint64_t fresh_at_last_period {};  // fresh_messages at last_fresh
+    // A signal-loss / BLACK run was seen; the next FRESH frame is a re-lock
+    // whose rate is re-read from the daemon. Starts armed: the stream primes
+    // with BLACK anyway, and a session that opened unlocked must plan too.
+    bool relock_pending {true};
+    std::chrono::steady_clock::time_point relock_retry_at {};  // zero = ask now
+    std::chrono::steady_clock::time_point relock_confirm_at {};  // zero = no confirm due
     // Measured source frame period, and the last FRESH arrival it came from.
     // Drives the wait cap so it scales with refresh rate instead of assuming
     // 60 Hz; zero until the first interval is seen, which disables waiting.
@@ -920,7 +1152,41 @@ namespace rkmpp {
     return cached;
   }
 
-  bool want_pipelined_encode(int width, int height, int fps) {
+  AVRational daemon_source_rate() {
+    if (!std::getenv("SUNSHINE_RKMPP_V4L2")) {
+      return {0, 1};  // not a capture-streaming box
+    }
+    install_capture_logger();
+    const auto st = retro::capture::query_status("sunshine-rate");
+    if (!st.valid || !st.signal_locked) {
+      return {0, 1};
+    }
+    return snap_source_rate(st.input_fps);
+  }
+
+  void begin_encode_rate(AVRational requested, const encode_rate_t &plan) {
+    std::lock_guard lk(rate_state::mu);
+    rate_state::requested = requested;
+    rate_state::signal_lost.store(false, std::memory_order_relaxed);
+    rate_state::fresh.store(false, std::memory_order_relaxed);
+    publish_plan_locked(plan);
+  }
+
+  live_rate_t live_encode_rate() {
+    live_rate_t out;
+    out.signal_lost = rate_state::signal_lost.load(std::memory_order_relaxed);
+    out.fresh = rate_state::fresh.load(std::memory_order_relaxed);
+    std::lock_guard lk(rate_state::mu);  // uncontended: taken once per frame
+    out.generation = rate_state::generation.load(std::memory_order_acquire);
+    out.plan = rate_state::plan;
+    return out;
+  }
+
+  double daemon_encode_period_ms() {
+    return rate_state::encode_period_ms.load(std::memory_order_relaxed);
+  }
+
+  bool want_pipelined_encode(int width, int height, double fps) {
     static const int mode = [] {
       const char *env = std::getenv("SUNSHINE_RKMPP_PIPELINE");
       if (!env || !*env || std::string_view(env) == "auto") {

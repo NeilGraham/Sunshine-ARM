@@ -5,11 +5,16 @@
 #pragma once
 
 // standard includes
+#include <cstdint>
 #include <memory>
 
 // local includes
 #include "misc.h"
 #include "src/platform/common.h"
+
+extern "C" {
+#include <libavutil/rational.h>
+}
 
 extern "C" struct AVBufferRef;
 
@@ -96,9 +101,103 @@ namespace rkmpp {
    *
    * SUNSHINE_RKMPP_PIPELINE: "auto" (default), "1" force on, "0" force off.
    */
-  bool want_pipelined_encode(int width, int height, int fps);
+  bool want_pipelined_encode(int width, int height, double fps);
 
   /// Set by the encoder setup for the session it just built; the capture
   /// path reads it to hold buffer leases while the encoder still reads them.
   void set_pipelined_encode(bool on);
+
+  // ---- source-rate following (capture box) ----
+  //
+  // A client's requested frame rate says what it can display, not what the
+  // console sends: Moonlight asks for 120 while a PS5 sends 59.94. Built for
+  // the request, the encoder pipelines four 4K frames for a rate that never
+  // arrives (54 ms host latency where 19 ms is possible) and budgets bits for
+  // twice the frames it gets. So on the daemon path the encoder is sized for
+  // the SOURCE: its rate as the capture spec defines it (CTA-861's N or
+  // N*1000/1001), decimated by a whole factor when the client asked for less.
+  // The plan follows the source across mode switches without reopening the
+  // encoder or cutting the stream (see live_encode_rate()).
+
+  /**
+   * @brief How a session feeds the encoder.
+   */
+  struct encode_rate_t {
+    AVRational source {0, 1};  ///< the source's spec rate; 0/1 = unknown
+    AVRational rate {0, 1};  ///< exact rate frames reach the encoder; 0/1 = unknown
+    int decimation {1};  ///< encode every Nth new source frame (source faster than the request)
+  };
+
+  /**
+   * @brief The spec rate behind a measured refresh rate.
+   *
+   * The receiver measures the pixel clock, so a 60000/1001 signal reads as
+   * 59.941 and a 60 Hz one as 60.002. Snaps to the nearest CTA-861 / CVT
+   * rate — an integer N or its N*1000/1001 twin — when the measurement is
+   * within 0.04% of it (the two families sit 0.1% apart); anything else is
+   * kept at the measurement's own millihertz resolution.
+   *
+   * @param fps Measured refresh rate, Hz.
+   * @return The exact rate, or 0/1 for a non-positive input.
+   */
+  AVRational snap_source_rate(double fps);
+
+  /**
+   * @brief Plan the encode rate for a requested and a source rate.
+   *
+   * A source no faster than the request is encoded frame for frame at its
+   * own rate. A faster one is decimated by the smallest whole factor that
+   * brings it to or under the request (119.88 for a 60 request -> every 2nd
+   * frame, 59.94 exactly), never by a fraction, which would judder. A source
+   * within 1% above the request counts as equal: the 0.1% between 60 and
+   * 59.94 is a clock, not a rate to halve.
+   *
+   * @param requested The client's requested rate.
+   * @param source The source's spec rate, 0/1 if unknown.
+   * @return The plan; rate 0/1 when the source is unknown.
+   */
+  encode_rate_t plan_encode_rate(AVRational requested, AVRational source);
+
+  /**
+   * @brief The source's spec rate right now, from the daemon's STATUS.
+   *
+   * One STATUS-role round trip (sub-millisecond; no consumer slot). 0/1
+   * when not a capture box, the daemon is absent, or the input is unlocked.
+   */
+  AVRational daemon_source_rate();
+
+  /**
+   * @brief Start a session's source-rate following.
+   *
+   * Called by the encoder setup before the capture connects. Resets the
+   * live state; the capture path re-plans with `requested` whenever the
+   * source re-locks.
+   *
+   * @param requested The client's requested rate.
+   * @param plan The plan the encoder was opened with.
+   */
+  void begin_encode_rate(AVRational requested, const encode_rate_t &plan);
+
+  /**
+   * @brief Live source-rate state for the encode loop, one read per frame.
+   */
+  struct live_rate_t {
+    std::uint64_t generation {};  ///< changes whenever `plan` does
+    encode_rate_t plan;  ///< what the encoder should run at now
+    bool signal_lost {};  ///< the frame about to be encoded is a signal-loss re-emission
+    bool fresh {};  ///< the frame about to be encoded is new content
+  };
+
+  /**
+   * @brief Read the live state (atomics; a mutex only when the plan moved).
+   */
+  live_rate_t live_encode_rate();
+
+  /**
+   * @brief Period of the encoded frame cadence, ms: the source period times
+   *        the decimation. Zero until the source rate is known.
+   *
+   * kmsgrab's capture tick oversamples this rather than the client's rate.
+   */
+  double daemon_encode_period_ms();
 }  // namespace rkmpp

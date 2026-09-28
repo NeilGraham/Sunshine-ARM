@@ -530,6 +530,9 @@ namespace video {
 
     std::deque<inflight_frame_t> inflight;  ///< Frames in the encoder, oldest first (pipelined rkmpp holds several).
     bool pipelined = false;  ///< rkmpp opened without LOW_DELAY: frames overlap across the VEPU cores.
+    bool rate_follow = false;  ///< rkmpp capture box: encoder rate and pipelining follow the source (rkmpp.h).
+    std::uint64_t rate_generation = 0;  ///< rkmpp::live_encode_rate() generation last applied.
+    int64_t pts_skip = 0;  ///< Frame numbers taken by drain calls, subtracted so the pts (the client's frame index) stays gapless.
 
     cbs::nal_t sps;  ///< Original and rewritten sequence parameter set for IDR injection.
     cbs::nal_t vps;  ///< Original and rewritten HEVC video parameter set for IDR injection.
@@ -2123,6 +2126,29 @@ namespace video {
     }
   }  // namespace fanout
 
+  /**
+   * @brief Whether an encoder follows the capture source's frame rate.
+   *
+   * rkmpp on a capture box (SUNSHINE_RKMPP_V4L2) only: the encoder is sized
+   * for the console's spec rate rather than the client's request, and
+   * re-sized live at every re-lock (rkmpp.h). SUNSHINE_RKMPP_RATE_FOLLOW=0|off
+   * restores sizing by the request, for A/B measurement.
+   *
+   * @param encoder Encoder about to be opened.
+   * @return True when the session should follow the source rate.
+   */
+  static bool rkmpp_rate_follow_enabled(const encoder_t &encoder) {
+#ifdef SUNSHINE_BUILD_RKMPP
+    static const bool disabled = [] {
+      const char *env = std::getenv("SUNSHINE_RKMPP_RATE_FOLLOW");
+      return env && (std::string_view {env} == "0" || std::string_view {env} == "off");
+    }();
+    return !disabled && encoder.name == "rkmpp"sv && std::getenv("SUNSHINE_RKMPP_V4L2") != nullptr;
+#else
+    return false;
+#endif
+  }
+
   bool shared_fanout_active() {
     // SUNSHINE_SHARED_FANOUT=0|off forces the upstream one-encoder-per-client
     // path for A/B measurement (a second client then finds the daemon BUSY).
@@ -2146,9 +2172,57 @@ namespace video {
    */
   int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp, std::optional<platf::frame_trace_t> frame_trace) {
     auto &frame = session.device->frame;
-    frame->pts = frame_nr;
-
     auto &ctx = session.avcodec_ctx;
+
+    // SOURCE-RATE FOLLOWING (rkmpp.h; capture box only). Two live moves;
+    // neither reopens the encoder or drops new content. (A frame-rate change
+    // does make MPP start a new GOP — one keyframe, measured 2026-09-28 — as
+    // it rewrites the stream timing; it lands on the re-lock, where the
+    // picture changes anyway.)
+    //
+    //  1. The capture path re-planned at a re-lock (the console changed mode):
+    //     set the new rate on the context — the patched hevc_rkmpp re-applies
+    //     rate control on its next frame — and switch between single-frame
+    //     (LOW_DELAY) and pipelined encoding for the new rate.
+    //
+    //  2. While the source is lost (the daemon re-emitting the held picture,
+    //     flagged SIGNAL_LOST), drain a pipelined encoder down to nothing on
+    //     those duplicates, and encode single-frame until the re-lock. A
+    //     120 -> 60 switch then starts at single-frame latency instead of
+    //     keeping the 4-frame queue (a pipelined encoder returns one packet
+    //     per frame submitted, so its depth never shrinks on its own). A drain
+    //     call submits nothing and takes back the oldest in-flight packet;
+    //     it is only made on a picture the stream already carries.
+    bool drain = false;
+    bool hold_single = false;
+#ifdef SUNSHINE_BUILD_RKMPP
+    if (session.rate_follow) {
+      const auto live = rkmpp::live_encode_rate();
+      if (live.generation != session.rate_generation) {
+        session.rate_generation = live.generation;
+        const auto &rate = live.plan.rate;
+        if (rate.num > 0 && av_cmp_q(rate, ctx->framerate)) {
+          const bool pipelined = rkmpp::want_pipelined_encode(ctx->width, ctx->height, av_q2d(rate));
+          BOOST_LOG(info) << "RKMPP: encoder now "sv << rate.num << '/' << rate.den << " fps (was "sv
+                          << ctx->framerate.num << '/' << ctx->framerate.den << "), "sv
+                          << (pipelined ? "pipelined across both VEPU cores"sv : "single-frame (LOW_DELAY)"sv)
+                          << " — live, no reopen"sv;
+          ctx->framerate = rate;
+          session.pipelined = pipelined;
+        }
+      }
+      hold_single = live.signal_lost;
+      const bool single = !session.pipelined || hold_single;
+      drain = !live.fresh && single && !session.inflight.empty() &&
+              !(frame->flags & AV_FRAME_FLAG_KEY);
+    }
+#endif
+
+    // Frames skipped by a drain take no number: the pts IS the frame index the
+    // client sees (packet_raw_avcodec::frame_index), and a gap there reads as
+    // a lost frame and costs an IDR request.
+    frame_nr -= session.pts_skip;
+    frame->pts = frame_nr;
 
     auto &sps = session.sps;
     auto &vps = session.vps;
@@ -2161,64 +2235,102 @@ namespace video {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
     };
-    if (frame_trace) {
-      frame_trace->encode_submit_ns = trace_now_ns();
-    }
+    int ret;
+    if (drain) {
+      // Drain request (see the top of this function): the patched hevc_rkmpp
+      // takes this flag as "hand back the oldest in-flight packet, encode
+      // nothing". It never reaches the inflight queue — the packet that comes
+      // back is matched to its own frame by pts below — and it takes no frame
+      // number. The flag must not outlive the call: the wrapper is reused.
+      frame->flags |= AV_FRAME_FLAG_DISCARD;
+      ret = avcodec_send_frame(ctx.get(), frame);
+      frame->flags &= ~AV_FRAME_FLAG_DISCARD;
+      if (ret < 0) {
+        char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+        BOOST_LOG(error) << "Could not send a drain request: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
+        return -1;
+      }
+      ++session.pts_skip;
+    } else {
+      if (frame_trace) {
+        frame_trace->encode_submit_ns = trace_now_ns();
+      }
 
-    // send the frame to the encoder
-    // A pipelined encoder hands back frame N's packet while encoding N+1, so
-    // the capture stamp and trace travel with the frame number rather than
-    // with the call. With a blocking encoder the packet is always this
-    // frame's and the queue never holds more than one entry.
-    session.inflight.push_back({frame_nr, frame_timestamp, frame_trace});
-    while (session.inflight.size() > 16) {
-      session.inflight.pop_front();
-    }
+      // send the frame to the encoder
+      // A pipelined encoder hands back frame N's packet while encoding N+1, so
+      // the capture stamp and trace travel with the frame number rather than
+      // with the call. With a blocking encoder the packet is always this
+      // frame's and the queue never holds more than one entry.
+      session.inflight.push_back({frame_nr, frame_timestamp, frame_trace});
+      while (session.inflight.size() > 16) {
+        session.inflight.pop_front();
+      }
 
-    // Pipelined rkmpp: keep the queue at a FIXED depth, never deeper. hevc_rkmpp
-    // hands back at most one packet per submitted frame, so whatever depth
-    // the queue reaches at startup it keeps for the whole session — measured:
-    // it settles at 4 frames, 33.6 ms of added delay at 120 Hz. hevc_rkmpp
-    // picks a blocking or a non-blocking packet wait per call from LOW_DELAY,
-    // so: once the queue holds `depth` frames, wait for the oldest one's
-    // packet; below that, do not wait at all. SUNSHINE_RKMPP_PIPELINE_DEPTH
-    // (2-8, default 4).
-    if (session.pipelined) {
-      // Frames allowed in the encoder, the one being submitted included.
-      // Measured at 4K120 (tests/stream FINDING 55): depth 2 runs serial
-      // again (67 fps); depth 3 holds 120 fps but releases packets unevenly
-      // (arrival p90 13 ms, 504 client drops in 2 min); depth 4 is steady
-      // (host latency p50 25 ms, arrival p99 11.3 ms). 4 is the default.
-      static const std::size_t depth = [] {
-        const char *env = std::getenv("SUNSHINE_RKMPP_PIPELINE_DEPTH");
-        const int v = env && *env ? std::atoi(env) : 4;
-        return (std::size_t) (v >= 2 && v <= 8 ? v : 4);
-      }();
-      if (session.inflight.size() >= depth) {
+      // Pipelined rkmpp: keep the queue at a FIXED depth, never deeper. hevc_rkmpp
+      // hands back at most one packet per submitted frame, so whatever depth
+      // the queue reaches at startup it keeps for the whole session — measured:
+      // it settles at 4 frames, 33.6 ms of added delay at 120 Hz. hevc_rkmpp
+      // picks a blocking or a non-blocking packet wait per call from LOW_DELAY,
+      // so: once the queue holds `depth` frames, wait for the oldest one's
+      // packet; below that, do not wait at all. SUNSHINE_RKMPP_PIPELINE_DEPTH
+      // (2-8, default 4).
+      if (session.pipelined && !hold_single) {
+        // Frames allowed in the encoder, the one being submitted included.
+        // Measured at 4K120 (tests/stream FINDING 55): depth 2 runs serial
+        // again (67 fps); depth 3 holds 120 fps but releases packets unevenly
+        // (arrival p90 13 ms, 504 client drops in 2 min); depth 4 is steady
+        // (host latency p50 25 ms, arrival p99 11.3 ms). 4 is the default.
+        static const std::size_t depth = [] {
+          const char *env = std::getenv("SUNSHINE_RKMPP_PIPELINE_DEPTH");
+          const int v = env && *env ? std::atoi(env) : 4;
+          return (std::size_t) (v >= 2 && v <= 8 ? v : 4);
+        }();
+        if (session.inflight.size() >= depth) {
+          ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        } else {
+          ctx->flags &= ~AV_CODEC_FLAG_LOW_DELAY;
+        }
+      } else if (session.rate_follow) {
+        // Single-frame: this call blocks for this frame's own packet. (A
+        // session that opened single-frame already has the flag; one that
+        // followed the source down from pipelined, or is riding out a signal
+        // loss, needs it back.)
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-      } else {
-        ctx->flags &= ~AV_CODEC_FLAG_LOW_DELAY;
+      }
+
+      ret = avcodec_send_frame(ctx.get(), frame);
+      if (ret < 0) {
+        char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+        BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
+
+        return -1;
       }
     }
 
-    auto ret = avcodec_send_frame(ctx.get(), frame);
-    if (ret < 0) {
-      char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
-      BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
-
-      return -1;
-    }
-
+    bool got_packet = false;
     while (ret >= 0) {
       auto packet = std::make_unique<packet_raw_avcodec>();
       auto av_packet = packet.get()->av_packet;
 
       ret = avcodec_receive_packet(ctx.get(), av_packet);
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        if (drain && !got_packet) {
+          // The encoder had nothing in flight after all: our queue is stale.
+          // Forget it, so the next held frame is encoded instead of being
+          // taken for another drain.
+          BOOST_LOG(debug) << "RKMPP: drain found the encoder empty; dropping "sv << session.inflight.size()
+                           << " stale in-flight entries"sv;
+          session.inflight.clear();
+        }
+        if (drain && session.inflight.empty()) {
+          BOOST_LOG(info) << "RKMPP: pipeline drained to single-frame on held frames ("sv << session.pts_skip
+                          << " drain calls this session)"sv;
+        }
         return 0;
       } else if (ret < 0) {
         return ret;
       }
+      got_packet = true;
 
       if (av_packet->flags & AV_PKT_FLAG_KEY) {
         BOOST_LOG(debug) << "Frame "sv << frame_nr << ": IDR Keyframe (AV_FRAME_FLAG_KEY)"sv;
@@ -2394,6 +2506,29 @@ namespace video {
                   (colorspace.bit_depth == 10 && config.chromaSamplingType == 1) ? platform_formats->avcodec_pix_fmt_yuv444_10bit :
                                                                                    AV_PIX_FMT_NONE;
 
+    // The rate the encoder is built for. The client's request everywhere but a
+    // capture box, where it is the SOURCE's spec rate (rkmpp.h): a client
+    // asking for 120 from a 59.94 Hz console gets an encoder planned for
+    // 60000/1001 — single-frame (LOW_DELAY) encoding instead of a four-frame
+    // pipeline waiting on frames that never come, and a per-frame bit budget
+    // for the frames that do. The capture path re-plans at every re-lock and
+    // encode_avcodec() applies it live.
+    const AVRational requested_fps = video::framerate_to_rational(config);
+    AVRational encode_fps = requested_fps;
+    const bool rate_follow = rkmpp_rate_follow_enabled(encoder);
+#ifdef SUNSHINE_BUILD_RKMPP
+    if (rate_follow) {
+      const auto plan = rkmpp::plan_encode_rate(requested_fps, rkmpp::daemon_source_rate());
+      rkmpp::begin_encode_rate(requested_fps, plan);
+      if (plan.rate.num > 0) {
+        encode_fps = plan.rate;
+      }
+      BOOST_LOG(info) << "RKMPP: client asked "sv << av_q2d(requested_fps) << " fps; source "sv
+                      << (plan.source.num > 0 ? std::to_string(av_q2d(plan.source)) : "unknown (plans at first light)"s)
+                      << "; encoder opened at "sv << encode_fps.num << '/' << encode_fps.den;
+    }
+#endif
+
     // Allow up to 1 retry to apply the set of fallback options.
     //
     // Note: If we later end up needing multiple sets of
@@ -2412,7 +2547,7 @@ namespace video {
       }
 #endif
       ctx->height = config.height;
-      const AVRational fps = video::framerate_to_rational(config);
+      const AVRational fps = encode_fps;
       ctx->framerate = fps;
       ctx->time_base = AVRational {fps.den, fps.num};
 
@@ -2472,12 +2607,11 @@ namespace video {
       // Above the one-core budget (4K60) hevc_rkmpp only keeps up pipelined;
       // see rkmpp::want_pipelined_encode().
       if (encoder.name == "rkmpp"sv) {
-        const int fps_int = fps.den ? (fps.num + fps.den - 1) / fps.den : 0;
-        low_delay = !rkmpp::want_pipelined_encode(ctx->width, ctx->height, fps_int);
+        low_delay = !rkmpp::want_pipelined_encode(ctx->width, ctx->height, av_q2d(fps));
         rkmpp::set_pipelined_encode(!low_delay);
         if (!low_delay) {
           BOOST_LOG(info) << "RKMPP: pipelined encode (no LOW_DELAY) for "sv << ctx->width << 'x'
-                          << ctx->height << '@' << fps_int << " — both VEPU cores in flight"sv;
+                          << ctx->height << '@' << av_q2d(fps) << " — both VEPU cores in flight"sv;
         }
       }
 #endif
@@ -2644,6 +2778,10 @@ namespace video {
           ctx->rc_buffer_size = bitrate / ((config.framerate * 10) / 15);
         } else {
           ctx->rc_buffer_size = bitrate / config.framerate;
+          if (rate_follow) {
+            // One frame's worth at the rate frames actually arrive.
+            ctx->rc_buffer_size = (int) av_rescale(bitrate, encode_fps.den, encode_fps.num);
+          }
 
 #ifndef __APPLE__
           if (encoder.name == "nvenc" && config::video.nv_legacy.vbv_percentage_increase > 0) {
@@ -2754,6 +2892,12 @@ namespace video {
       config.videoFormat <= 1 ? (1 - static_cast<int>(video_format[encoder_t::VUI_PARAMETERS])) * (1 + config.videoFormat) : 0
     );
     session->pipelined = pipelined;
+#ifdef SUNSHINE_BUILD_RKMPP
+    session->rate_follow = rate_follow;
+    if (rate_follow) {
+      session->rate_generation = rkmpp::live_encode_rate().generation;
+    }
+#endif
 
     return session;
   }
@@ -2845,7 +2989,30 @@ namespace video {
     // set max frame time based on client-requested target framerate.
     double minimum_fps_target = (config::video.minimum_fps_target > 0.0) ? config::video.minimum_fps_target : (config.framerate / 2);
     std::chrono::duration<double, std::milli> max_frametime {1000.0 / minimum_fps_target};
+    // Following the source (rkmpp.h), "half the client's rate" becomes half
+    // the rate frames actually arrive at — the same rule, applied to the
+    // cadence that exists — and it moves with the source at each re-lock.
+    // An explicit minimum_fps_target in the config still wins.
+    std::uint64_t min_fps_generation = 0;
+    const bool min_fps_follows = config::video.minimum_fps_target <= 0.0 && rkmpp_rate_follow_enabled(encoder);
+    auto follow_min_fps = [&] {
+#ifdef SUNSHINE_BUILD_RKMPP
+      if (!min_fps_follows) {
+        return;
+      }
+      const auto live = rkmpp::live_encode_rate();
+      if (live.generation == min_fps_generation || live.plan.rate.num <= 0) {
+        return;
+      }
+      min_fps_generation = live.generation;
+      minimum_fps_target = av_q2d(live.plan.rate) / 2;
+      max_frametime = std::chrono::duration<double, std::milli> {1000.0 / minimum_fps_target};
+      BOOST_LOG(info) << "Frame wait target set to "sv << minimum_fps_target << "fps ("sv << max_frametime.count()
+                      << "ms), from the source rate"sv;
+#endif
+    };
     BOOST_LOG(info) << "Frame wait target set to "sv << minimum_fps_target << "fps ("sv << max_frametime.count() << "ms)"sv;
+    follow_min_fps();
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     // Shared-encoder platforms queue video on the SESSION mailbox: stream.cpp
@@ -2894,6 +3061,8 @@ namespace video {
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
       std::optional<platf::frame_trace_t> frame_trace;
+
+      follow_min_fps();
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
