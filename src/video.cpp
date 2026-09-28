@@ -2174,8 +2174,11 @@ namespace video {
     auto &frame = session.device->frame;
     auto &ctx = session.avcodec_ctx;
 
-    // SOURCE-RATE FOLLOWING (rkmpp.h; capture box only). Two live moves, and
-    // neither reopens the encoder, forces a keyframe or drops new content:
+    // SOURCE-RATE FOLLOWING (rkmpp.h; capture box only). Two live moves;
+    // neither reopens the encoder or drops new content. (A frame-rate change
+    // does make MPP start a new GOP — one keyframe, measured 2026-09-28 — as
+    // it rewrites the stream timing; it lands on the re-lock, where the
+    // picture changes anyway.)
     //
     //  1. The capture path re-planned at a re-lock (the console changed mode):
     //     set the new rate on the context — the patched hevc_rkmpp re-applies
