@@ -6,6 +6,7 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
 #include <string_view>
 
 // local includes
@@ -40,6 +41,7 @@ namespace video {
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
     int rsCaps {0};  ///< retro-stream client capabilities (RS_CAP_*), from the launch request's `rsCaps`.
+    std::uint64_t clientKey {0};  ///< Stable per paired client (a hash of its certificate); 0 = unknown.
   };
 
   /**

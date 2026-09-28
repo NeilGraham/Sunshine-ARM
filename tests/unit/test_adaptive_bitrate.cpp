@@ -46,6 +46,8 @@ TEST(AdaptiveBitrateMode, CeilingFollowsTheSourceMode) {
   // The same mode as requested keeps the full bitrate, and a bigger or faster
   // mode never raises it.
   EXPECT_EQ(abr::mode_ceiling_bps(80 * mbps, 3840, 2160, 60, 3840, 2160, 60), 80 * mbps);
+  // 59.94 for a 60 request is a clock, not a mode: the full bitrate.
+  EXPECT_EQ(abr::mode_ceiling_bps(80 * mbps, 3840, 2160, 60, 3840, 2160, 60000.0 / 1001), 80 * mbps);
   EXPECT_EQ(abr::mode_ceiling_bps(20 * mbps, 1920, 1080, 60, 3840, 2160, 120), 20 * mbps);
   // A PS3 at 720p60 on that session: an eighth-ish, not all of it.
   const auto ps3 = abr::mode_ceiling_bps(80 * mbps, 3840, 2160, 120, 1280, 720, 60000.0 / 1001);
@@ -140,6 +142,59 @@ TEST_F(AdaptiveBitrateTest, KeyframeRequestsInGraceAreNotLoss) {
   ctl.on_keyframe_request(now);
   now += 16ms;
   EXPECT_LT(ctl.update(now), 40 * mbps);
+}
+
+TEST_F(AdaptiveBitrateTest, ACeilingRiseResumesAtTheKnee) {
+  // 4K on Wi-Fi: backs off from 22 to ~15, climbs back to a 1080p ceiling
+  // of 5.5 after the console drops to 1080p...
+  ctl.begin(22 * mbps, 4 * mbps, t0);
+  auto now = t0;
+  ctl.on_frame_loss(false, now);
+  now += 16ms;
+  ctl.update(now);
+  const auto knee = 22 * mbps;
+  ctl.set_ceiling(5 * mbps, now);
+  EXPECT_LT(ctl.target(), 5 * mbps);
+  run(now, 10s);
+  EXPECT_EQ(ctl.target(), 5 * mbps);
+  // ...and when 4K returns 12 s after the back-off, resumes at the knee it
+  // broke at, not above it (here the knee IS the old ceiling, so the rise is
+  // capped at it only when it is below the new ceiling).
+  ctl.set_ceiling(30 * mbps, now);
+  EXPECT_EQ(ctl.target(), knee);
+}
+
+TEST_F(AdaptiveBitrateTest, ALateCeilingRiseGoesToTheCeiling) {
+  // Long after a back-off (past knee_memory), a rise goes straight to the
+  // new ceiling: the link has been proven since.
+  ctl.begin(22 * mbps, 4 * mbps, t0);
+  auto now = t0;
+  ctl.on_frame_loss(false, now);
+  now += 16ms;
+  ctl.update(now);
+  EXPECT_EQ(run(now, 40s), 22 * mbps);
+  ctl.set_ceiling(5 * mbps, now);
+  EXPECT_EQ(ctl.target(), 5 * mbps);
+  run(now, 5s);
+  ctl.set_ceiling(22 * mbps, now);
+  EXPECT_EQ(ctl.target(), 22 * mbps);
+}
+
+TEST_F(AdaptiveBitrateTest, StartAtALearnedRate) {
+  ctl.begin(22 * mbps, 3 * mbps, t0);
+  ctl.start_at(6 * mbps, t0);
+  EXPECT_EQ(ctl.target(), 6 * mbps);
+  auto now = t0;
+  // Held briefly, then probes upward in small steps.
+  EXPECT_EQ(run(now, 1s), 6 * mbps);
+  const auto later = run(now, 5s);
+  EXPECT_GT(later, 6 * mbps);
+  EXPECT_LT(later, 22 * mbps);
+  // A learned rate at or above the ceiling changes nothing.
+  abr::controller_t other;
+  other.begin(10 * mbps, 3 * mbps, t0);
+  other.start_at(12 * mbps, t0);
+  EXPECT_EQ(other.target(), 10 * mbps);
 }
 
 TEST_F(AdaptiveBitrateTest, CeilingMovesCarryTheBackOff) {

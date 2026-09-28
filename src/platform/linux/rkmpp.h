@@ -190,8 +190,10 @@ namespace rkmpp {
    *
    * @param requested The client's requested rate.
    * @param plan The plan the encoder was opened with.
+   * @param source_width The source's geometry the plan was made from (0 = unknown).
+   * @param source_height
    */
-  void begin_encode_rate(AVRational requested, const encode_rate_t &plan);
+  void begin_encode_rate(AVRational requested, const encode_rate_t &plan, int source_width = 0, int source_height = 0);
 
   /**
    * @brief Live source-rate state for the encode loop, one read per frame.

@@ -1237,11 +1237,11 @@ namespace rkmpp {
     return g_encode_at_pool.load(std::memory_order_relaxed);
   }
 
-  void begin_encode_rate(AVRational requested, const encode_rate_t &plan) {
+  void begin_encode_rate(AVRational requested, const encode_rate_t &plan, int source_width, int source_height) {
     std::lock_guard lk(rate_state::mu);
     rate_state::requested = requested;
-    rate_state::source_w = 0;
-    rate_state::source_h = 0;
+    rate_state::source_w = source_width;
+    rate_state::source_h = source_height;
     rate_state::signal_lost.store(false, std::memory_order_relaxed);
     rate_state::fresh.store(false, std::memory_order_relaxed);
     publish_plan_locked(plan);

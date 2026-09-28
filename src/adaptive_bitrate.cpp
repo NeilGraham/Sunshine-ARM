@@ -10,6 +10,7 @@
 #include <cmath>
 #include <iterator>
 #include <mutex>
+#include <unordered_map>
 
 // ABR_POLICY_ONLY builds just the policy (the controller and the mode math)
 // for a standalone test, without Sunshine's logging.
@@ -61,6 +62,10 @@ namespace abr {
     if (requested_default <= 0.0) {
       return requested_bps;
     }
+    // 59.94 against a requested 60 is the source's clock, not a slower mode.
+    if (std::abs(fps - req_fps) <= req_fps * 0.01) {
+      fps = req_fps;
+    }
     const double ratio = std::clamp(moonlight_default_kbps(width, height, fps) / requested_default, 0.05, 1.0);
     return (std::int64_t) std::llround((double) requested_bps * ratio);
   }
@@ -75,12 +80,31 @@ namespace abr {
     target_ = ceiling_;
     knee_ = ceiling_;
     pending_recovered_ = pending_lost_ = pending_keyframe_requests_ = 0;
+    last_knee_bps_ = 0;
+    last_knee_at_ = {};
+    held_bps_ = 0;
     grace_until_ = now;
     last_decrease_ = {};
     last_step_ = now;
     hold_until_ = now;
     window_ = {};
     window_.low_bps = target_;
+  }
+
+  void controller_t::start_at(std::int64_t bps, clock::time_point now) {
+    const auto start = std::clamp(bps, floor_, ceiling_);
+    if (start >= ceiling_) {
+      return;
+    }
+    // As if the link had just broken at this rate: probe past it slowly.
+    target_ = start;
+    knee_ = start;
+    held_bps_ = start;
+    last_knee_bps_ = start;
+    last_knee_at_ = now;
+    last_step_ = now;
+    hold_until_ = now + hold_after_loss;
+    window_.low_bps = std::min(window_.low_bps, target_);
   }
 
   void controller_t::set_ceiling(std::int64_t ceiling_bps, clock::time_point now) {
@@ -92,10 +116,18 @@ namespace abr {
     // Keep a backed-off target the same share below the new ceiling: the
     // link did not get better or worse because the console changed mode.
     const double share = (double) target_ / (double) ceiling_;
+    const bool rising = ceiling_bps > ceiling_;
     ceiling_ = ceiling_bps;
     floor_ = std::min(floor_, ceiling_);
     target_ = unconstrained ? ceiling_ : std::clamp<std::int64_t>((std::int64_t) (share * ceiling_), floor_, ceiling_);
     knee_ = std::min(knee_, ceiling_);
+    if (rising && unconstrained && last_knee_bps_ > 0 && now - last_knee_at_ < knee_memory && last_knee_bps_ < target_) {
+      // The link broke at last_knee_bps_ moments ago; a bigger picture does
+      // not make it faster. Resume there and probe upward.
+      target_ = std::max(floor_, last_knee_bps_);
+      knee_ = target_;
+      hold_until_ = std::max(hold_until_, now + step_spacing);
+    }
     last_step_ = now;
     window_.low_bps = std::min(window_.low_bps, target_);
   }
@@ -143,7 +175,10 @@ namespace abr {
         const std::int64_t bound = severe ? floor_ : std::max(floor_, (std::int64_t) (ceiling_ * mild_limit));
         if (target_ > bound) {
           knee_ = target_;
+          last_knee_bps_ = target_;
+          last_knee_at_ = now;
           target_ = std::max(bound, (std::int64_t) (target_ * (severe ? severe_factor : mild_factor)));
+          held_bps_ = target_;
           last_decrease_ = now;
           ++window_.decreases;
         }
@@ -176,30 +211,66 @@ namespace abr {
     controller_t ctl;  // under mu
     std::int64_t last_logged_bps = 0;  // under mu
     clock::time_point window_start;  // under mu
+    std::uint64_t session_client = 0;  // under mu
+
+    // Per paired client: the rate its link held when its last session ended
+    // (only for sessions that had to back off). Process lifetime only.
+    struct remembered_t {
+      std::int64_t bps;
+      clock::time_point at;
+    };
+
+    std::unordered_map<std::uint64_t, remembered_t> remembered;  // under mu
+    constexpr auto remember_for = std::chrono::minutes(30);
 
     double mbps(std::int64_t bps) {
       return std::round(bps / 100000.0) / 10.0;
     }
   }  // namespace
 
-  void session_begin(bool enabled, std::int64_t ceiling_bps, std::int64_t floor_bps) {
+  std::int64_t session_begin(bool enabled, std::int64_t ceiling_bps, std::int64_t floor_bps, std::uint64_t client_key) {
     std::lock_guard lk(mu);
     active = enabled;
     if (!enabled) {
-      return;
+      return 0;
     }
     const auto now = clock::now();
     ctl.begin(ceiling_bps, floor_bps, now);
+    session_client = client_key;
+    std::int64_t learned = 0;
+    if (client_key) {
+      if (auto it = remembered.find(client_key); it != remembered.end()) {
+        if (now - it->second.at < remember_for) {
+          learned = it->second.bps;
+          ctl.start_at(learned, now);
+        } else {
+          remembered.erase(it);
+        }
+      }
+    }
     // The client's own first keyframe requests are the stream starting.
     ctl.grace_until(now + 3s);
     last_logged_bps = ctl.target();
     window_start = now;
     BOOST_LOG(info) << "Dynamic bitrate: "sv << mbps(ctl.ceiling()) << " Mbps ceiling, "sv << mbps(ctl.floor())
                     << " Mbps floor; backing off on packet loss"sv;
+    if (learned && ctl.target() < ctl.ceiling()) {
+      BOOST_LOG(info) << "Dynamic bitrate: this client's link held "sv << mbps(learned)
+                      << " Mbps last session; starting there and probing up"sv;
+    }
+    return ctl.target();
   }
 
   void session_end() {
     std::lock_guard lk(mu);
+    if (active && session_client) {
+      // Remember a link that had to back off; forget one that never did.
+      if (const auto held = ctl.held_bps(); held > 0) {
+        remembered[session_client] = {std::min(held, ctl.target()), clock::now()};
+      } else {
+        remembered.erase(session_client);
+      }
+    }
     active = false;
   }
 

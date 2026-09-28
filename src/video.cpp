@@ -2678,7 +2678,7 @@ namespace video {
       source_width = mode.width;
       source_height = mode.height;
       const auto plan = rkmpp::plan_encode_rate(requested_fps, mode.rate);
-      rkmpp::begin_encode_rate(requested_fps, plan);
+      rkmpp::begin_encode_rate(requested_fps, plan, mode.width, mode.height);
       if (rate_follow && plan.rate.num > 0) {
         encode_fps = plan.rate;
       }
@@ -3169,7 +3169,7 @@ namespace video {
       const std::int64_t floor_bps = config::video.dynamic_bitrate_min > 0 ?
                                        (std::int64_t) config::video.dynamic_bitrate_min * 1000 :
                                        abr::auto_floor_bps(av->requested_bps);
-      abr::session_begin(true, av->avcodec_ctx->bit_rate, floor_bps);
+      abr::session_begin(true, av->avcodec_ctx->bit_rate, floor_bps, config.clientKey);
       abr_running = true;
     }
     auto abr_guard = util::fail_guard([abr_running] {

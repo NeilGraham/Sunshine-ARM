@@ -74,9 +74,21 @@ namespace abr {
 
     void begin(std::int64_t ceiling_bps, std::int64_t floor_bps, clock::time_point now);
 
+    /// Start below the ceiling, at a rate this client's link held last time
+    /// (it then climbs past it in small probes, as after any loss).
+    void start_at(std::int64_t bps, clock::time_point now);
+
+    /// The rate the link last held after backing off (the target a back-off
+    /// settled on), 0 if this session never backed off.
+    std::int64_t held_bps() const {
+      return held_bps_;
+    }
+
     /// The mode-scaled ceiling moved (the source re-locked in another mode, or
-    /// the stream changed size). An unconstrained target follows it; a
-    /// backed-off one keeps its distance below.
+    /// the stream changed size). An unconstrained target follows it, except
+    /// that a rise shortly after a back-off resumes from the rate that broke
+    /// rather than above it (the link did not get faster because the console
+    /// changed mode); a backed-off target keeps its distance below.
     void set_ceiling(std::int64_t ceiling_bps, clock::time_point now);
 
     /// Keyframe requests before `until` are not loss: the encoder itself just
@@ -116,12 +128,16 @@ namespace abr {
     static constexpr double mild_limit = 0.50;  ///< FEC-only loss never pushes below this share of the ceiling
     static constexpr double fast_step = 1.08;  ///< climbing back toward the rate that broke
     static constexpr double probe_step = 0.02;  ///< share of the ceiling added per step past it
+    static constexpr auto knee_memory = std::chrono::seconds(30);  ///< how long a back-off's knee caps a ceiling rise
 
   private:
     std::int64_t ceiling_ {};
     std::int64_t floor_ {};
     std::int64_t target_ {};
     std::int64_t knee_ {};  ///< the target when loss last started
+    std::int64_t last_knee_bps_ {};  ///< absolute knee of the latest back-off, for ceiling rises
+    clock::time_point last_knee_at_ {};
+    std::int64_t held_bps_ {};  ///< what the latest back-off settled on
     int pending_recovered_ {};
     int pending_lost_ {};
     int pending_keyframe_requests_ {};
@@ -137,8 +153,15 @@ namespace abr {
   /**
    * @brief Start adapting for a session. `enabled` false leaves tick() at 0
    *        (the caller keeps the requested bitrate) and ignores the signals.
+   *
+   * @param client_key Identifies the paired client (0 = unknown). A client
+   *        whose previous session (within 30 minutes) had to back off starts
+   *        at the rate its link held then, instead of relearning it through
+   *        dropped frames; one whose previous session never lost a packet
+   *        starts at the ceiling.
+   * @return The target the session starts at.
    */
-  void session_begin(bool enabled, std::int64_t ceiling_bps, std::int64_t floor_bps);
+  std::int64_t session_begin(bool enabled, std::int64_t ceiling_bps, std::int64_t floor_bps, std::uint64_t client_key = 0);
 
   /// Stop adapting (the session ended).
   void session_end();
