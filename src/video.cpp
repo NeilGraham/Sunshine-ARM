@@ -2319,6 +2319,10 @@ namespace video {
                            << " stale in-flight entries"sv;
           session.inflight.clear();
         }
+        if (drain && session.inflight.empty()) {
+          BOOST_LOG(info) << "RKMPP: pipeline drained to single-frame on held frames ("sv << session.pts_skip
+                          << " drain calls this session)"sv;
+        }
         return 0;
       } else if (ret < 0) {
         return ret;
