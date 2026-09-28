@@ -1244,6 +1244,11 @@ namespace rtsp_stream {
       }
       config.audio.flags[audio::config_t::CUSTOM_SURROUND_PARAMS] = valid;
     }
+    config.monitor.rsCaps = session.rs_caps;
+    if (session.rs_caps) {
+      BOOST_LOG(info) << "Client declared retro-stream capabilities "sv << session.rs_caps;
+    }
+
     if (session.continuous_audio) {
       BOOST_LOG(info) << "Client requested continuous audio"sv;
       config.audio.flags[audio::config_t::CONTINUOUS_AUDIO] = true;

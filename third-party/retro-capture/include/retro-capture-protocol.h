@@ -44,7 +44,7 @@
 extern "C" {
 #endif
 
-#define RCAP_PROTO_VERSION 3
+#define RCAP_PROTO_VERSION 4
 #define RCAP_PROTO_VERSION_MIN 1 /* daemon still speaks v1 to old consumers */
 #define RCAP_MAGIC 0x52434150u /* "RCAP" */
 #define RCAP_SOCKET_DEFAULT "/run/retro-stream/retro-capture.sock"
@@ -67,6 +67,8 @@ enum rcap_msg_type {
   /* v3 additions: live HDMI-TX display-passthrough control. */
   RCAP_MSG_DISPLAY_SET = 13, /* status client -> daemon (v3 connections only) */
   RCAP_MSG_DISPLAY_ACK = 14, /* daemon -> status client */
+  /* v4 additions: the picture follows the source inside the pool. */
+  RCAP_MSG_OUTPUT_SET = 15, /* consumer -> daemon (v4 connections only) */
 };
 
 enum rcap_role {
@@ -80,6 +82,10 @@ enum rcap_error_code {
   RCAP_ERR_BAD_SETUP = 3, /* unacceptable SETUP parameters */
   RCAP_ERR_INTERNAL = 4,
 };
+
+/* SETUP flags (rcap_setup2.flags, v4 connections) */
+#define RCAP_SETUP_FOLLOW_SOURCE (1u << 0) /* start with the picture following
+                                            * the source (PROTOCOL.md 3.7.1) */
 
 /* FRAME flags */
 #define RCAP_FRAME_FRESH (1u << 0)       /* newly captured content */
@@ -141,8 +147,8 @@ struct RCAP_PACKED rcap_setup {
  * requires and reconnect/fail rather than assume. */
 struct RCAP_PACKED rcap_setup2 {
   struct rcap_setup base;
-  uint32_t fourcc;   /* requested pool format; 0 = DRM_FORMAT_NV12 */
-  uint32_t reserved; /* must be 0 */
+  uint32_t fourcc; /* requested pool format; 0 = DRM_FORMAT_NV12 */
+  uint32_t flags;  /* v4: RCAP_SETUP_*; v2/v3: reserved, must be 0 */
 };
 
 struct RCAP_PACKED rcap_stream_info {
@@ -186,6 +192,18 @@ struct RCAP_PACKED rcap_frame {
   uint64_t dqbuf_ns;
   uint64_t process_done_ns;
   uint64_t send_ns;
+};
+
+/* v4 length-extension of FRAME: every FRAME on a v4 connection is this
+ * longer message. The picture occupies the top-left active_width x
+ * active_height of the buffer at the STREAM_INFO strides; a session that is
+ * not following the source reports the pool size. HELD re-emissions carry the
+ * held buffer's own active size. */
+struct RCAP_PACKED rcap_frame_v4 {
+  struct rcap_frame base;
+  uint16_t active_width;
+  uint16_t active_height;
+  uint32_t reserved; /* 0 */
 };
 
 struct RCAP_PACKED rcap_release {
@@ -258,6 +276,21 @@ struct RCAP_PACKED rcap_display_ack {
   uint8_t ok;        /* 1 = request queued */
   uint8_t available; /* 1 = the display sink is armed in this daemon run */
   uint16_t reserved;
+};
+
+/* ---- v4: the picture follows the source ---- */
+
+/* Consumer-role control of the picture size inside the fixed pool (PROTOCOL.md
+ * 3.15). Latest wins, applied from the next produced frame, no ack: the FRAME
+ * active size is the answer. Caps of 0 mean the pool size; caps above it are
+ * clamped to it. */
+struct RCAP_PACKED rcap_output_set {
+  struct rcap_hdr hdr;
+  uint8_t follow; /* 1 = follow the source, 0 = scale to the pool size */
+  uint8_t reserved;
+  uint16_t max_width;
+  uint16_t max_height;
+  uint16_t reserved2;
 };
 
 #ifdef __cplusplus

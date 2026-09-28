@@ -39,6 +39,18 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    int rsCaps {0};  ///< retro-stream client capabilities (RS_CAP_*), from the launch request's `rsCaps`.
+  };
+
+  /**
+   * @brief retro-stream client capability bits (the `rsCaps` launch argument).
+   *
+   * A fork-private launch-URL argument rather than an SDP feature flag, so
+   * the bits can never collide with upstream Moonlight's. A stock client
+   * never sends it: every bit reads as absent.
+   */
+  enum rs_cap_e : int {
+    RS_CAP_DYNAMIC_RESOLUTION = 1 << 0,  ///< Decodes and displays a mid-stream resolution change (IDR with new parameter sets).
   };
 
   namespace amf {

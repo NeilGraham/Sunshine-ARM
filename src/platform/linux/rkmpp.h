@@ -159,10 +159,25 @@ namespace rkmpp {
   encode_rate_t plan_encode_rate(AVRational requested, AVRational source);
 
   /**
-   * @brief The source's spec rate right now, from the daemon's STATUS.
+   * @brief The source's mode right now, from the daemon's STATUS.
+   */
+  struct source_mode_t {
+    AVRational rate {0, 1};  ///< spec rate (snap_source_rate); 0/1 = unknown
+    int width {};  ///< input geometry as the receiver locked it; 0 = unknown
+    int height {};
+  };
+
+  /**
+   * @brief The source's mode right now, from the daemon's STATUS.
    *
-   * One STATUS-role round trip (sub-millisecond; no consumer slot). 0/1
-   * when not a capture box, the daemon is absent, or the input is unlocked.
+   * One STATUS-role round trip (sub-millisecond; no consumer slot). Rate 0/1
+   * and a zero size when not a capture box, the daemon is absent, or the
+   * input is unlocked.
+   */
+  source_mode_t daemon_source_mode();
+
+  /**
+   * @brief The source's spec rate right now (daemon_source_mode().rate).
    */
   AVRational daemon_source_rate();
 
@@ -182,8 +197,10 @@ namespace rkmpp {
    * @brief Live source-rate state for the encode loop, one read per frame.
    */
   struct live_rate_t {
-    std::uint64_t generation {};  ///< changes whenever `plan` does
+    std::uint64_t generation {};  ///< changes whenever `plan` or the source size does
     encode_rate_t plan;  ///< what the encoder should run at now
+    int source_width {};  ///< the source's geometry at the last (re-)lock; 0 = unknown
+    int source_height {};
     bool signal_lost {};  ///< the frame about to be encoded is a signal-loss re-emission
     bool fresh {};  ///< the frame about to be encoded is new content
   };
@@ -200,4 +217,35 @@ namespace rkmpp {
    * kmsgrab's capture tick oversamples this rather than the client's rate.
    */
   double daemon_encode_period_ms();
+
+  // ---- source-geometry following (capture box, capture protocol v4) ----
+  //
+  // The same idea for resolution: the daemon delivers the console's own
+  // resolution inside the pool (capped by the client's request, never
+  // upscaled), and the encoder follows it frame by frame. Each wrapper frame
+  // carries the picture's size in width/height; the pool, its strides and
+  // its fds never change. Only for a client that declared it follows a
+  // mid-stream size change (video::RS_CAP_DYNAMIC_RESOLUTION): every other
+  // client keeps the size it asked for.
+
+  /**
+   * @brief Whether the session about to connect should follow the source's
+   *        geometry. Set by the encoder setup, read when the capture connects.
+   */
+  void set_follow_geometry(bool on);
+
+  /**
+   * @brief Live gate on geometry following, for a shared (fan-out) stream: a
+   *        listener that cannot follow a size change turns it off for as long
+   *        as it is attached. Takes effect on the next captured frame.
+   */
+  void set_follow_geometry_allowed(bool allowed);
+
+  /**
+   * @brief Published by the encode loop: whether the encoder currently runs
+   *        at the capture pool's full size (so a listener that cannot follow a
+   *        size change can join without seeing one).
+   */
+  void note_encode_at_pool_size(bool at_pool);
+  bool encode_at_pool_size();
 }  // namespace rkmpp
