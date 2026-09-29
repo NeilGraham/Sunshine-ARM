@@ -44,7 +44,7 @@
 extern "C" {
 #endif
 
-#define RCAP_PROTO_VERSION 4
+#define RCAP_PROTO_VERSION 5
 #define RCAP_PROTO_VERSION_MIN 1 /* daemon still speaks v1 to old consumers */
 #define RCAP_MAGIC 0x52434150u /* "RCAP" */
 #define RCAP_SOCKET_DEFAULT "/run/retro-stream/retro-capture.sock"
@@ -69,6 +69,9 @@ enum rcap_msg_type {
   RCAP_MSG_DISPLAY_ACK = 14, /* daemon -> status client */
   /* v4 additions: the picture follows the source inside the pool. */
   RCAP_MSG_OUTPUT_SET = 15, /* consumer -> daemon (v4 connections only) */
+  /* v5 additions: live USB capture-card control. */
+  RCAP_MSG_USB_SET = 16, /* status client -> daemon (v5 connections only) */
+  RCAP_MSG_USB_ACK = 17, /* daemon -> status client */
 };
 
 enum rcap_role {
@@ -291,6 +294,26 @@ struct RCAP_PACKED rcap_output_set {
   uint16_t max_width;
   uint16_t max_height;
   uint16_t reserved2;
+};
+
+/* ---- v5: live USB capture-card control ---- */
+
+/* Presents/withdraws the daemon's USB capture-card sink (the board's Type-C
+ * port as a UVC camera) live. Sent by a STATUS-role client on a connection
+ * speaking version >= 5. The sink must have been started with the daemon
+ * (RETRO_CAPTURE_USB=on|standby); when it was not, the daemon replies
+ * available=0 and the request is a no-op. */
+struct RCAP_PACKED rcap_usb_set {
+  struct rcap_hdr hdr;
+  uint8_t enable; /* 1 = present the camera to the host, 0 = disconnect it */
+  uint8_t reserved[3];
+};
+
+struct RCAP_PACKED rcap_usb_ack {
+  struct rcap_hdr hdr;
+  uint8_t ok;        /* 1 = request queued */
+  uint8_t available; /* 1 = the USB sink runs in this daemon run */
+  uint16_t reserved;
 };
 
 #ifdef __cplusplus
